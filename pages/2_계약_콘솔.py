@@ -194,6 +194,17 @@ doc_html = ("<html><head><meta charset='utf-8'><style>body{font-family:sans-seri
 st.download_button("📄 계약서 HTML 내려받기 (열어서 PDF로 인쇄)", doc_html,
                    file_name=f"계약서_{p['brand']}.html", mime="text/html")
 
+# 「계약서 작성」 탭에서 이 브랜드로 저장한 최종 계약서들
+saved = SUPA.table("contracts").select("*").eq("project_id", p["id"]).order("created_at", desc=True).execute().data
+if saved:
+    st.markdown("**저장된 계약서** (계약서 작성 탭에서 저장됨)")
+    for s in saved:
+        cols = st.columns([6, 2])
+        cols[0].write(f"· [{s.get('doc_type') or '-'}] {s.get('counterparty') or ''} · {(s.get('created_at') or '')[:10]} · {s.get('sign_status') or 'draft'}")
+        if s.get("body"):
+            cols[1].download_button("내려받기", s["body"], file_name=f"계약서_{s.get('counterparty') or p['brand']}.html",
+                                    mime="text/html", key="sv" + s["id"])
+
 # ── 알림 발송 로그 ────────────────────────────────────────────
 st.subheader("알림 발송 로그")
 for nft in notifs_of(p["id"]):
