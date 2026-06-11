@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>브랜드슬램 계약 콘솔</title>
+  <style>
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      margin: 0;
+      background: #f5f7fb;
+      color: #111827;
+    }
+    .frame {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 32px;
+    }
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 24px 24px;
+      background: #ffffff;
+      border-radius: 28px;
+      box-shadow: 0 20px 70px rgba(15, 23, 42, 0.08);
+      margin-bottom: 24px;
+    }
+    .topbar .label {
+      font-size: 14px;
+      color: #4b5563;
+      letter-spacing: .2em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+    .topbar h1 {
+      margin: 0;
+      font-size: 32px;
+      letter-spacing: -0.04em;
+    }
+    .topbar .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      background: #eef2ff;
+      color: #3730a3;
+      border-radius: 999px;
+      padding: 10px 16px;
+      font-weight: 700;
+      font-size: 13px;
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: white;
+      border-radius: 24px;
+      padding: 24px;
+      box-shadow: 0 20px 70px rgba(15, 23, 42, 0.06);
+    }
+    .card h2 {
+      margin-top: 0;
+      font-size: 16px;
+      color: #6b7280;
+      margin-bottom: 16px;
+    }
+    .card .value {
+      font-size: 34px;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .kpi {
+      background: #111827;
+      color: white;
+      border-radius: 22px;
+      padding: 24px;
+      min-height: 128px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+    .kpi h3 {
+      margin: 0;
+      font-size: 14px;
+      color: #d1d5db;
+    }
+    .kpi .amount {
+      font-size: 32px;
+      margin-top: 16px;
+      font-weight: 700;
+    }
+    .split {
+      display: grid;
+      grid-template-columns: 1.6fr 1fr;
+      gap: 24px;
+    }
+    .panel {
+      background: white;
+      border-radius: 28px;
+      padding: 24px;
+      box-shadow: 0 20px 70px rgba(15, 23, 42, 0.06);
+    }
+    .panel h3 {
+      margin: 0 0 16px;
+      font-size: 20px;
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(59, 130, 246, 0.12);
+      color: #1d4ed8;
+      border-radius: 999px;
+      padding: 8px 14px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .step-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: grid;
+      gap: 16px;
+    }
+    .step-item {
+      border: 1px solid #e5e7eb;
+      border-radius: 22px;
+      padding: 20px;
+      display: grid;
+      gap: 8px;
+    }
+    .step-item.active {
+      border-color: #6366f1;
+      background: #eef2ff;
+    }
+    .step-item h4 {
+      margin: 0;
+      font-size: 18px;
+    }
+    .step-item p {
+      margin: 0;
+      color: #4b5563;
+    }
+    .actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 16px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      padding: 12px 20px;
+      border: none;
+      cursor: pointer;
+      font-weight: 700;
+      transition: transform 0.2s ease, background 0.2s ease;
+    }
+    .btn:hover { transform: translateY(-1px); }
+    .btn.primary { background: #4f46e5; color: white; }
+    .btn.secondary { background: #eef2ff; color: #3730a3; }
+    .btn.danger { background: #f87171; color: white; }
+    .table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 16px;
+    }
+    .table th,
+    .table td {
+      padding: 16px;
+      border-bottom: 1px solid #e5e7eb;
+      text-align: left;
+    }
+    .table th {
+      background: #f8fafc;
+      color: #475569;
+      text-transform: uppercase;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+    }
+    .table td strong {
+      display: block;
+      font-size: 16px;
+      color: #111827;
+    }
+    .table td span {
+      display: block;
+      color: #6b7280;
+      margin-top: 4px;
+      font-size: 13px;
+    }
+    .scroll {
+      max-height: 520px;
+      overflow: auto;
+    }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: #e0f2fe;
+      color: #0369a1;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .notice {
+      background: #f8fafc;
+      border-left: 4px solid #60a5fa;
+      padding: 18px 22px;
+      border-radius: 16px;
+      color: #1e293b;
+      margin-top: 24px;
+    }
+    .inline-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <section class="topbar">
+      <div>
+        <div class="label">계약 콘솔</div>
+        <h1>브랜드슬램 계약 진행 콘솔</h1>
+      </div>
+      <div class="badge">데모 모드</div>
+    </section>
+
+    <div class="summary">
+      <div class="card">
+        <h2>현재 계약</h2>
+        <div class="value">12건</div>
+        <p>이번 달 계약 진행 현황을 한눈에 확인합니다.</p>
+      </div>
+      <div class="card">
+        <h2>예상 총이윤</h2>
+        <div class="value">₩19,600,000</div>
+        <p>계약 단계별 마진을 자동으로 집계합니다.</p>
+      </div>
+      <div class="card">
+        <h2>알림 채널 활성</h2>
+        <div class="value">3개</div>
+        <p>Slack/카카오톡/이메일 알림이 모두 켜져 있습니다.</p>
+      </div>
+    </div>
+
+    <div class="kpi-grid">
+      <div class="kpi">
+        <h3>신규 계약</h3>
+        <div class="amount">4건</div>
+      </div>
+      <div class="kpi">
+        <h3>진행 중</h3>
+        <div class="amount">5건</div>
+      </div>
+      <div class="kpi">
+        <h3>완료</h3>
+        <div class="amount">3건</div>
+      </div>
+      <div class="kpi">
+        <h3>월별 매출</h3>
+        <div class="amount">₩42,300,000</div>
+      </div>
+    </div>
+
+    <div class="split">
+      <div class="panel">
+        <h3>계약 단계</h3>
+        <div class="status-pill">현재 단계: 견적 검토</div>
+        <ul class="step-list">
+          <li class="step-item active">
+            <h4>1. 요구사항 확인</h4>
+            <p>고객사 요구사항을 검토하고 우선순위를 정합니다.</p>
+          </li>
+          <li class="step-item">
+            <h4>2. 제안서 작성</h4>
+            <p>제안서 초안을 작성하고 예상 금액을 산정합니다.</p>
+          </li>
+          <li class="step-item">
+            <h4>3. 계약 협의</h4>
+            <p>고객사와 조율하며 조건 및 일정 조정합니다.</p>
+          </li>
+          <li class="step-item">
+            <h4>4. 계약 확정</h4>
+            <p>계약서 서명 및 계약금 납부까지 완료합니다.</p>
+          </li>
+          <li class="step-item">
+            <h4>5. 서비스 시작</h4>
+            <p>서비스 준비 및 운영을 시작합니다.</p>
+          </li>
+        </ul>
+        <div class="actions">
+          <button class="btn primary">단계 진행</button>
+          <button class="btn secondary">단계 되돌리기</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>오늘의 작업</h3>
+        <div class="inline-grid">
+          <div class="card">
+            <h2>계약서 생성</h2>
+            <div class="value">3건</div>
+            <p>자동으로 PDF 양식을 생성하여 보관합니다.</p>
+          </div>
+          <div class="card">
+            <h2>알림 발송</h2>
+            <div class="value">21건</div>
+            <p>결제 리마인더, 일정 알림이 예약되었습니다.</p>
+          </div>
+        </div>
+        <h3 style="margin-top: 24px;">활성화 채널</h3>
+        <div class="actions">
+          <button class="btn secondary">Slack</button>
+          <button class="btn secondary">카카오톡</button>
+          <button class="btn secondary">이메일</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top: 24px;">
+      <h3>계약 프로젝트</h3>
+      <div class="scroll">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>단계</th>
+              <th>고객사</th>
+              <th>브랜드</th>
+              <th>예상 매출</th>
+              <th>상태</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>견적 검토</strong><span>5건 진행 중</span></td>
+              <td>홍길동 브랜드</td>
+              <td>A 브랜드</td>
+              <td><strong>₩8,200,000</strong></td>
+              <td><span class="tag">대기중</span></td>
+            </tr>
+            <tr>
+              <td><strong>계약 협의</strong><span>3건 진행 중</span></td>
+              <td>블루웨이브</td>
+              <td>B 브랜드</td>
+              <td><strong>₩6,900,000</strong></td>
+              <td><span class="tag">진행중</span></td>
+            </tr>
+            <tr>
+              <td><strong>서비스 준비</strong><span>2건 진행 중</span></td>
+              <td>레인보우</td>
+              <td>C 브랜드</td>
+              <td><strong>₩4,600,000</strong></td>
+              <td><span class="tag">진행중</span></td>
+            </tr>
+            <tr>
+              <td><strong>완료</strong><span>2건 완료</span></td>
+              <td>그린스타</td>
+              <td>D 브랜드</td>
+              <td><strong>₩3,500,000</strong></td>
+              <td><span class="tag">완료</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="notice">
+      이 페이지는 현재 데모 데이터로 구성되어 있습니다. 실제 Supabase 데이터를 연동하려면 이후 단계에서 계약 데이터 모델과 동기화를 진행해야 합니다.
+    </div>
+  </div>
+</body>
+</html>
