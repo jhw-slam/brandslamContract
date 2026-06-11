@@ -19,7 +19,12 @@ if PW and not st.session_state.get("ok"):
 # ── Supabase (service_role · 서버사이드 전용) ─────────────────
 @st.cache_resource
 def sb():
-    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_KEY")
+    if not url or not key:
+        st.error("❌ Supabase 환경변수가 설정되지 않았습니다.\nSUPABASE_URL, SUPABASE_SERVICE_KEY를 설정해주세요.")
+        st.stop()
+    return create_client(url, key)
 SUPA = sb()
 
 STATUS_LABEL = {"PAYMENT_PENDING": "결제 대기", "KICKOFF": "진행중",
