@@ -29,16 +29,13 @@ STAGES = [("LEAD", "제안·미팅"), ("SENT", "계약서 발송"), ("SIGNED", "
           ("DEPOSIT", "선금 입금"), ("PROGRESS", "캠페인 진행"), ("BALANCE", "잔금 청구"),
           ("SETTLED", "정산 완료")]
 KEYS = [k for k, _ in STAGES]; LABEL = dict(STAGES)
-STATUS2STAGE = {"PAYMENT_PENDING": "SENT", "KICKOFF": "PROGRESS",
-                "IN_PROGRESS": "PROGRESS", "COMPLETED": "SETTLED"}
 won = lambda n: "₩{:,}".format(int(n or 0))
 
-@st.cache_data(ttl=30)
-def load_campaigns():
-    return SUPA.table("campaigns").select(
-        "order_number,brand_name,product_name,plan,status,plan_price,"
-        "start_date,end_date,customer_name,created_at"
-    ).order("created_at", desc=True).execute().data
+def load_projects():
+    return SUPA.table("projects").select("*").order("created_at").execute().data
+
+def companies_map():
+    return {c["id"]: c["name"] for c in SUPA.table("companies").select("id,name").execute().data}
 
 def get_or_create_company(name):
     name = (name or "(미상)").strip()
@@ -46,23 +43,6 @@ def get_or_create_company(name):
     if r:
         return r[0]["id"]
     return SUPA.table("companies").insert({"name": name}).execute().data[0]["id"]
-
-def get_project(order_number):
-    r = SUPA.table("projects").select("*").eq("order_number", order_number).limit(1).execute().data
-    return r[0] if r else None
-
-def create_project(camp):
-    cid = get_or_create_company(camp.get("brand_name"))
-    payload = {
-        "order_number": camp["order_number"], "company_id": cid,
-        "brand": camp.get("brand_name") or "(미상)",
-        "product": camp.get("product_name"), "region": "",
-        "campaign": camp.get("product_name") or camp.get("plan"),
-        "supply_amount": int(camp.get("plan_price") or 0),
-        "stage": STATUS2STAGE.get(camp.get("status"), "LEAD"),
-        "start_date": camp.get("start_date"), "end_date": camp.get("end_date"),
-    }
-    return SUPA.table("projects").insert(payload).execute().data[0]
 
 def vendors_of(pid):
     return SUPA.table("project_vendors").select("*").eq("project_id", pid).order("created_at").execute().data
@@ -84,38 +64,46 @@ def push_notif(pid, stage, body, channel="email"):
         "template_code": "TPL_" + stage, "recipient": "브랜드 담당자",
         "body": body, "status": "sent"}).execute()
 
-# ── 좌측: 회사(브랜드)별 캠페인 트리 ──────────────────────────
-st.sidebar.title("회사 · 계약")
-camps = load_campaigns()
+projects = load_projects()
+cmap = companies_map()
+
+# ── 좌측: 회사별 프로젝트 + 계약 추가 ─────────────────────────
+st.sidebar.title("계약 (projects)")
+with st.sidebar.expander("➕ 계약 추가", expanded=False):
+    with st.form("add", clear_on_submit=True):
+        cn = st.text_input("업체명")
+        cm = st.text_input("캠페인/상품명")
+        amt = st.number_input("공급가액(VAT별도)", min_value=0, step=100000)
+        stg = st.selectbox("단계", KEYS, format_func=lambda k: LABEL[k])
+        if st.form_submit_button("추가") and cn:
+            cid = get_or_create_company(cn)
+            SUPA.table("projects").insert({
+                "company_id": cid, "brand": cn, "product": cm, "campaign": cm,
+                "supply_amount": int(amt), "stage": stg}).execute()
+            st.rerun()
+
 groups = {}
-for c in camps:
-    groups.setdefault(c.get("brand_name") or "(미상)", []).append(c)
-for brand, lst in groups.items():
-    with st.sidebar.expander(f"{brand} · {len(lst)}건", expanded=True):
-        for c in lst:
-            lab = (c.get("product_name") or c.get("plan") or "계약")[:28]
-            if st.button(lab, key="c" + c["order_number"], use_container_width=True):
-                st.session_state.sel = c["order_number"]
+for p in projects:
+    groups.setdefault(cmap.get(p["company_id"], "(미상)"), []).append(p)
+for comp, lst in groups.items():
+    rev = sum(x["supply_amount"] or 0 for x in lst)
+    with st.sidebar.expander(f"{comp} · {len(lst)}건", expanded=True):
+        for p in lst:
+            lab = (p.get("product") or p.get("campaign") or LABEL[p["stage"]])[:26]
+            if st.button(f"{lab}", key="p" + p["id"], use_container_width=True):
+                st.session_state.pid = p["id"]
 
-sel = st.session_state.get("sel")
-camp = next((c for c in camps if c["order_number"] == sel), None)
-if not camp:
+pid = st.session_state.get("pid")
+p = next((x for x in projects if x["id"] == pid), None)
+if not p:
     st.title("계약 콘솔")
-    st.info("좌측에서 계약을 선택하세요. (목록은 campaigns 실데이터)")
+    st.info("좌측에서 계약을 선택하거나, '➕ 계약 추가'로 새 계약을 등록하세요.")
     st.stop()
 
-# ── 아직 워크플로에 없는 계약 → 관리 시작 ─────────────────────
-p = get_project(sel)
-st.title(f"{camp.get('brand_name','')} · {camp.get('product_name','')}")
-st.caption(f"주문번호 {sel} · 상태 {camp.get('status')} · 금액 {won(camp.get('plan_price'))} · 담당 {camp.get('customer_name') or '-'}")
+# ── 상세 ──────────────────────────────────────────────────────
+st.title(f"{p['brand']} · {p.get('product') or ''}")
+st.caption(f"{cmap.get(p['company_id'],'')} · 기간 {p.get('start_date') or '-'} ~ {p.get('end_date') or '-'}")
 
-if p is None:
-    st.warning("이 계약은 아직 워크플로(projects)에 등록되지 않았습니다.")
-    if st.button("▶ 이 계약 관리 시작", type="primary"):
-        create_project(camp); st.rerun()
-    st.stop()
-
-# ── 단계 타임라인 ─────────────────────────────────────────────
 i = KEYS.index(p["stage"])
 cols = st.columns(len(STAGES))
 for n, (k, lab) in enumerate(STAGES):
@@ -146,11 +134,9 @@ if cc.button("📨 현재 단계 알림 보내기", use_container_width=True):
     push_notif(p["id"], p["stage"], f"[{LABEL[p['stage']]}] 단계를 완료해 주세요.")
     st.rerun()
 
-# ── 수익 구조 (실행사 견적 → 이윤) ────────────────────────────
+# ── 수익 구조 ─────────────────────────────────────────────────
 st.subheader("수익 구조")
-vs = vendors_of(p["id"])
-vtotal = sum(v["amount"] or 0 for v in vs)
-supply = p["supply_amount"] or 0
+vs = vendors_of(p["id"]); vtotal = sum(v["amount"] or 0 for v in vs); supply = p["supply_amount"] or 0
 mc = st.columns(3)
 mc[0].metric("매출(공급가)", won(supply))
 mc[1].metric("실행사 비용", won(vtotal))
@@ -184,15 +170,13 @@ with st.expander("금액 · 조건 수정"):
 
 # ── 계약서 미리보기 / 다운로드 ────────────────────────────────
 st.subheader("계약서")
-comp = SUPA.table("companies").select("*").eq("id", p["company_id"]).limit(1).execute().data
-comp = comp[0] if comp else {}
 total = p["total_amount"] or 0
 body = f"""통합 홍보 대행 계약서
 
-본 계약은 {comp.get('name','')}(이하 "A")와 주식회사 브랜드슬램(이하 "B") 간 홍보 대행 서비스에 대한 기본 계약이다.
+본 계약은 {cmap.get(p['company_id'],'')}(이하 "A")와 주식회사 브랜드슬램(이하 "B") 간 홍보 대행 서비스에 대한 기본 계약이다.
 
 [별첨: 서비스 내용]
-· 브랜드/상품: {p['brand']} / {p.get('product','')}
+· 브랜드/상품: {p['brand']} / {p.get('product') or ''}
 · 계약 기간: {p.get('start_date') or '-'} ~ {p.get('end_date') or '-'}
 · 공급가액(VAT별도): {won(supply)}
 · 부가세(10%): {won(p['vat_amount'])}
