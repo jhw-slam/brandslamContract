@@ -112,7 +112,8 @@ for comp, lst in groups.items():
 
 if "sidebar_visible" not in st.session_state:
     st.session_state.sidebar_visible = True
-if st.button("사이드바 숨기기" if st.session_state.sidebar_visible else "사이드바 보이기"):
+btn_col, _ = st.columns([1, 19])
+if btn_col.button("☰", help="사이드바 토글", key="sidebar_toggle"):
     st.session_state.sidebar_visible = not st.session_state.sidebar_visible
     st.rerun()
 if not st.session_state.sidebar_visible:
@@ -165,14 +166,16 @@ with st.expander("송금 캘린더", expanded=True):
         st.warning(
             "현재 이 계약에는 선금/잔금 예정일이 입력되어 있지 않아 송금 캘린더를 표시할 수 없습니다."
         )
-        if st.button("송금 일정 입력 안내"):
-            with st.modal("송금 일정 입력 안내"):
-                st.write(
-                    "진행 중인 계약의 '금액 · 조건 수정'에서 선금 예정일과 잔금 예정일을 입력해주세요."
-                )
-                st.write(
-                    "입력한 날짜는 계약서 미리보기와 송금 캘린더에 반영됩니다."
-                )
+        with st.expander("송금 일정 입력 안내"):
+            st.write(
+                "진행 중인 계약의 '금액 · 조건 수정'에서 선금 예정일과 잔금 예정일을 입력해주세요."
+            )
+            st.write(
+                "입력한 날짜는 계약서 미리보기와 송금 캘린더에 반영됩니다."
+            )
+            st.write(
+                "※ 데이터가 비어 있으면 먼저 해당 프로젝트의 금액·조건을 업데이트해 주세요."
+            )
 
 ca, cb, cc = st.columns(3)
 if i < len(STAGES) - 1 and ca.button(f"▶ 「{STAGES[i+1][1]}」 진행", type="primary", use_container_width=True):
