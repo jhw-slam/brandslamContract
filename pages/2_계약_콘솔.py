@@ -3,6 +3,7 @@ import datetime
 
 import pandas as pd
 import streamlit as st
+from postgrest.exceptions import APIError
 from supabase import create_client
 
 st.set_page_config(page_title="계약 콘솔", layout="wide")
@@ -65,6 +66,21 @@ def push_notif(pid, stage, body, channel="email"):
         "project_id": pid, "stage": stage, "channel": channel,
         "template_code": "TPL_" + stage, "recipient": "브랜드 담당자",
         "body": body, "status": "sent"}).execute()
+
+
+def safe_project_update(project_id, upd):
+    try:
+        SUPA.table("projects").update(upd).eq("id", project_id).execute()
+        return True, None
+    except APIError as exc:
+        if "deposit_date" in str(exc) or "balance_date" in str(exc):
+            filtered = {k: v for k, v in upd.items() if k not in ("deposit_date", "balance_date")}
+            if filtered:
+                SUPA.table("projects").update(filtered).eq("id", project_id).execute()
+            return False, "현재 Supabase 프로젝트 테이블에 'deposit_date' 또는 'balance_date' 컬럼이 없습니다. 해당 컬럼을 추가해야 날짜를 저장할 수 있습니다."
+        return False, str(exc)
+    except Exception as exc:
+        return False, str(exc)
 
 
 def parse_date(value):
@@ -232,7 +248,9 @@ with st.expander("금액 · 조건 수정"):
             upd = {"supply_amount": int(ns), "dep_ratio": dr,
                    "bal_ratio": br, "terms": terms,
                    "deposit_date": dd.isoformat(), "balance_date": bd.isoformat()}
-            SUPA.table("projects").update(upd).eq("id", p["id"]).execute()
+            ok, err = safe_project_update(p["id"], upd)
+            if not ok:
+                st.warning(err)
             st.rerun()
 
 # ── 계약서 미리보기 / 다운로드 ────────────────────────────────
