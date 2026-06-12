@@ -1,5 +1,7 @@
 import os
+import datetime
 
+import pandas as pd
 import streamlit as st
 from supabase import create_client
 
@@ -64,6 +66,21 @@ def push_notif(pid, stage, body, channel="email"):
         "template_code": "TPL_" + stage, "recipient": "브랜드 담당자",
         "body": body, "status": "sent"}).execute()
 
+
+def parse_date(value):
+    if not value:
+        return None
+    if isinstance(value, datetime.date):
+        return value
+    try:
+        return datetime.date.fromisoformat(str(value))
+    except Exception:
+        try:
+            return pd.to_datetime(value, errors="coerce").date()
+        except Exception:
+            return None
+
+
 projects = load_projects()
 cmap = companies_map()
 
@@ -93,6 +110,18 @@ for comp, lst in groups.items():
             if st.button(f"{lab}", key="p" + p["id"], use_container_width=True):
                 st.session_state.pid = p["id"]
 
+if "sidebar_visible" not in st.session_state:
+    st.session_state.sidebar_visible = True
+if st.button("사이드바 숨기기" if st.session_state.sidebar_visible else "사이드바 보이기"):
+    st.session_state.sidebar_visible = not st.session_state.sidebar_visible
+    st.rerun()
+if not st.session_state.sidebar_visible:
+    st.markdown(
+        "<style>section[data-testid='stSidebar']{display:none !important;}"
+        "div[data-testid='stAppViewContainer'] > div:first-child{margin-left:0 !important;}</style>",
+        unsafe_allow_html=True,
+    )
+
 pid = st.session_state.get("pid")
 p = next((x for x in projects if x["id"] == pid), None)
 if not p:
@@ -103,6 +132,10 @@ if not p:
 # ── 상세 ──────────────────────────────────────────────────────
 st.title(f"{p['brand']} · {p.get('product') or ''}")
 st.caption(f"{cmap.get(p['company_id'],'')} · 기간 {p.get('start_date') or '-'} ~ {p.get('end_date') or '-'}")
+if p.get("deposit_date") or p.get("balance_date"):
+    st.caption(
+        f"선금 예정일 {p.get('deposit_date') or '-'} · 잔금 예정일 {p.get('balance_date') or '-'}"
+    )
 
 i = KEYS.index(p["stage"])
 cols = st.columns(len(STAGES))
@@ -115,6 +148,31 @@ m[0].metric("총 계약금액(VAT포함)", won(p["total_amount"]))
 m[1].metric("선금", won(p["deposit_amount"]) + (" ✓" if p["deposit_paid"] else " (대기)"))
 m[2].metric("미수금", won(outstanding(p)))
 m[3].metric("단계", LABEL[p["stage"]])
+
+with st.expander("송금 캘린더", expanded=True):
+    cal_items = []
+    dp = parse_date(p.get("deposit_date"))
+    bp = parse_date(p.get("balance_date"))
+    if dp:
+        cal_items.append({"구분": "선금 예정일", "일자": dp.isoformat(),
+                          "금액": won(p["deposit_amount"]), "상태": "완료" if p["deposit_paid"] else "대기"})
+    if bp:
+        cal_items.append({"구분": "잔금 예정일", "일자": bp.isoformat(),
+                          "금액": won(p["balance_amount"]), "상태": "완료" if p["balance_paid"] else "대기"})
+    if cal_items:
+        st.dataframe(pd.DataFrame(cal_items), use_container_width=True, hide_index=True)
+    else:
+        st.warning(
+            "현재 이 계약에는 선금/잔금 예정일이 입력되어 있지 않아 송금 캘린더를 표시할 수 없습니다."
+        )
+        if st.button("송금 일정 입력 안내"):
+            with st.modal("송금 일정 입력 안내"):
+                st.write(
+                    "진행 중인 계약의 '금액 · 조건 수정'에서 선금 예정일과 잔금 예정일을 입력해주세요."
+                )
+                st.write(
+                    "입력한 날짜는 계약서 미리보기와 송금 캘린더에 반영됩니다."
+                )
 
 ca, cb, cc = st.columns(3)
 if i < len(STAGES) - 1 and ca.button(f"▶ 「{STAGES[i+1][1]}」 진행", type="primary", use_container_width=True):
@@ -162,10 +220,16 @@ with st.expander("금액 · 조건 수정"):
         ns = st.number_input("공급가액(VAT별도)", value=int(supply), step=100000)
         dr = st.number_input("선금 비율", value=float(p["dep_ratio"] or 0.5), min_value=0.0, max_value=1.0, step=0.1)
         br = st.number_input("잔금 비율", value=float(p["bal_ratio"] or 0.5), min_value=0.0, max_value=1.0, step=0.1)
+        dd_default = parse_date(p.get("deposit_date")) or datetime.date.today()
+        bd_default = parse_date(p.get("balance_date")) or datetime.date.today()
+        dd = st.date_input("선금 예정일", value=dd_default)
+        bd = st.date_input("잔금 예정일", value=bd_default)
         terms = st.text_area("특이사항", value=p.get("terms") or "")
         if st.form_submit_button("저장"):
-            SUPA.table("projects").update({"supply_amount": int(ns), "dep_ratio": dr,
-                                           "bal_ratio": br, "terms": terms}).eq("id", p["id"]).execute()
+            upd = {"supply_amount": int(ns), "dep_ratio": dr,
+                   "bal_ratio": br, "terms": terms,
+                   "deposit_date": dd.isoformat(), "balance_date": bd.isoformat()}
+            SUPA.table("projects").update(upd).eq("id", p["id"]).execute()
             st.rerun()
 
 # ── 계약서 미리보기 / 다운로드 ────────────────────────────────
@@ -181,7 +245,8 @@ body = f"""통합 홍보 대행 계약서
 · 공급가액(VAT별도): {won(supply)}
 · 부가세(10%): {won(p['vat_amount'])}
 · 총 계약금액(VAT포함): {won(total)}
-· 선금: {won(p['deposit_amount'])}  /  잔금: {won(p['balance_amount'])}
+· 선금: {won(p['deposit_amount'])}  /  선금 지급예정일: {p.get('deposit_date') or '-'}
+· 잔금: {won(p['balance_amount'])}  /  잔금 지급예정일: {p.get('balance_date') or '-'}
 · 결제 방식: {p.get('pay_method') or '계좌이체'}
 
 [특이사항]
