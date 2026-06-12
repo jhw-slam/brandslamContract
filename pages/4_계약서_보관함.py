@@ -33,12 +33,15 @@ DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "1hpPLwG5AoykCve0ouUB3tYY7Pd
 # ── Google Drive (서비스 계정) ────────────────────────────────
 @st.cache_resource
 def drive():
-    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    raw = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
     if not raw:
         return None
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError:
+        return "BAD_JSON"
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
-    info = json.loads(raw)
     creds = service_account.Credentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/drive.readonly"])
     return build("drive", "v3", credentials=creds, cache_discovery=False)
@@ -143,7 +146,11 @@ def a4(text):
 st.title("계약서 보관함")
 svc = drive()
 if svc is None:
-    st.error("❌ GOOGLE_SERVICE_ACCOUNT_JSON 환경변수가 없습니다. (서비스 계정 설정 후 Railway에 추가하세요)")
+    st.error("❌ GOOGLE_SERVICE_ACCOUNT_JSON 환경변수가 비어 있습니다. Railway에 서비스 계정 키(JSON) 전체를 넣어주세요.")
+    st.stop()
+if svc == "BAD_JSON":
+    st.error("❌ GOOGLE_SERVICE_ACCOUNT_JSON 값이 올바른 JSON이 아닙니다. "
+             "다운로드한 키 파일의 내용을 통째로(맨 앞 { 부터 맨 뒤 } 까지) 따옴표 없이 그대로 붙여넣었는지 확인하세요.")
     st.stop()
 
 cols = st.columns([3, 1])
