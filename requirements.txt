@@ -1,3 +1,7 @@
 streamlit>=1.36
 supabase>=2.6
 pandas>=2.0
+google-api-python-client>=2.130
+google-auth>=2.30
+pypdf>=4.2
+python-docx>=1.1
