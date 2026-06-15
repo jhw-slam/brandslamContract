@@ -48,13 +48,32 @@ def text_to_html(txt):
             out.append("<p>" + esc.replace("\n", "<br>") + "</p>")
     return "".join(out)
 
+def size_images(html):
+    """docx 안 이미지를 점검: 정사각(도장/직인)은 2.2cm로 축소, 그 외는 본문폭 제한(CSS)."""
+    import base64
+    try:
+        from PIL import Image
+    except Exception:
+        return html
+
+    def repl(m):
+        tag = m.group(0); b64 = m.group(1)
+        try:
+            im = Image.open(io.BytesIO(base64.b64decode(b64))); w, h = im.size
+        except Exception:
+            return tag
+        if h and 0.6 <= (w / h) <= 1.6 and "class=" not in tag:
+            return "<img class=\"stamp\"" + tag[4:]
+        return tag
+    return re.sub(r'<img\b[^>]*src="data:image/[^;]+;base64,([^"]+)"[^>]*>', repl, html)
+
 def extract(name, data):
     """returns (html_for_preview, plain_text_for_edit)"""
     n = name.lower()
     try:
         if n.endswith(".docx"):
             import mammoth
-            html = mammoth.convert_to_html(io.BytesIO(data)).value
+            html = size_images(mammoth.convert_to_html(io.BytesIO(data)).value)
             text = mammoth.extract_raw_text(io.BytesIO(data)).value
             return html, text
         if n.endswith(".pdf"):
@@ -95,6 +114,8 @@ A4_CSS = (
     ".page table{border-collapse:collapse;width:100%;margin:10px 0;font-size:10.5pt}"
     ".page td,.page th{border:1px solid #bbb;padding:6px 8px;text-align:left}"
     ".page ul,.page ol{margin:6px 0 6px 18px}"
+    ".page img{max-width:100%;height:auto}"
+    ".page img.stamp{width:2.2cm;height:2.2cm;object-fit:contain;vertical-align:middle}"
     "@media print{body{background:#fff}.page{box-shadow:none;margin:0}@page{size:A4;margin:0}}"
 )
 def wrap(inner):
