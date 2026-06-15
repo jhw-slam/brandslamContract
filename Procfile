@@ -1,1 +1,1 @@
-web: streamlit run streamlit_app.py --server.port=$PORT --server.address=0.0.0.0
+web: streamlit run 종합상황판.py --server.port=$PORT --server.address=0.0.0.0
