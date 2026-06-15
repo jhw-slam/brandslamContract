@@ -1,9 +1,6 @@
 import os
-import datetime
 
-import pandas as pd
 import streamlit as st
-from postgrest.exceptions import APIError
 from supabase import create_client
 
 st.set_page_config(page_title="계약 콘솔", layout="wide")
@@ -67,36 +64,6 @@ def push_notif(pid, stage, body, channel="email"):
         "template_code": "TPL_" + stage, "recipient": "브랜드 담당자",
         "body": body, "status": "sent"}).execute()
 
-
-def safe_project_update(project_id, upd):
-    try:
-        SUPA.table("projects").update(upd).eq("id", project_id).execute()
-        return True, None
-    except APIError as exc:
-        if "deposit_date" in str(exc) or "balance_date" in str(exc):
-            filtered = {k: v for k, v in upd.items() if k not in ("deposit_date", "balance_date")}
-            if filtered:
-                SUPA.table("projects").update(filtered).eq("id", project_id).execute()
-            return False, "현재 Supabase 프로젝트 테이블에 'deposit_date' 또는 'balance_date' 컬럼이 없습니다. 해당 컬럼을 추가해야 날짜를 저장할 수 있습니다."
-        return False, str(exc)
-    except Exception as exc:
-        return False, str(exc)
-
-
-def parse_date(value):
-    if not value:
-        return None
-    if isinstance(value, datetime.date):
-        return value
-    try:
-        return datetime.date.fromisoformat(str(value))
-    except Exception:
-        try:
-            return pd.to_datetime(value, errors="coerce").date()
-        except Exception:
-            return None
-
-
 projects = load_projects()
 cmap = companies_map()
 
@@ -126,19 +93,6 @@ for comp, lst in groups.items():
             if st.button(f"{lab}", key="p" + p["id"], use_container_width=True):
                 st.session_state.pid = p["id"]
 
-if "sidebar_visible" not in st.session_state:
-    st.session_state.sidebar_visible = True
-btn_col, _ = st.columns([1, 19])
-if btn_col.button("☰", help="사이드바 토글", key="sidebar_toggle"):
-    st.session_state.sidebar_visible = not st.session_state.sidebar_visible
-    st.rerun()
-if not st.session_state.sidebar_visible:
-    st.markdown(
-        "<style>section[data-testid='stSidebar']{display:none !important;}"
-        "div[data-testid='stAppViewContainer'] > div:first-child{margin-left:0 !important;}</style>",
-        unsafe_allow_html=True,
-    )
-
 pid = st.session_state.get("pid")
 p = next((x for x in projects if x["id"] == pid), None)
 if not p:
@@ -149,10 +103,6 @@ if not p:
 # ── 상세 ──────────────────────────────────────────────────────
 st.title(f"{p['brand']} · {p.get('product') or ''}")
 st.caption(f"{cmap.get(p['company_id'],'')} · 기간 {p.get('start_date') or '-'} ~ {p.get('end_date') or '-'}")
-if p.get("deposit_date") or p.get("balance_date"):
-    st.caption(
-        f"선금 예정일 {p.get('deposit_date') or '-'} · 잔금 예정일 {p.get('balance_date') or '-'}"
-    )
 
 i = KEYS.index(p["stage"])
 cols = st.columns(len(STAGES))
@@ -166,33 +116,6 @@ m[1].metric("선금", won(p["deposit_amount"]) + (" ✓" if p["deposit_paid"] el
 m[2].metric("미수금", won(outstanding(p)))
 m[3].metric("단계", LABEL[p["stage"]])
 
-with st.expander("송금 캘린더", expanded=True):
-    cal_items = []
-    dp = parse_date(p.get("deposit_date"))
-    bp = parse_date(p.get("balance_date"))
-    if dp:
-        cal_items.append({"구분": "선금 예정일", "일자": dp.isoformat(),
-                          "금액": won(p["deposit_amount"]), "상태": "완료" if p["deposit_paid"] else "대기"})
-    if bp:
-        cal_items.append({"구분": "잔금 예정일", "일자": bp.isoformat(),
-                          "금액": won(p["balance_amount"]), "상태": "완료" if p["balance_paid"] else "대기"})
-    if cal_items:
-        st.dataframe(pd.DataFrame(cal_items), use_container_width=True, hide_index=True)
-    else:
-        st.warning(
-            "현재 이 계약에는 선금/잔금 예정일이 입력되어 있지 않아 송금 캘린더를 표시할 수 없습니다."
-        )
-        with st.expander("송금 일정 입력 안내"):
-            st.write(
-                "진행 중인 계약의 '금액 · 조건 수정'에서 선금 예정일과 잔금 예정일을 입력해주세요."
-            )
-            st.write(
-                "입력한 날짜는 계약서 미리보기와 송금 캘린더에 반영됩니다."
-            )
-            st.write(
-                "※ 데이터가 비어 있으면 먼저 해당 프로젝트의 금액·조건을 업데이트해 주세요."
-            )
-
 ca, cb, cc = st.columns(3)
 if i < len(STAGES) - 1 and ca.button(f"▶ 「{STAGES[i+1][1]}」 진행", type="primary", use_container_width=True):
     nxt = KEYS[i + 1]; upd = {"stage": nxt}
@@ -200,13 +123,13 @@ if i < len(STAGES) - 1 and ca.button(f"▶ 「{STAGES[i+1][1]}」 진행", type=
     if nxt == "SETTLED": upd["balance_paid"] = True
     SUPA.table("projects").update(upd).eq("id", p["id"]).execute()
     push_notif(p["id"], nxt, f"{STAGES[i+1][1]} 단계 알림이 발송되었습니다.")
-    st.rerun()
+    st.toast("Supabase 반영됨 ✓"); st.rerun()
 if i > 0 and cb.button("◀ 되돌리기", use_container_width=True):
     prev = KEYS[i - 1]; upd = {"stage": prev}
     if p["stage"] == "DEPOSIT": upd["deposit_paid"] = False
     if p["stage"] == "SETTLED": upd["balance_paid"] = False
     SUPA.table("projects").update(upd).eq("id", p["id"]).execute()
-    st.rerun()
+    st.toast("Supabase 반영됨 ✓"); st.rerun()
 if cc.button("📨 현재 단계 알림 보내기", use_container_width=True):
     push_notif(p["id"], p["stage"], f"[{LABEL[p['stage']]}] 단계를 완료해 주세요.")
     st.rerun()
@@ -239,19 +162,59 @@ with st.expander("금액 · 조건 수정"):
         ns = st.number_input("공급가액(VAT별도)", value=int(supply), step=100000)
         dr = st.number_input("선금 비율", value=float(p["dep_ratio"] or 0.5), min_value=0.0, max_value=1.0, step=0.1)
         br = st.number_input("잔금 비율", value=float(p["bal_ratio"] or 0.5), min_value=0.0, max_value=1.0, step=0.1)
-        dd_default = parse_date(p.get("deposit_date")) or datetime.date.today()
-        bd_default = parse_date(p.get("balance_date")) or datetime.date.today()
-        dd = st.date_input("선금 예정일", value=dd_default)
-        bd = st.date_input("잔금 예정일", value=bd_default)
         terms = st.text_area("특이사항", value=p.get("terms") or "")
         if st.form_submit_button("저장"):
-            upd = {"supply_amount": int(ns), "dep_ratio": dr,
-                   "bal_ratio": br, "terms": terms,
-                   "deposit_date": dd.isoformat(), "balance_date": bd.isoformat()}
-            ok, err = safe_project_update(p["id"], upd)
-            if not ok:
-                st.warning(err)
-            st.rerun()
+            SUPA.table("projects").update({"supply_amount": int(ns), "dep_ratio": dr,
+                                           "bal_ratio": br, "terms": terms}).eq("id", p["id"]).execute()
+            st.toast("Supabase에 저장되었습니다 ✓"); st.rerun()
+
+# ── 송금 일정 (이 프로젝트 · cash_events) ─────────────────────
+st.subheader("송금 일정")
+st.caption("여기서 입력하면 즉시 Supabase에 저장되고, '전체 송금 스케쥴' 페이지에도 합쳐져 보입니다.")
+ce = SUPA.table("cash_events").select("*").eq("project_id", p["id"]).order("due_date").execute().data
+if ce:
+    for e in ce:
+        cols = st.columns([1.6, 1.2, 1.8, 1.6, 1, 0.7])
+        cols[0].write((e.get("due_date") or "-")[:10])
+        cols[1].write("받을 돈" if e["direction"] == "in" else "나갈 돈")
+        cols[2].write(e.get("category") or "")
+        cols[3].write(won(e["amount"]))
+        cols[4].write("완료" if e["paid"] else "예정")
+        if cols[5].button("삭제", key="ce" + e["id"]):
+            SUPA.table("cash_events").delete().eq("id", e["id"]).execute()
+            st.toast("삭제됨 ✓"); st.rerun()
+else:
+    st.caption("· 등록된 송금 일정이 없습니다. 아래에서 추가하세요.")
+
+with st.form("ce_add", clear_on_submit=True):
+    cf = st.columns([1.2, 1.4, 1.6, 1.3, 0.8])
+    direction = cf[0].selectbox("구분", ["받을 돈", "나갈 돈"], label_visibility="collapsed")
+    category = cf[1].selectbox("항목", ["선금", "잔금", "인보이스", "실행사 지급", "기타"], label_visibility="collapsed")
+    amount = cf[2].number_input("금액", min_value=0, step=100000, label_visibility="collapsed")
+    due = cf[3].date_input("예정일", label_visibility="collapsed")
+    paid = cf[4].checkbox("완료")
+    if st.form_submit_button("➕ 송금 일정 추가") and amount:
+        SUPA.table("cash_events").insert({
+            "project_id": p["id"], "direction": "in" if direction == "받을 돈" else "out",
+            "category": category, "amount": int(amount), "due_date": due.isoformat(),
+            "paid": paid, "paid_date": due.isoformat() if paid else None}).execute()
+        st.toast("Supabase에 저장되었습니다 ✓"); st.rerun()
+
+with st.expander("선금·잔금 예정 자동 만들기 (계약금액 기반)"):
+    ac = st.columns(2)
+    d1 = ac[0].date_input("선금 예정일", key="ad1")
+    d2 = ac[1].date_input("잔금 예정일", key="ad2")
+    if st.button("자동 생성"):
+        rows = []
+        if p["deposit_amount"]:
+            rows.append({"project_id": p["id"], "direction": "in", "category": "선금",
+                         "amount": int(p["deposit_amount"]), "due_date": d1.isoformat(), "paid": bool(p["deposit_paid"])})
+        if p["balance_amount"]:
+            rows.append({"project_id": p["id"], "direction": "in", "category": "잔금",
+                         "amount": int(p["balance_amount"]), "due_date": d2.isoformat(), "paid": bool(p["balance_paid"])})
+        if rows:
+            SUPA.table("cash_events").insert(rows).execute()
+            st.toast("선금·잔금 일정 생성됨 ✓"); st.rerun()
 
 # ── 계약서 미리보기 / 다운로드 ────────────────────────────────
 st.subheader("계약서")
@@ -266,8 +229,7 @@ body = f"""통합 홍보 대행 계약서
 · 공급가액(VAT별도): {won(supply)}
 · 부가세(10%): {won(p['vat_amount'])}
 · 총 계약금액(VAT포함): {won(total)}
-· 선금: {won(p['deposit_amount'])}  /  선금 지급예정일: {p.get('deposit_date') or '-'}
-· 잔금: {won(p['balance_amount'])}  /  잔금 지급예정일: {p.get('balance_date') or '-'}
+· 선금: {won(p['deposit_amount'])}  /  잔금: {won(p['balance_amount'])}
 · 결제 방식: {p.get('pay_method') or '계좌이체'}
 
 [특이사항]
