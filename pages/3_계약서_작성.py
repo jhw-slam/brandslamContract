@@ -67,7 +67,8 @@ def brand_html(v):
 <p><b>제9조(분쟁·관할)</b> 대한민국 법을 준거법으로 하고 서울중앙지방법원을 전속 관할로 한다.</p>
 <div class="sig">계약일: {v['sign_date'] or '____년 __월 __일'}<br><br>
 A: {v['a_name'] or '____'} / 사업자등록번호 {v['a_biz'] or '__________'} / 대표이사 {v['a_ceo'] or '______'} (인)<br>
-B: 주식회사 브랜드슬램 / 284-44-03016 / 대표이사 장현우 (인)</div>
+B: 주식회사 브랜드슬램 / 사업자등록번호 284-88-03016 / 대표이사 장현우 (인)<br>
+&nbsp;&nbsp;&nbsp;주소: 서울시 강남구 테헤란로 7길 11, 한덕빌딩 9층 902호</div>
 <h2>별첨: 서비스 내용</h2>
 <p class="small">· 서비스 명칭: {v['svc'] or '-'}<br>
 · 대상 브랜드/제품: {v['target'] or '-'}<br>
@@ -97,7 +98,8 @@ def creator_html(v):
 <p>· <b>Payment Criteria:</b> Payment will be processed on {v['pay_date'] or '____'}, provided the following are verified: content upload completion, content URL submission, signed agreement submission, and bank/PayPal information submission. Payment is refused if any term is breached or if content is deleted or set to private. If compensation in KRW is converted to a foreign currency, Woori Bank's standard exchange rate (기준환율) on the Agreement date applies.</p>
 <div class="sig">Contract Date: {v['contract_date'] or '____ Year ____ Month ____ Day'}<br><br>
 [ Signatures ]<br>
-Agency — BrandSlam Co., Ltd. / CEO: Jang Hyunwoo / Signature: ______________________<br><br>
+Agency — BrandSlam Co., Ltd. / Business Reg. No. 284-88-03016 / CEO: Jang Hyunwoo / Signature: ______________________<br>
+&nbsp;&nbsp;&nbsp;Address: 9F #902, Handeok Bldg, 11 Teheran-ro 7-gil, Gangnam-gu, Seoul<br><br>
 Creator — Full Name: {v['name'] or '____'} / Phone: {v['phone'] or '____'} / Visit Date: {v['visit_date'] or '____'} / Signature: ______________________</div>
 </div>"""
     return inner
