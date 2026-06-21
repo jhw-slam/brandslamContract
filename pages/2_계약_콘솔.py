@@ -101,8 +101,10 @@ if not p:
     st.stop()
 
 # ── 상세 ──────────────────────────────────────────────────────
-st.title(f"{p['brand']} · {p.get('product') or ''}")
-st.caption(f"{cmap.get(p['company_id'],'')} · 기간 {p.get('start_date') or '-'} ~ {p.get('end_date') or '-'}")
+st.title(f"🔗 {p['brand']} · {p.get('product') or ''}")
+st.caption(f"📌 **프로젝트 ID**: `{p['id']}` | 업체: {cmap.get(p['company_id'],'')} | 기간 {p.get('start_date') or '-'} ~ {p.get('end_date') or '-'}")
+
+st.info(f"💡 이 페이지의 모든 송금/계약/정보는 **프로젝트 ID `{p['id']}`로 연결**됩니다. 송금캘린더에서도 같은 ID로 선택하면 같은 데이터를 볼 수 있습니다.")
 
 i = KEYS.index(p["stage"])
 cols = st.columns(len(STAGES))
@@ -171,16 +173,19 @@ with st.expander("금액 · 조건 수정"):
 # ── 송금 일정 (이 프로젝트 · cash_events) ─────────────────────
 st.subheader("송금 일정")
 st.caption("여기서 입력하면 즉시 Supabase에 저장되고, '전체 송금 스케쥴' 페이지에도 합쳐져 보입니다.")
-ce = SUPA.table("cash_events").select("*").eq("project_id", p["id"]).order("due_date").execute().data
+ce = SUPA.table("cash_events").select(
+    "id, project_id, direction, category, title, amount, due_date, paid, paid_date"
+).eq("project_id", p["id"]).order("due_date").execute().data
 if ce:
     for e in ce:
-        cols = st.columns([1.6, 1.2, 1.8, 1.6, 1, 0.7])
+        cols = st.columns([1.4, 1.2, 1.4, 2.2, 1, 1, 0.7])
         cols[0].write((e.get("due_date") or "-")[:10])
         cols[1].write("받을 돈" if e["direction"] == "in" else "나갈 돈")
         cols[2].write(e.get("category") or "")
-        cols[3].write(won(e["amount"]))
-        cols[4].write("완료" if e["paid"] else "예정")
-        if cols[5].button("삭제", key="ce" + e["id"]):
+        cols[3].write(e.get("title") or "-")
+        cols[4].write(won(e["amount"]))
+        cols[5].write("완료" if e["paid"] else "예정")
+        if cols[6].button("삭제", key="ce" + e["id"]):
             SUPA.table("cash_events").delete().eq("id", e["id"]).execute()
             st.toast("삭제됨 ✓"); st.rerun()
 else:
@@ -217,7 +222,7 @@ with st.expander("선금·잔금 예정 자동 만들기 (계약금액 기반)")
             st.toast("선금·잔금 일정 생성됨 ✓"); st.rerun()
 
 # ── 계약서 미리보기 / 다운로드 ────────────────────────────────
-st.subheader("계약서")
+st.subheader("📋 계약서")
 total = p["total_amount"] or 0
 body = f"""통합 홍보 대행 계약서
 
@@ -239,19 +244,27 @@ st.text(body)
 doc_html = ("<html><head><meta charset='utf-8'><style>body{font-family:sans-serif;"
             "white-space:pre-wrap;padding:40px;line-height:1.8}</style></head><body>"
             + body.replace("<", "&lt;") + "</body></html>")
-st.download_button("📄 계약서 HTML 내려받기 (열어서 PDF로 인쇄)", doc_html,
+st.download_button("📄 기본 계약서 내려받기 (인쇄용)", doc_html,
                    file_name=f"계약서_{p['brand']}.html", mime="text/html")
 
-# 「계약서 작성」 탭에서 이 브랜드로 저장한 최종 계약서들
+st.markdown("**💾 저장된 계약서** (계약서 작성/보관함에서 저장)")
 saved = SUPA.table("contracts").select("*").eq("project_id", p["id"]).order("created_at", desc=True).execute().data
 if saved:
-    st.markdown("**저장된 계약서** (계약서 작성 탭에서 저장됨)")
     for s in saved:
-        cols = st.columns([6, 2])
-        cols[0].write(f"· [{s.get('doc_type') or '-'}] {s.get('counterparty') or ''} · {(s.get('created_at') or '')[:10]} · {s.get('sign_status') or 'draft'}")
+        cols = st.columns([6, 1.5, 0.8])
+        doc_type_badge = "🏢" if s.get('doc_type') == 'brand' else "👤"
+        cols[0].write(f"{doc_type_badge} [{s.get('doc_type') or '-'}] {s.get('counterparty') or ''} · {(s.get('created_at') or '')[:10]} · {s.get('sign_status', 'draft')}")
+        
         if s.get("body"):
-            cols[1].download_button("내려받기", s["body"], file_name=f"계약서_{s.get('counterparty') or p['brand']}.html",
-                                    mime="text/html", key="sv" + s["id"])
+            cols[1].download_button("📥 내려받기", s["body"], 
+                                   file_name=f"계약서_{s.get('counterparty', p['brand'])}_{s.get('created_at', '')[:10]}.html",
+                                   mime="text/html", key="sv" + s["id"], use_container_width=True)
+        
+        if cols[2].button("🗑️", key="delc" + s["id"], help="삭제"):
+            SUPA.table("contracts").delete().eq("id", s["id"]).execute()
+            st.rerun()
+else:
+    st.caption("저장된 계약서가 없습니다. '계약서 작성' 탭에서 작성하거나 '계약서 보관함'에서 업로드하세요.")
 
 # ── 알림 발송 로그 ────────────────────────────────────────────
 st.subheader("알림 발송 로그")

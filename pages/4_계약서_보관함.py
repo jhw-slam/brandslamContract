@@ -1,6 +1,8 @@
 import os
 import io
 import re
+import json
+from datetime import datetime
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -35,8 +37,38 @@ def sb():
     return create_client(url, key)
 SUPA = sb()
 
+def load_projects():
+    return SUPA.table("projects").select("*").order("created_at").execute().data
+
+def load_companies():
+    return SUPA.table("companies").select("id,name").execute().data
+
+def get_or_create_company(name):
+    """회사 ID를 얻거나 없으면 생성"""
+    name = (name or "(미상)").strip()
+    r = SUPA.table("companies").select("id").eq("name", name).limit(1).execute().data
+    if r:
+        return r[0]["id"]
+    return SUPA.table("companies").insert({"name": name}).execute().data[0]["id"]
+
+def create_project(company_name, product_name, contract_type):
+    """프로젝트 생성"""
+    company_id = get_or_create_company(company_name)
+    proj = SUPA.table("projects").insert({
+        "company_id": company_id,
+        "brand": company_name,
+        "product": product_name,
+        "campaign": product_name,
+        "stage": "SENT",  # 계약서 발송 단계부터 시작
+        "supply_amount": 0,
+        "total_amount": 0,
+        "doc_type": contract_type,
+    }).execute().data
+    return proj[0] if proj else None
+
 # ── 텍스트 → 계약서 서식 HTML (문단/줄바꿈 유지) ──────────────
 def text_to_html(txt):
+    """텍스트를 HTML 서식으로 변환 (조항 구조 유지)"""
     parts = [p for p in re.split(r"\n\s*\n", txt or "") if p.strip()]
     out = []
     for p in parts:
@@ -68,7 +100,7 @@ def size_images(html):
     return re.sub(r'<img\b[^>]*src="data:image/[^;]+;base64,([^"]+)"[^>]*>', repl, html)
 
 def extract(name, data):
-    """returns (html_for_preview, plain_text_for_edit)"""
+    """파일에서 HTML과 텍스트 추출 (docx, pdf, txt 지원)"""
     n = name.lower()
     try:
         if n.endswith(".docx"):
@@ -86,6 +118,7 @@ def extract(name, data):
         return f"<p>(파일을 읽지 못했습니다: {e})</p>", ""
 
 def guess_party(text, fallback):
+    """계약서 텍스트에서 거래 상대방 이름 추출"""
     for pat in [r"Full Name[:：]\s*([^\n,]{2,40})", r"주식회사\s*([가-힣A-Za-z0-9 ]{1,20})",
                 r"\(주\)\s*([가-힣A-Za-z0-9 ]{1,20})", r"대표이사[:：]?\s*([가-힣]{2,6})"]:
         m = re.search(pat, text or "")
@@ -94,6 +127,7 @@ def guess_party(text, fallback):
     return fallback
 
 def guess_type(text):
+    """계약서 텍스트에서 계약 유형 추측 (인플루언서 vs 브랜드사)"""
     t = text or ""
     if "Creator" in t or "크리에이터" in t or "Campaign Agreement" in t:
         return "인플루언서"
@@ -118,77 +152,150 @@ A4_CSS = (
     ".page img.stamp{width:2.2cm;height:2.2cm;object-fit:contain;vertical-align:middle}"
     "@media print{body{background:#fff}.page{box-shadow:none;margin:0}@page{size:A4;margin:0}}"
 )
+
 def wrap(inner):
+    """HTML을 A4 페이지 서식으로 감싸기"""
     return ("<html><head><meta charset='utf-8'><style>" + A4_CSS +
             "</style></head><body><div class='page'>" + inner + "</div></body></html>")
 
-def projects_for_select():
-    projs = SUPA.table("projects").select("id,brand,product,company_id").order("created_at").execute().data
-    comp = {c["id"]: c["name"] for c in SUPA.table("companies").select("id,name").execute().data}
-    opts = {"(브랜드 선택 안 함)": None}
-    for p in projs:
-        opts[f"{comp.get(p['company_id'],'')} · {p.get('product') or p['brand']}"] = (p["id"], comp.get(p["company_id"], ""))
-    return opts
+def create_contract_record(project_id, doc_type, counterparty, body, html):
+    """계약서를 Supabase에 저장"""
+    return SUPA.table("contracts").insert({
+        "project_id": project_id,
+        "doc_type": doc_type,
+        "counterparty": counterparty,
+        "body": wrap(html),
+        "sign_status": "draft",
+        "uploaded_at": datetime.now().isoformat(),
+    }).execute().data
 
 # ── 화면 ──────────────────────────────────────────────────────
 st.title("계약서 보관함")
-st.caption("계약서 파일(PDF·DOCX·TXT)을 올리면 **서식을 유지한 채** 미리보고, 템플릿으로 재사용해 브랜드에 저장할 수 있어요. (구글드라이브 인증 불필요)")
+st.caption("💡 계약서 파일(PDF·DOCX·TXT)을 업로드하면 **서식을 유지한 채** 미리보고, 브랜드 프로젝트에 **고정값으로 저장**할 수 있습니다. (구글드라이브 인증 불필요)")
 
-with st.expander(f"브랜드슬램(B) 기본정보 — 표준값 (복사용)"):
+with st.expander("📋 브랜드슬램(B) 기본정보 — 표준값"):
     st.code(f"{BRANDSLAM['name']}\n사업자등록번호 {BRANDSLAM['biz']}\n대표이사 {BRANDSLAM['ceo']}\n주소: {BRANDSLAM['addr']}", language=None)
-    st.caption("업로드한 과거 계약서에 회사정보가 다르게 적혀 있으면, 템플릿 편집 시 위 표준값으로 바꿔주세요.")
+    st.caption("업로드한 과거 계약서에 회사정보가 다르면, 아래 편집할 때 위 표준값으로 바꿔주세요.")
 
-files = st.file_uploader("계약서 파일 업로드", type=["pdf", "docx", "txt"], accept_multiple_files=True)
+st.divider()
+st.subheader("📁 계약서 업로드 및 프로젝트 저장")
+
+files = st.file_uploader("계약서 파일 선택 (PDF, DOCX, TXT)", type=["pdf", "docx", "txt"], accept_multiple_files=True)
+
 if files:
     for f in files:
+        st.info(f"📄 파일: **{f.name}**")
         data = f.getvalue()
         html, text = extract(f.name, data)
         party = guess_party(text, f.name.rsplit(".", 1)[0]); typ = guess_type(text)
-        with st.expander(f"📄 {party}  ·  [{typ}]  ·  {f.name}", expanded=True):
-            components.html(wrap(html), height=820, scrolling=True)
-            if st.button("📋 이 계약서를 템플릿으로 사용하기", key="t" + f.name):
-                st.session_state.tpl = {"party": party, "type": typ, "text": text, "html": html}
-                st.rerun()
+        
+        # 미리보기
+        with st.expander(f"📖 미리보기 — [{typ}] {party}", expanded=False):
+            components.html(wrap(html), height=600, scrolling=True)
+        
+        # 프로젝트 선택/생성 UI
+        st.subheader(f"🔗 {party} 계약서 저장")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            action = st.radio("선택", ["기존 프로젝트에 저장", "새 프로젝트 생성"], 
+                             key=f"action_{f.name}", horizontal=True)
+        
+        if action == "기존 프로젝트에 저장":
+            projects = load_projects()
+            companies = load_companies()
+            comp_map = {c["id"]: c["name"] for c in companies}
+            
+            opts = {}
+            for p in projects:
+                label = f"{comp_map.get(p['company_id'], '')} · {p.get('product') or p['brand']}"
+                opts[label] = p
+            
+            if opts:
+                selected_label = st.selectbox(f"프로젝트 선택", list(opts.keys()), key=f"proj_{f.name}")
+                selected_proj = opts[selected_label]
+                
+                if st.button(f"💾 '{selected_label}'에 저장", type="primary", key=f"save_{f.name}"):
+                    create_contract_record(
+                        selected_proj["id"],
+                        doc_type=typ,
+                        counterparty=party,
+                        body=text,
+                        html=html
+                    )
+                    st.success(f"✅ 계약서가 저장되었습니다!")
+            else:
+                st.warning("등록된 프로젝트가 없습니다. 새 프로젝트를 생성하세요.")
+        
+        else:  # 새 프로젝트 생성
+            st.markdown("**새 프로젝트 정보 입력**")
+            ncol1, ncol2 = st.columns(2)
+            with ncol1:
+                new_company = st.text_input(f"업체명", value=party, key=f"comp_{f.name}")
+            with ncol2:
+                new_product = st.text_input(f"상품/캠페인명", key=f"prod_{f.name}")
+            
+            if st.button(f"➕ 새 프로젝트 생성 & 저장", type="primary", key=f"create_{f.name}"):
+                if new_company:
+                    new_proj = create_project(new_company, new_product or "미지정", typ)
+                    if new_proj:
+                        create_contract_record(
+                            new_proj["id"],
+                            doc_type=typ,
+                            counterparty=party,
+                            body=text,
+                            html=html
+                        )
+                        st.success(f"✅ 새 프로젝트가 생성되고 계약서가 저장되었습니다!")
+                        st.info(f"📌 프로젝트 ID: `{new_proj['id']}` | 업체: {new_company}")
+                else:
+                    st.error("업체명을 입력하세요.")
+        
+        st.divider()
 
-# ── 저장된 계약서 (Supabase contracts) ────────────────────────
-st.divider()
-st.subheader("저장된 계약서 (Supabase)")
-saved = SUPA.table("contracts").select("*").order("created_at", desc=True).limit(50).execute().data
+# ── 저장된 계약서 목록 ────────────────────────────────────────
+st.subheader("📚 저장된 계약서")
+
+projects = load_projects()
+companies = load_companies()
+comp_map = {c["id"]: c["name"] for c in companies}
+
+saved = SUPA.table("contracts").select("*").order("created_at", desc=True).limit(100).execute().data
+
 if saved:
-    pj = SUPA.table("projects").select("id,brand,company_id").execute().data
-    cm = {c["id"]: c["name"] for c in SUPA.table("companies").select("id,name").execute().data}
-    pmap = {p["id"]: cm.get(p["company_id"], p["brand"]) for p in pj}
+    # 프로젝트별로 그룹화
+    grouped = {}
     for s in saved:
-        cols = st.columns([6, 2])
-        cols[0].write(f"· [{s.get('doc_type') or '-'}] {s.get('counterparty') or ''} · "
-                      f"{pmap.get(s.get('project_id'), '미연결')} · {(s.get('created_at') or '')[:10]}")
-        if s.get("body"):
-            cols[1].download_button("내려받기", s["body"], file_name=f"계약서_{s.get('counterparty') or 'doc'}.html",
-                                    mime="text/html", key="dl" + s["id"])
+        pid = s.get("project_id")
+        proj = next((p for p in projects if p["id"] == pid), None)
+        if proj:
+            proj_label = f"{comp_map.get(proj['company_id'], '')} · {proj.get('product') or proj['brand']}"
+        else:
+            proj_label = "(미연결)"
+        
+        if proj_label not in grouped:
+            grouped[proj_label] = []
+        grouped[proj_label].append(s)
+    
+    # UI 표시
+    for proj_label, contracts in grouped.items():
+        with st.expander(f"📌 {proj_label} — {len(contracts)}건", expanded=False):
+            for idx, s in enumerate(contracts):
+                cols = st.columns([6, 1.5, 1])
+                cols[0].write(f"• [{s.get('doc_type') or '-'}] {s.get('counterparty') or ''} · {(s.get('created_at') or '')[:10]}")
+                
+                if s.get("body"):
+                    cols[1].download_button(
+                        "📄 내려받기",
+                        s["body"],
+                        file_name=f"계약서_{s.get('counterparty', 'doc')}_{s.get('created_at', '')[:10]}.html",
+                        mime="text/html",
+                        key=f"dl_{s['id']}"
+                    )
+                
+                # 삭제 버튼
+                if cols[2].button("🗑️", key=f"del_{s['id']}", help="삭제"):
+                    SUPA.table("contracts").delete().eq("id", s["id"]).execute()
+                    st.rerun()
 else:
-    st.caption("· 아직 저장된 계약서가 없습니다. 위에서 업로드 후 '템플릿으로 사용' → 브랜드 저장하거나, '계약서 작성' 탭에서 저장하세요.")
-
-# ── 템플릿 사용: 내용 수정 → 브랜드로 저장 (서식 유지) ────────
-tpl = st.session_state.get("tpl")
-if tpl:
-    st.divider()
-    st.subheader(f"템플릿 사용 — {tpl['party']} ({tpl['type']})")
-    edited = st.text_area("계약 내용 수정 (머지값·금액·조건·날짜 등) — 회사정보는 위 표준값 참고", value=tpl["text"], height=420)
-    st.markdown("**미리보기 (A4, 서식 유지)**")
-    components.html(wrap(text_to_html(edited)), height=560, scrolling=True)
-    opts = projects_for_select()
-    c1, c2 = st.columns([2, 1])
-    target_label = c1.selectbox("어느 브랜드 계약현황으로 저장할까요?", list(opts.keys()))
-    target = opts[target_label]
-    if c2.button("💾 이 브랜드로 저장", type="primary", use_container_width=True):
-        SUPA.table("contracts").insert({
-            "project_id": target[0] if target else None,
-            "doc_type": "creator" if tpl["type"] == "인플루언서" else "brand",
-            "counterparty": tpl["party"], "body": wrap(text_to_html(edited)), "sign_status": "draft",
-        }).execute()
-        st.session_state.pop("tpl", None)
-        st.toast("Supabase에 저장되었습니다 ✓")
-        st.success(f"저장 완료 — {target[1] if target else '브랜드 미연결'}. 콘솔/이 목록에서 확인하세요.")
-        st.rerun()
-    if st.button("템플릿 닫기"):
-        st.session_state.pop("tpl", None); st.rerun()
+    st.info("아직 저장된 계약서가 없습니다. 위에서 파일을 업로드하고 프로젝트에 저장하세요.")

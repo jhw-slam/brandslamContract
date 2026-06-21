@@ -106,81 +106,115 @@ Creator — Full Name: {v['name'] or '____'} / Phone: {v['phone'] or '____'} / V
 
 # ── 화면 ──────────────────────────────────────────────────────
 st.title("계약서 작성")
+st.caption("💡 **팁**: 계약서 보관함에서 파일 업로드 후 저장한 계약서를 여기서 불러올 수 있습니다!")
+
 projects = load_projects(); cmap = companies_map()
 proj_opts = {"(연결 안 함)": None}
 for p in projects:
     proj_opts[f"{cmap.get(p['company_id'],'')} · {p.get('product') or p.get('campaign') or p['brand']}"] = p
 
-c1, c2 = st.columns(2)
-kind = c1.radio("계약서 종류", ["브랜드사용", "인플루언서용"], horizontal=True)
-proj_label = c2.selectbox("연결할 브랜드(계약현황에 저장됨)", list(proj_opts.keys()))
-proj = proj_opts[proj_label]
+# 탭: 새로 작성 vs 기존 계약서 불러오기
+tab1, tab2 = st.tabs(["✏️ 새로 작성", "📂 기존 계약서 수정"])
 
-left, right = st.columns([1, 1.3])
-
-with left:
-    st.subheader("머지값")
-    if kind == "브랜드사용":
-        a_name = st.text_input("브랜드사 상호", value=(cmap.get(proj["company_id"], "") if proj else ""))
-        cc = st.columns(2)
-        a_biz = cc[0].text_input("사업자등록번호"); a_ceo = cc[1].text_input("대표이사")
-        sign_date = st.text_input("계약일", placeholder="2026-06-11")
-        svc = st.text_input("서비스 명칭", value="인플루언서 시딩 홍보 대행 서비스")
-        target = st.text_input("대상 브랜드/제품", value=(proj.get("product") if proj else ""))
-        cc = st.columns(3)
-        platform = cc[0].text_input("플랫폼", value="틱톡·인스타그램")
-        country = cc[1].text_input("운영 국가", value="미국")
-        scale = cc[2].text_input("운영 규모", value="")
-        cc = st.columns(3)
-        tier = cc[0].text_input("인플루언서 기준", value="나노·마이크로")
-        qty = cc[1].text_input("수량", value="")
-        ctype = cc[2].text_input("콘텐츠 유형", value="제품 리뷰")
-        supply = st.number_input("공급가액(VAT별도)", min_value=0,
-                                 value=int(proj["supply_amount"]) if proj else 0, step=100000)
-        cc = st.columns(2)
-        dep = cc[0].number_input("선금 비율", 0.0, 1.0, 0.5, 0.1)
-        bal = cc[1].number_input("잔금 비율", 0.0, 1.0, 0.5, 0.1)
-        bal_when = st.text_input("잔금 지급시점", value="리포트 제출 시")
-        cc = st.columns(4)
-        pay = cc[0].text_input("결제 방식", value="계좌이체")
-        period = cc[1].text_input("기간(개월)", value="3")
-        refund = cc[2].text_input("환불(일)", value="3")
-        swap = cc[3].text_input("교체(%)", value="30")
-        noup = st.text_input("미집행 교체(일)", value="90")
-        v = dict(a_name=a_name, a_biz=a_biz, a_ceo=a_ceo, sign_date=sign_date, svc=svc,
-                 target=target, platform=platform, country=country, scale=scale, tier=tier,
-                 qty=qty, ctype=ctype, supply=supply, dep=dep, bal=bal, bal_when=bal_when,
-                 pay=pay, period=period, refund=refund, swap=swap, noup=noup)
-        inner = brand_html(v); counterparty = a_name or "브랜드사"
+with tab2:
+    st.subheader("저장된 계약서에서 불러오기")
+    saved_contracts = SUPA.table("contracts").select("*").order("created_at", desc=True).limit(50).execute().data
+    
+    if saved_contracts:
+        contract_opts = {}
+        for s in saved_contracts:
+            proj = next((p for p in projects if p["id"] == s.get("project_id")), None)
+            if proj:
+                proj_label = f"{cmap.get(proj['company_id'], '')} · {proj.get('product') or proj['brand']}"
+            else:
+                proj_label = "(미연결)"
+            label = f"[{s.get('doc_type', '-')}] {s.get('counterparty', '')} · {proj_label} · {s.get('created_at', '')[:10]}"
+            contract_opts[label] = s
+        
+        selected_contract_label = st.selectbox("계약서 선택", list(contract_opts.keys()))
+        selected_contract = contract_opts[selected_contract_label]
+        
+        st.info(f"📌 선택된 계약서: {selected_contract_label}")
+        
+        if st.button("📂 이 계약서 불러오기", type="primary"):
+            st.session_state.loaded_contract = selected_contract
+            st.rerun()
     else:
-        name = st.text_input("Creator name")
-        phone = st.text_input("Phone")
-        payment = st.text_input("Compensation (Fee)", placeholder="예: USD 300 / ₩400,000")
-        store = st.text_input("Store (매장)", value="the designated store")
-        visit_date = st.text_input("Visit date", placeholder="2026-07-01")
-        pay_date = st.text_input("Payment processing date", placeholder="2026-07-31")
-        contract_date = st.text_input("Contract date", placeholder="2026-06-11")
-        v = dict(name=name, phone=phone, payment=payment, store=store, visit_date=visit_date,
-                 pay_date=pay_date, contract_date=contract_date)
-        inner = creator_html(v); counterparty = name or "Creator"
+        st.info("저장된 계약서가 없습니다. '계약서 보관함'에서 파일을 업로드하여 저장해주세요.")
 
-with right:
-    st.subheader("미리보기 (A4)")
-    st.components.v1.html(wrap(inner), height=900, scrolling=True)
+with tab1:
+    st.subheader("새 계약서 작성")
+    
+    c1, c2 = st.columns(2)
+    kind = c1.radio("계약서 종류", ["브랜드사용", "인플루언서용"], horizontal=True)
+    proj_label = c2.selectbox("연결할 브랜드(계약현황에 저장됨)", list(proj_opts.keys()))
+    proj = proj_opts[proj_label]
 
-full_html = wrap(inner)
-b1, b2 = st.columns(2)
-b1.download_button("📄 계약서 내려받기 (열어서 PDF로 인쇄)", full_html,
-                   file_name=f"계약서_{counterparty}.html", mime="text/html", use_container_width=True)
-if b2.button("💾 이 브랜드 계약현황에 저장", type="primary", use_container_width=True):
-    SUPA.table("contracts").insert({
-        "project_id": proj["id"] if proj else None,
-        "doc_type": "brand" if kind == "브랜드사용" else "creator",
-        "counterparty": counterparty,
-        "merge_values": json.loads(json.dumps(v, default=str)),
-        "body": full_html, "sign_status": "draft",
-    }).execute()
-    if proj:
-        st.success(f"저장 완료 — '{cmap.get(proj['company_id'],'')}' 계약현황(콘솔)에서 확인할 수 있어요.")
-    else:
-        st.success("저장 완료 (브랜드 미연결). 콘솔에 표시하려면 브랜드를 연결해 다시 저장하세요.")
+    left, right = st.columns([1, 1.3])
+
+    with left:
+        st.subheader("정보 입력")
+        if kind == "브랜드사용":
+            a_name = st.text_input("브랜드사 상호", value=(cmap.get(proj["company_id"], "") if proj else ""))
+            cc = st.columns(2)
+            a_biz = cc[0].text_input("사업자등록번호"); a_ceo = cc[1].text_input("대표이사")
+            sign_date = st.text_input("계약일", placeholder="2026-06-11")
+            svc = st.text_input("서비스 명칭", value="인플루언서 시딩 홍보 대행 서비스")
+            target = st.text_input("대상 브랜드/제품", value=(proj.get("product") if proj else ""))
+            cc = st.columns(3)
+            platform = cc[0].text_input("플랫폼", value="틱톡·인스타그램")
+            country = cc[1].text_input("운영 국가", value="미국")
+            scale = cc[2].text_input("운영 규모", value="")
+            cc = st.columns(3)
+            tier = cc[0].text_input("인플루언서 기준", value="나노·마이크로")
+            qty = cc[1].text_input("수량", value="")
+            ctype = cc[2].text_input("콘텐츠 유형", value="제품 리뷰")
+            supply = st.number_input("공급가액(VAT별도)", min_value=0,
+                                     value=int(proj["supply_amount"]) if proj else 0, step=100000)
+            cc = st.columns(2)
+            dep = cc[0].number_input("선금 비율", 0.0, 1.0, 0.5, 0.1)
+            bal = cc[1].number_input("잔금 비율", 0.0, 1.0, 0.5, 0.1)
+            bal_when = st.text_input("잔금 지급시점", value="리포트 제출 시")
+            cc = st.columns(4)
+            pay = cc[0].text_input("결제 방식", value="계좌이체")
+            period = cc[1].text_input("기간(개월)", value="3")
+            refund = cc[2].text_input("환불(일)", value="3")
+            swap = cc[3].text_input("교체(%)", value="30")
+            noup = st.text_input("미집행 교체(일)", value="90")
+            v = dict(a_name=a_name, a_biz=a_biz, a_ceo=a_ceo, sign_date=sign_date, svc=svc,
+                     target=target, platform=platform, country=country, scale=scale, tier=tier,
+                     qty=qty, ctype=ctype, supply=supply, dep=dep, bal=bal, bal_when=bal_when,
+                     pay=pay, period=period, refund=refund, swap=swap, noup=noup)
+            inner = brand_html(v); counterparty = a_name or "브랜드사"
+        else:
+            name = st.text_input("Creator name")
+            phone = st.text_input("Phone")
+            payment = st.text_input("Compensation (Fee)", placeholder="예: USD 300 / ₩400,000")
+            store = st.text_input("Store (매장)", value="the designated store")
+            visit_date = st.text_input("Visit date", placeholder="2026-07-01")
+            pay_date = st.text_input("Payment processing date", placeholder="2026-07-31")
+            contract_date = st.text_input("Contract date", placeholder="2026-06-11")
+            v = dict(name=name, phone=phone, payment=payment, store=store, visit_date=visit_date,
+                     pay_date=pay_date, contract_date=contract_date)
+            inner = creator_html(v); counterparty = name or "Creator"
+
+    with right:
+        st.subheader("📄 미리보기 (A4)")
+        st.components.v1.html(wrap(inner), height=900, scrolling=True)
+
+    full_html = wrap(inner)
+    b1, b2 = st.columns(2)
+    b1.download_button("📄 내려받기 (열어서 PDF로 인쇄)", full_html,
+                       file_name=f"계약서_{counterparty}.html", mime="text/html", use_container_width=True)
+    if b2.button("💾 계약현황에 저장", type="primary", use_container_width=True):
+        SUPA.table("contracts").insert({
+            "project_id": proj["id"] if proj else None,
+            "doc_type": "brand" if kind == "브랜드사용" else "creator",
+            "counterparty": counterparty,
+            "merge_values": json.loads(json.dumps(v, default=str)),
+            "body": full_html, "sign_status": "draft",
+        }).execute()
+        if proj:
+            st.success(f"✅ 저장 완료 — '{cmap.get(proj['company_id'],'')}' 계약현황(콘솔)에서 확인하세요.")
+        else:
+            st.success("✅ 저장 완료 (브랜드 미연결). 프로젝트를 연결해서 다시 저장하세요.")

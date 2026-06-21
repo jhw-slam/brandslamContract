@@ -64,7 +64,9 @@ def load_real():
     comp = {c["id"]: c["name"] for c in SUPA.table("companies").select("id,name").execute().data}
     for p in projs:
         p["company"] = comp.get(p["company_id"], p.get("brand"))
-    cash = SUPA.table("cash_events").select("*").execute().data
+    cash = SUPA.table("cash_events").select(
+        "id, project_id, direction, category, title, amount, due_date, paid, paid_date"
+    ).execute().data
     contracts = SUPA.table("contracts").select("id,project_id,doc_type,created_at").execute().data
     try:
         camp_n = SUPA.table("campaigns").select("id", count="exact").execute().count or 0
