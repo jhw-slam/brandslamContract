@@ -101,10 +101,15 @@ if not p:
     st.stop()
 
 # ── 상세 ──────────────────────────────────────────────────────
-st.title(f"🔗 {p['brand']} · {p.get('product') or ''}")
-st.caption(f"📌 **프로젝트 ID**: `{p['id']}` | 업체: {cmap.get(p['company_id'],'')} | 기간 {p.get('start_date') or '-'} ~ {p.get('end_date') or '-'}")
+st.title(f"{p['brand']} · {p.get('product') or ''}")
+st.caption(f"{cmap.get(p['company_id'],'')} · 기간 {p.get('start_date') or '-'} ~ {p.get('end_date') or '-'}")
 
-st.info(f"💡 이 페이지의 모든 송금/계약/정보는 **프로젝트 ID `{p['id']}`로 연결**됩니다. 송금캘린더에서도 같은 ID로 선택하면 같은 데이터를 볼 수 있습니다.")
+# 이 프로젝트의 송금 일정(여러 입금/출금)을 한 번에 합산 → 위 요약에 반영
+ce = SUPA.table("cash_events").select("*").eq("project_id", p["id"]).order("due_date").execute().data
+in_total = sum(e["amount"] or 0 for e in ce if e["direction"] == "in")
+in_unpaid = sum(e["amount"] or 0 for e in ce if e["direction"] == "in" and not e["paid"])
+out_total = sum(e["amount"] or 0 for e in ce if e["direction"] == "out")
+out_unpaid = sum(e["amount"] or 0 for e in ce if e["direction"] == "out" and not e["paid"])
 
 i = KEYS.index(p["stage"])
 cols = st.columns(len(STAGES))
@@ -112,11 +117,17 @@ for n, (k, lab) in enumerate(STAGES):
     mark = "✅" if n < i else ("🟠" if n == i else "⚪")
     cols[n].markdown(f"<div style='text-align:center;font-size:12px'>{mark}<br>{lab}</div>", unsafe_allow_html=True)
 
+# 송금 일정이 있으면 그 합계를, 없으면 계약(공급가) 기준값을 표시
+recv_total = in_total if ce else (p["total_amount"] or 0)
+recv_unpaid = in_unpaid if ce else outstanding(p)
 m = st.columns(4)
-m[0].metric("총 계약금액(VAT포함)", won(p["total_amount"]))
-m[1].metric("선금", won(p["deposit_amount"]) + (" ✓" if p["deposit_paid"] else " (대기)"))
-m[2].metric("미수금", won(outstanding(p)))
+m[0].metric("받을 금액(합계)", won(recv_total))
+m[1].metric("미수금(받을 잔액)", won(recv_unpaid))
+m[2].metric("나갈 미지급", won(out_unpaid))
 m[3].metric("단계", LABEL[p["stage"]])
+if ce:
+    st.caption(f"송금 {len(ce)}건 합산 · 받을 {won(in_total)}(미수 {won(in_unpaid)}) · 나갈 {won(out_total)}(미지급 {won(out_unpaid)})"
+               + (f" · 계약 공급가 {won(p['supply_amount'])}" if (p['supply_amount'] or 0) else ""))
 
 ca, cb, cc = st.columns(3)
 if i < len(STAGES) - 1 and ca.button(f"▶ 「{STAGES[i+1][1]}」 진행", type="primary", use_container_width=True):
@@ -138,7 +149,7 @@ if cc.button("📨 현재 단계 알림 보내기", use_container_width=True):
 
 # ── 수익 구조 ─────────────────────────────────────────────────
 st.subheader("수익 구조")
-vs = vendors_of(p["id"]); vtotal = sum(v["amount"] or 0 for v in vs); supply = p["supply_amount"] or 0
+vs = vendors_of(p["id"]); vtotal = sum(v["amount"] or 0 for v in vs); supply = p["supply_amount"] or in_total
 mc = st.columns(3)
 mc[0].metric("매출(공급가)", won(supply))
 mc[1].metric("실행사 비용", won(vtotal))
@@ -172,20 +183,16 @@ with st.expander("금액 · 조건 수정"):
 
 # ── 송금 일정 (이 프로젝트 · cash_events) ─────────────────────
 st.subheader("송금 일정")
-st.caption("여기서 입력하면 즉시 Supabase에 저장되고, '전체 송금 스케쥴' 페이지에도 합쳐져 보입니다.")
-ce = SUPA.table("cash_events").select(
-    "id, project_id, direction, category, title, amount, due_date, paid, paid_date"
-).eq("project_id", p["id"]).order("due_date").execute().data
+st.caption("여기서 입력하면 즉시 Supabase에 저장되고, '전체 송금 스케쥴' 페이지에도 합쳐져 보입니다. 위 요약 금액은 아래 항목들을 모두 합산한 값이에요.")
 if ce:
     for e in ce:
-        cols = st.columns([1.4, 1.2, 1.4, 2.2, 1, 1, 0.7])
+        cols = st.columns([1.6, 1.2, 1.8, 1.6, 1, 0.7])
         cols[0].write((e.get("due_date") or "-")[:10])
         cols[1].write("받을 돈" if e["direction"] == "in" else "나갈 돈")
         cols[2].write(e.get("category") or "")
-        cols[3].write(e.get("title") or "-")
-        cols[4].write(won(e["amount"]))
-        cols[5].write("완료" if e["paid"] else "예정")
-        if cols[6].button("삭제", key="ce" + e["id"]):
+        cols[3].write(won(e["amount"]))
+        cols[4].write("완료" if e["paid"] else "예정")
+        if cols[5].button("삭제", key="ce" + e["id"]):
             SUPA.table("cash_events").delete().eq("id", e["id"]).execute()
             st.toast("삭제됨 ✓"); st.rerun()
 else:
@@ -222,7 +229,7 @@ with st.expander("선금·잔금 예정 자동 만들기 (계약금액 기반)")
             st.toast("선금·잔금 일정 생성됨 ✓"); st.rerun()
 
 # ── 계약서 미리보기 / 다운로드 ────────────────────────────────
-st.subheader("📋 계약서")
+st.subheader("계약서")
 total = p["total_amount"] or 0
 body = f"""통합 홍보 대행 계약서
 
@@ -244,27 +251,19 @@ st.text(body)
 doc_html = ("<html><head><meta charset='utf-8'><style>body{font-family:sans-serif;"
             "white-space:pre-wrap;padding:40px;line-height:1.8}</style></head><body>"
             + body.replace("<", "&lt;") + "</body></html>")
-st.download_button("📄 기본 계약서 내려받기 (인쇄용)", doc_html,
+st.download_button("📄 계약서 HTML 내려받기 (열어서 PDF로 인쇄)", doc_html,
                    file_name=f"계약서_{p['brand']}.html", mime="text/html")
 
-st.markdown("**💾 저장된 계약서** (계약서 작성/보관함에서 저장)")
+# 「계약서 작성」 탭에서 이 브랜드로 저장한 최종 계약서들
 saved = SUPA.table("contracts").select("*").eq("project_id", p["id"]).order("created_at", desc=True).execute().data
 if saved:
+    st.markdown("**저장된 계약서** (계약서 작성 탭에서 저장됨)")
     for s in saved:
-        cols = st.columns([6, 1.5, 0.8])
-        doc_type_badge = "🏢" if s.get('doc_type') == 'brand' else "👤"
-        cols[0].write(f"{doc_type_badge} [{s.get('doc_type') or '-'}] {s.get('counterparty') or ''} · {(s.get('created_at') or '')[:10]} · {s.get('sign_status', 'draft')}")
-        
+        cols = st.columns([6, 2])
+        cols[0].write(f"· [{s.get('doc_type') or '-'}] {s.get('counterparty') or ''} · {(s.get('created_at') or '')[:10]} · {s.get('sign_status') or 'draft'}")
         if s.get("body"):
-            cols[1].download_button("📥 내려받기", s["body"], 
-                                   file_name=f"계약서_{s.get('counterparty', p['brand'])}_{s.get('created_at', '')[:10]}.html",
-                                   mime="text/html", key="sv" + s["id"], use_container_width=True)
-        
-        if cols[2].button("🗑️", key="delc" + s["id"], help="삭제"):
-            SUPA.table("contracts").delete().eq("id", s["id"]).execute()
-            st.rerun()
-else:
-    st.caption("저장된 계약서가 없습니다. '계약서 작성' 탭에서 작성하거나 '계약서 보관함'에서 업로드하세요.")
+            cols[1].download_button("내려받기", s["body"], file_name=f"계약서_{s.get('counterparty') or p['brand']}.html",
+                                    mime="text/html", key="sv" + s["id"])
 
 # ── 알림 발송 로그 ────────────────────────────────────────────
 st.subheader("알림 발송 로그")
