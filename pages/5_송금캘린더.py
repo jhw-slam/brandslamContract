@@ -84,21 +84,21 @@ df = pd.DataFrame(events)
 df["due_date"] = pd.to_datetime(df["due_date"], errors="coerce")
 inc = df[df["direction"] == "in"]; out = df[df["direction"] == "out"]
 k = st.columns(4)
-k[0].metric("받을 돈(전체)", won(inc["amount"].sum()))
-k[1].metric("나갈 돈(전체)", won(out["amount"].sum()))
-k[2].metric("미입금(받을)", won(inc[~inc["paid"]]["amount"].sum()))
-k[3].metric("미지급(나갈)", won(out[~out["paid"]]["amount"].sum()))
+k[0].metric("입금완료(받은)", won(inc[inc["paid"] == True]["amount"].sum()))
+k[1].metric("미입금(받을)", won(inc[inc["paid"] != True]["amount"].sum()))
+k[2].metric("지급완료(나간)", won(out[out["paid"] == True]["amount"].sum()))
+k[3].metric("미지급(나갈)", won(out[out["paid"] != True]["amount"].sum()))
 
 fc = st.columns([1.6, 1])
-flt = fc[0].radio("상태 필터", ["전체", "받을·미입금", "받을·완료", "나갈·미지급"], horizontal=True)
+flt = fc[0].radio("상태 필터", ["전체", "미입금", "입금완료", "미지급"], horizontal=True)
 proj_opts = ["전체 프로젝트"] + [plabel[p["id"]] for p in projs] + ["(프로젝트 없음)"]
 projsel = fc[1].selectbox("프로젝트별 보기", proj_opts)
 label2id = {plabel[p["id"]]: p["id"] for p in projs}
 
 def _keep(e):
-    if flt == "받을·미입금": ok = e["direction"] == "in" and not e["paid"]
-    elif flt == "받을·완료": ok = e["direction"] == "in" and e["paid"]
-    elif flt == "나갈·미지급": ok = e["direction"] == "out" and not e["paid"]
+    if flt == "미입금": ok = e["direction"] == "in" and not e["paid"]
+    elif flt == "입금완료": ok = e["direction"] == "in" and e["paid"]
+    elif flt == "미지급": ok = e["direction"] == "out" and not e["paid"]
     else: ok = True
     if projsel == "(프로젝트 없음)": ok = ok and (e.get("project_id") is None)
     elif projsel != "전체 프로젝트": ok = ok and (e.get("project_id") == label2id.get(projsel))
