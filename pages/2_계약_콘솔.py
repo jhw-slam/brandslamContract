@@ -129,6 +129,22 @@ if ce:
     st.caption(f"송금 {len(ce)}건 합산 · 받을 {won(in_total)}(미수 {won(in_unpaid)}) · 나갈 {won(out_total)}(미지급 {won(out_unpaid)})"
                + (f" · 계약 공급가 {won(p['supply_amount'])}" if (p['supply_amount'] or 0) else ""))
 
+# 선작업·미입금 경고 + 다음 할 일
+_NEXT = {"LEAD": "계약서 발송", "SENT": "서명 받기", "SIGNED": "선금 청구·입금 확인",
+         "DEPOSIT": "캠페인 진행", "PROGRESS": "성과보고서 업로드 → 잔금 청구",
+         "BALANCE": "잔금 입금 확인", "SETTLED": "완료"}
+if in_unpaid > 0 and p["stage"] in ("PROGRESS", "BALANCE", "SETTLED"):
+    st.error(f"🔴 일은 진행 중인데 미입금 **{won(in_unpaid)}** 남아 있어요. 다음 할 일: **{_NEXT.get(p['stage'],'-')}**")
+elif in_unpaid > 0:
+    st.warning(f"🟠 미수 {won(in_unpaid)} · 다음 할 일: {_NEXT.get(p['stage'],'-')}")
+
+# 성과보고서 링크
+rc = st.columns([3, 1])
+if p.get("report_url"):
+    rc[0].markdown(f"📑 [성과보고서 열기]({p['report_url']})")
+else:
+    rc[0].caption("성과보고서 링크 없음 (아래 '금액·조건 수정'에서 등록)")
+
 ca, cb, cc = st.columns(3)
 if i < len(STAGES) - 1 and ca.button(f"▶ 「{STAGES[i+1][1]}」 진행", type="primary", use_container_width=True):
     nxt = KEYS[i + 1]; upd = {"stage": nxt}
@@ -176,9 +192,11 @@ with st.expander("금액 · 조건 수정"):
         dr = st.number_input("선금 비율", value=float(p["dep_ratio"] or 0.5), min_value=0.0, max_value=1.0, step=0.1)
         br = st.number_input("잔금 비율", value=float(p["bal_ratio"] or 0.5), min_value=0.0, max_value=1.0, step=0.1)
         terms = st.text_area("특이사항", value=p.get("terms") or "")
+        report_url = st.text_input("성과보고서 링크 (외부 사이트 URL)", value=p.get("report_url") or "")
         if st.form_submit_button("저장"):
             SUPA.table("projects").update({"supply_amount": int(ns), "dep_ratio": dr,
-                                           "bal_ratio": br, "terms": terms}).eq("id", p["id"]).execute()
+                                           "bal_ratio": br, "terms": terms,
+                                           "report_url": report_url or None}).eq("id", p["id"]).execute()
             st.toast("Supabase에 저장되었습니다 ✓"); st.rerun()
 
 # ── 송금 일정 (이 프로젝트 · cash_events) ─────────────────────
