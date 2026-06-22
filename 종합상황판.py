@@ -199,6 +199,63 @@ if alerts:
 else:
     st.success("정체·연체 항목이 없습니다. 모든 계약이 정상 흐름이에요.")
 
+# ── 2.5) 수금 현황 (입금 / 선작업 미입금 / 미수 대기 분리) ─────
+st.subheader("💸 수금 현황 — 입금됨 vs 일 먼저 진행 중(미입금)")
+NEXT = {"LEAD": "계약서 발송", "SENT": "서명 받기", "SIGNED": "선금 청구·입금 확인",
+        "DEPOSIT": "캠페인 진행", "PROGRESS": "성과보고서 업로드 → 잔금 청구",
+        "BALANCE": "잔금 입금 확인", "SETTLED": "완료"}
+WORK = ("PROGRESS", "BALANCE", "SETTLED")  # 사실상 일이 진행된 단계
+
+byp = {}
+if not cdf.empty:
+    for pid, g in cdf[cdf["direction"] == "in"].groupby("project_id"):
+        byp[pid] = {"paid": int(g[g["paid"] == True]["amount"].sum()),
+                    "unpaid": int(g[g["paid"] == False]["amount"].sum())}
+
+def report_link(p):
+    return f"  ·  [📑 성과보고서]({p['report_url']})" if p.get("report_url") else ""
+
+paid_list, risk_list, wait_list = [], [], []
+for p in projs:
+    a = byp.get(p["id"], {"paid": 0, "unpaid": 0})
+    if a["unpaid"] > 0 and p["stage"] in WORK:
+        risk_list.append((p, a))
+    elif a["unpaid"] > 0:
+        wait_list.append((p, a))
+    if a["paid"] > 0:
+        paid_list.append((p, a))
+
+sc = st.columns(3)
+sc[0].metric("✅ 수금 완료", f"{len(paid_list)}건", won_short(sum(a['paid'] for _, a in paid_list)))
+sc[1].metric("🔴 선작업·미입금 (최우선)", f"{len(risk_list)}건", "−" + won_short(sum(a['unpaid'] for _, a in risk_list)), delta_color="inverse")
+sc[2].metric("🟠 미수 대기(초기단계)", f"{len(wait_list)}건", "−" + won_short(sum(a['unpaid'] for _, a in wait_list)), delta_color="inverse")
+
+with st.expander(f"🔴 일은 진행 중인데 아직 미입금 — {len(risk_list)}건 (가장 위험·최우선 회수)", expanded=bool(risk_list)):
+    if risk_list:
+        for p, a in sorted(risk_list, key=lambda x: -x[1]["unpaid"]):
+            st.markdown(f"🔴 **{p['company']} · {p.get('product') or p['brand']}** — 미입금 **{won(a['unpaid'])}** · "
+                        f"현재 [{LABEL[p['stage']]}] → 다음 할 일: **{NEXT.get(p['stage'],'-')}**" + report_link(p))
+    else:
+        st.caption("해당 없음 — 진행 중 프로젝트는 모두 입금 확인됨.")
+
+with st.expander(f"📋 받을 돈 미수 — 잔금까지 가는 체크리스트 (총 {len(risk_list)+len(wait_list)}건)"):
+    allunpaid = sorted(risk_list + wait_list, key=lambda x: KEYS.index(x[0]["stage"]), reverse=True)
+    if allunpaid:
+        for p, a in allunpaid:
+            flag = "🔴" if p["stage"] in WORK else "🟠"
+            st.markdown(f"{flag} **{p['company']} · {p.get('product') or p['brand']}** — 미수 {won(a['unpaid'])} · "
+                        f"[{LABEL[p['stage']]}] → **{NEXT.get(p['stage'],'-')}**" + report_link(p))
+    else:
+        st.caption("미수 항목이 없습니다.")
+
+with st.expander(f"✅ 수금 완료 프로젝트 — {len(paid_list)}건"):
+    if paid_list:
+        for p, a in sorted(paid_list, key=lambda x: -x[1]["paid"]):
+            rem = f" · 잔여 미입금 {won(a['unpaid'])}" if a["unpaid"] else ""
+            st.markdown(f"✅ **{p['company']} · {p.get('product') or p['brand']}** — 수금 {won(a['paid'])}{rem}" + report_link(p))
+    else:
+        st.caption("아직 수금 완료된 건이 없습니다.")
+
 # ── 3) 파이프라인 단계 분포 ───────────────────────────────────
 st.subheader("📊 파이프라인 단계 분포")
 counts = {lab: 0 for _, lab in STAGES}
