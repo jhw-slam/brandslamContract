@@ -117,17 +117,28 @@ for n, (k, lab) in enumerate(STAGES):
     mark = "✅" if n < i else ("🟠" if n == i else "⚪")
     cols[n].markdown(f"<div style='text-align:center;font-size:12px'>{mark}<br>{lab}</div>", unsafe_allow_html=True)
 
-# 송금 일정이 있으면 그 합계를, 없으면 계약(공급가) 기준값을 표시
-recv_total = in_total if ce else (p["total_amount"] or 0)
-recv_unpaid = in_unpaid if ce else outstanding(p)
-m = st.columns(4)
-m[0].metric("받을 금액(합계)", won(recv_total))
-m[1].metric("미수금(받을 잔액)", won(recv_unpaid))
-m[2].metric("나갈 미지급", won(out_unpaid))
-m[3].metric("단계", LABEL[p["stage"]])
-if ce:
-    st.caption(f"송금 {len(ce)}건 합산 · 받을 {won(in_total)}(미수 {won(in_unpaid)}) · 나갈 {won(out_total)}(미지급 {won(out_unpaid)})"
-               + (f" · 계약 공급가 {won(p['supply_amount'])}" if (p['supply_amount'] or 0) else ""))
+# ── 매출 · 매입 통일 요약 (모두 cash_events 기준) ─────────────
+# 매출 = 들어올/받은 돈(in) · 매입 = 나갈/나간 돈(out)
+in_paid = sum(e["amount"] or 0 for e in ce if e["direction"] == "in" and e["paid"])
+out_paid = sum(e["amount"] or 0 for e in ce if e["direction"] == "out" and e["paid"])
+profit = in_total - out_total
+margin = round(profit / in_total * 100) if in_total else 0
+supply = p["supply_amount"] or in_total
+
+st.markdown("**매출 (받을 돈)**")
+r1 = st.columns(4)
+r1[0].metric("매출 합계", won(in_total))
+r1[1].metric("받은(입금완료)", won(in_paid))
+r1[2].metric("미수금", won(in_unpaid))
+r1[3].metric("단계", LABEL[p["stage"]])
+st.markdown("**매입 (나갈 돈 · 실행사 지급 등)**")
+r2 = st.columns(4)
+r2[0].metric("매입 합계", won(out_total))
+r2[1].metric("지급완료(나간)", won(out_paid))
+r2[2].metric("미지급", won(out_unpaid))
+r2[3].metric("이윤 · 이윤율", f"{won(profit)} · {margin}%")
+st.caption(f"송금 {len(ce)}건 합산 · 매출 {won(in_total)}(미수 {won(in_unpaid)}) · 매입 {won(out_total)}(미지급 {won(out_unpaid)}) · 이윤 {won(profit)}"
+           + (f" · 계약 공급가(VAT별도) {won(p['supply_amount'])}" if (p['supply_amount'] or 0) else ""))
 
 # 선작업·미입금 경고 + 다음 할 일
 _NEXT = {"LEAD": "계약서 발송", "SENT": "서명 받기", "SIGNED": "선금 청구·입금 확인",
@@ -163,28 +174,6 @@ if cc.button("📨 현재 단계 알림 보내기", use_container_width=True):
     push_notif(p["id"], p["stage"], f"[{LABEL[p['stage']]}] 단계를 완료해 주세요.")
     st.rerun()
 
-# ── 수익 구조 ─────────────────────────────────────────────────
-st.subheader("수익 구조")
-vs = vendors_of(p["id"]); vtotal = sum(v["amount"] or 0 for v in vs); supply = p["supply_amount"] or in_total
-mc = st.columns(3)
-mc[0].metric("매출(공급가)", won(supply))
-mc[1].metric("실행사 비용", won(vtotal))
-rate = round((supply - vtotal) / supply * 100) if supply else 0
-mc[2].metric("이윤 · 이윤율", f"{won(supply - vtotal)} · {rate}%")
-for v in vs:
-    vc = st.columns([5, 2, 1])
-    vc[0].write(f"{v['vendor_name']}  ({v.get('file_url') or '파일 없음'})")
-    vc[1].write(won(v["amount"]))
-    if vc[2].button("삭제", key="d" + v["id"]):
-        SUPA.table("project_vendors").delete().eq("id", v["id"]).execute(); st.rerun()
-with st.form("vendor_add", clear_on_submit=True):
-    f = st.columns([5, 2, 1])
-    vn = f[0].text_input("실행사명", label_visibility="collapsed", placeholder="실행사명")
-    va = f[1].number_input("금액", min_value=0, step=100000, label_visibility="collapsed")
-    if f[2].form_submit_button("추가") and vn and va:
-        SUPA.table("project_vendors").insert({"project_id": p["id"], "vendor_name": vn, "amount": int(va)}).execute()
-        st.rerun()
-
 # ── 금액·조건 수정 ────────────────────────────────────────────
 with st.expander("금액 · 조건 수정"):
     with st.form("edit"):
@@ -206,7 +195,7 @@ if ce:
     for e in ce:
         cols = st.columns([1.5, 1.1, 1.5, 1.5, 0.9, 1, 0.7])
         cols[0].write((e.get("due_date") or "-")[:10])
-        cols[1].write("받을 돈" if e["direction"] == "in" else "나갈 돈")
+        cols[1].write("받을(매출)" if e["direction"] == "in" else "나갈(매입)")
         cols[2].write(e.get("category") or "")
         cols[3].write(won(e["amount"]))
         cols[4].write("✅ 완료" if e["paid"] else "⏳ 예정")
@@ -227,15 +216,15 @@ else:
     st.caption("· 등록된 송금 일정이 없습니다. 아래에서 추가하세요.")
 
 with st.form("ce_add", clear_on_submit=True):
-    cf = st.columns([1.2, 1.4, 1.6, 1.3, 0.8])
-    direction = cf[0].selectbox("구분", ["받을 돈", "나갈 돈"], label_visibility="collapsed")
+    cf = st.columns([1.4, 1.4, 1.6, 1.3, 0.8])
+    direction = cf[0].selectbox("구분", ["받을 돈(매출)", "나갈 돈(매입)"], label_visibility="collapsed")
     category = cf[1].selectbox("항목", ["선금", "잔금", "인보이스", "실행사 지급", "기타"], label_visibility="collapsed")
     amount = cf[2].number_input("금액", min_value=0, step=100000, label_visibility="collapsed")
     due = cf[3].date_input("예정일", label_visibility="collapsed")
     paid = cf[4].checkbox("완료")
     if st.form_submit_button("➕ 송금 일정 추가") and amount:
         SUPA.table("cash_events").insert({
-            "project_id": p["id"], "direction": "in" if direction == "받을 돈" else "out",
+            "project_id": p["id"], "direction": "in" if direction.startswith("받을") else "out",
             "category": category, "amount": int(amount), "due_date": due.isoformat(),
             "paid": paid, "paid_date": due.isoformat() if paid else None}).execute()
         st.toast("Supabase에 저장되었습니다 ✓"); st.rerun()
