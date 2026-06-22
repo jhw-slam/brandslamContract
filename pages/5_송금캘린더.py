@@ -1,6 +1,6 @@
 import os
 import calendar
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -52,6 +52,22 @@ pstage = {p["id"]: SLAB.get(p.get("stage"), p.get("stage") or "-") for p in proj
 
 st.title("전체 송금 스케쥴")
 
+# ── 기간 선택 (기본: 최근 3개월) ─────────────────────────────
+today = date.today()
+pc = st.columns([2, 3])
+period = pc[0].selectbox("기간 선택", ["최근 3개월", "최근 6개월", "올해", "전체", "직접 선택"], index=0)
+start, end = today - timedelta(days=90), None
+if period == "최근 6개월":
+    start = today - timedelta(days=180)
+elif period == "올해":
+    start = date(today.year, 1, 1)
+elif period == "전체":
+    start = None
+elif period == "직접 선택":
+    dr = pc[1].date_input("직접 기간", value=(today - timedelta(days=90), today))
+    if isinstance(dr, (list, tuple)) and len(dr) == 2:
+        start, end = dr[0], dr[1]
+
 # ── 일정 추가 ─────────────────────────────────────────────────
 with st.expander("➕ 송금 일정 추가", expanded=not events):
     with st.form("add_ev", clear_on_submit=True):
@@ -77,6 +93,26 @@ with st.expander("➕ 송금 일정 추가", expanded=not events):
 
 if not events:
     st.info("등록된 송금 일정이 없습니다. 위 '➕ 송금 일정 추가'로 입력하면 표·달력에 표시됩니다.")
+    st.stop()
+
+def _in_period(e):
+    dd = (e.get("due_date") or "")[:10]
+    if not dd:
+        return True
+    try:
+        d = date.fromisoformat(dd)
+    except Exception:
+        return True
+    if start and d < start:
+        return False
+    if end and d > end:
+        return False
+    return True
+
+events = [e for e in events if _in_period(e)]
+st.caption("기간: " + period + (f"  ({start} ~ {end or '이후 전체'})" if start else "  (전체)") + f"  ·  {len(events)}건")
+if not events:
+    st.warning("선택한 기간에 송금 일정이 없습니다. 기간을 넓혀보세요.")
     st.stop()
 
 # ── 공통 요약 ─────────────────────────────────────────────────
