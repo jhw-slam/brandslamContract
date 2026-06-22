@@ -64,9 +64,7 @@ def load_real():
     comp = {c["id"]: c["name"] for c in SUPA.table("companies").select("id,name").execute().data}
     for p in projs:
         p["company"] = comp.get(p["company_id"], p.get("brand"))
-    cash = SUPA.table("cash_events").select(
-        "id, project_id, direction, category, title, amount, due_date, paid, paid_date"
-    ).execute().data
+    cash = SUPA.table("cash_events").select("*").execute().data
     contracts = SUPA.table("contracts").select("id,project_id,doc_type,created_at").execute().data
     try:
         camp_n = SUPA.table("campaigns").select("id", count="exact").execute().count or 0
@@ -109,6 +107,17 @@ def load_demo():
         {"project_id": "d3", "direction": "out", "amount": 3000000, "due_date": d(20), "paid": False},
         {"project_id": "d6", "direction": "in", "amount": 22000000, "due_date": d(-1), "paid": False},
         {"project_id": "d6", "direction": "out", "amount": 15000000, "due_date": d(12), "paid": False},
+        # ── 과거 분기(전년 대비/전분기 대비 데모용) ──
+        {"project_id": "d7", "direction": "in", "amount": 18000000, "due_date": "2025-02-15", "paid": True},
+        {"project_id": "d7", "direction": "out", "amount": 9000000, "due_date": "2025-02-20", "paid": True},
+        {"project_id": "d2", "direction": "in", "amount": 24000000, "due_date": "2025-05-18", "paid": True},
+        {"project_id": "d2", "direction": "out", "amount": 11000000, "due_date": "2025-05-25", "paid": True},
+        {"project_id": "d1", "direction": "in", "amount": 30000000, "due_date": "2025-08-12", "paid": True},
+        {"project_id": "d1", "direction": "out", "amount": 16000000, "due_date": "2025-08-20", "paid": True},
+        {"project_id": "d6", "direction": "in", "amount": 41000000, "due_date": "2025-11-10", "paid": True},
+        {"project_id": "d6", "direction": "out", "amount": 20000000, "due_date": "2025-11-18", "paid": True},
+        {"project_id": "d3", "direction": "in", "amount": 33000000, "due_date": "2026-02-12", "paid": True},
+        {"project_id": "d3", "direction": "out", "amount": 14000000, "due_date": "2026-02-19", "paid": True},
     ]
     contracts = [{"id": "c1", "project_id": "d1", "doc_type": "brand", "created_at": d(60)},
                  {"id": "c2", "project_id": "d6", "doc_type": "creator", "created_at": d(14)}]
@@ -249,5 +258,82 @@ for p in sorted(projs, key=lambda x: order.get(x["stage"], 0)):
             f"</div>")
     st.markdown(html, unsafe_allow_html=True)
 
+# ── 6) 재무 분석 (약식) ───────────────────────────────────────
+st.divider()
+st.subheader("🧾 재무 분석 (약식)")
+
+rev = cash_sum("in"); cost = cash_sum("out")
+gp = rev - cost; rate = round(gp / rev * 100) if rev else 0
+recv = int(cdf[(cdf["direction"] == "in") & (cdf["paid"] == True)]["amount"].sum()) if not cdf.empty else 0
+paidout = int(cdf[(cdf["direction"] == "out") & (cdf["paid"] == True)]["amount"].sum()) if not cdf.empty else 0
+ar = cash_sum("in", paid=False); ap = cash_sum("out", paid=False)
+
+st.markdown("**약식 손익 (발생 기준 · 받을/나갈 합계)**")
+pl = st.columns(4)
+pl[0].metric("매출액", won_short(rev))
+pl[1].metric("비용", won_short(cost))
+pl[2].metric("매출총이익", won_short(gp))
+pl[3].metric("이익률", f"{rate}%")
+
+st.markdown("**현금 · 채권/채무 (수금 기준)**")
+cf = st.columns(4)
+cf[0].metric("수금완료(입금)", won_short(recv))
+cf[1].metric("지급완료", won_short(paidout))
+cf[2].metric("미수금(받을)", won_short(ar))
+cf[3].metric("미지급금(나갈)", won_short(ap))
+
+# 분기별 매출 추이 + QoQ / YoY
+st.markdown("**분기별 매출 추이 · QoQ / YoY 성장률**")
+if not cdf.empty:
+    inq = cdf[cdf["direction"] == "in"].dropna(subset=["due"]).copy()
+    if len(inq):
+        inq["P"] = inq["due"].dt.to_period("Q")
+        q = inq.groupby("P")["amount"].sum().sort_index()
+        full = pd.period_range(q.index.min(), q.index.max(), freq="Q")
+        q = q.reindex(full, fill_value=0)
+        qoq = q.pct_change() * 100
+        yoy = (q / q.shift(4) - 1) * 100
+        idx = [str(x) for x in q.index]
+        st.bar_chart(pd.Series(q.values, index=idx), height=220)
+        qt = pd.DataFrame({
+            "분기": idx, "매출": [won(v) for v in q.values],
+            "QoQ%": ["-" if pd.isna(v) else f"{v:+.1f}%" for v in qoq.values],
+            "YoY%": ["-" if pd.isna(v) else f"{v:+.1f}%" for v in yoy.values],
+        })
+        st.dataframe(qt, use_container_width=True, hide_index=True)
+    else:
+        st.caption("매출(받을 돈) 데이터가 없습니다.")
+else:
+    st.caption("송금 데이터가 쌓이면 분기별 성장률이 표시됩니다.")
+
+# 업체별 매출 & 성장률 (최근 분기 vs 직전 분기)
+st.markdown("**업체별 매출 · 성장률**")
+if not cdf.empty:
+    pid2comp = {p["id"]: p["company"] for p in projs}
+    inc = cdf[cdf["direction"] == "in"].dropna(subset=["due"]).copy()
+    inc["company"] = inc["project_id"].map(pid2comp).fillna("미연결")
+    if len(inc):
+        inc["P"] = inc["due"].dt.to_period("Q")
+        piv = inc.pivot_table(index="company", columns="P", values="amount", aggfunc="sum", fill_value=0).sort_index(axis=1)
+        cols_q = list(piv.columns)
+        last_q = cols_q[-1]; prev_q = cols_q[-2] if len(cols_q) >= 2 else None
+        rows = []
+        for comp in piv.index:
+            total = int(piv.loc[comp].sum())
+            cur = int(piv.loc[comp, last_q])
+            if prev_q is not None and piv.loc[comp, prev_q]:
+                g = f"{(cur/piv.loc[comp, prev_q]-1)*100:+.1f}%"
+            else:
+                g = "-"
+            rows.append({"업체": comp, "누적 매출": won(total), f"최근({last_q})": won(cur), "직전분기 대비": g})
+        st.dataframe(pd.DataFrame(rows).sort_values("누적 매출", ascending=False), use_container_width=True, hide_index=True)
+    else:
+        st.caption("업체별 매출 데이터가 없습니다.")
+else:
+    st.caption("송금 데이터가 쌓이면 업체별 성장률이 표시됩니다.")
+
+st.caption("※ 약식 분석입니다(부가세·세금·고정비 미반영). 정식 재무제표 대용이 아니라 운영 모니터링용이에요.")
+
+st.divider()
 st.caption(f"사이트 주문(campaigns) {camp_n}건 · 저장된 계약서 {len(contracts)}건"
            + ("  ·  🔮 예시 데이터" if demo else ""))
