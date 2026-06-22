@@ -204,13 +204,23 @@ st.subheader("송금 일정")
 st.caption("여기서 입력하면 즉시 Supabase에 저장되고, '전체 송금 스케쥴' 페이지에도 합쳐져 보입니다. 위 요약 금액은 아래 항목들을 모두 합산한 값이에요.")
 if ce:
     for e in ce:
-        cols = st.columns([1.6, 1.2, 1.8, 1.6, 1, 0.7])
+        cols = st.columns([1.5, 1.1, 1.5, 1.5, 0.9, 1, 0.7])
         cols[0].write((e.get("due_date") or "-")[:10])
         cols[1].write("받을 돈" if e["direction"] == "in" else "나갈 돈")
         cols[2].write(e.get("category") or "")
         cols[3].write(won(e["amount"]))
-        cols[4].write("완료" if e["paid"] else "예정")
-        if cols[5].button("삭제", key="ce" + e["id"]):
+        cols[4].write("✅ 완료" if e["paid"] else "⏳ 예정")
+        if e["paid"]:
+            if cols[5].button("되돌리기", key="undo" + e["id"]):
+                SUPA.table("cash_events").update({"paid": False, "paid_date": None}).eq("id", e["id"]).execute()
+                st.toast("예정으로 되돌림 ✓"); st.rerun()
+        else:
+            label = "입금완료" if e["direction"] == "in" else "지급완료"
+            if cols[5].button(label, key="done" + e["id"], type="primary"):
+                from datetime import date as _d
+                SUPA.table("cash_events").update({"paid": True, "paid_date": _d.today().isoformat()}).eq("id", e["id"]).execute()
+                st.toast("완료 처리됨 ✓ (전체 송금 스케쥴·종합상황판에 반영)"); st.rerun()
+        if cols[6].button("삭제", key="ce" + e["id"]):
             SUPA.table("cash_events").delete().eq("id", e["id"]).execute()
             st.toast("삭제됨 ✓"); st.rerun()
 else:
