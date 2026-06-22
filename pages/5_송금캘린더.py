@@ -89,14 +89,23 @@ k[1].metric("나갈 돈(전체)", won(out["amount"].sum()))
 k[2].metric("미입금(받을)", won(inc[~inc["paid"]]["amount"].sum()))
 k[3].metric("미지급(나갈)", won(out[~out["paid"]]["amount"].sum()))
 
-flt = st.radio("필터", ["전체", "받을·미입금", "받을·완료", "나갈·미지급"], horizontal=True)
+fc = st.columns([1.6, 1])
+flt = fc[0].radio("상태 필터", ["전체", "받을·미입금", "받을·완료", "나갈·미지급"], horizontal=True)
+proj_opts = ["전체 프로젝트"] + [plabel[p["id"]] for p in projs] + ["(프로젝트 없음)"]
+projsel = fc[1].selectbox("프로젝트별 보기", proj_opts)
+label2id = {plabel[p["id"]]: p["id"] for p in projs}
+
 def _keep(e):
-    if flt == "받을·미입금": return e["direction"] == "in" and not e["paid"]
-    if flt == "받을·완료":  return e["direction"] == "in" and e["paid"]
-    if flt == "나갈·미지급": return e["direction"] == "out" and not e["paid"]
-    return True
+    if flt == "받을·미입금": ok = e["direction"] == "in" and not e["paid"]
+    elif flt == "받을·완료": ok = e["direction"] == "in" and e["paid"]
+    elif flt == "나갈·미지급": ok = e["direction"] == "out" and not e["paid"]
+    else: ok = True
+    if projsel == "(프로젝트 없음)": ok = ok and (e.get("project_id") is None)
+    elif projsel != "전체 프로젝트": ok = ok and (e.get("project_id") == label2id.get(projsel))
+    return ok
+
 events_f = [e for e in events if _keep(e)]
-st.caption(f"필터: {flt} · {len(events_f)}건")
+st.caption(f"필터: {flt} · {projsel} · {len(events_f)}건")
 
 mode = st.radio("보기", ["표로 보기", "달력으로 보기"], horizontal=True)
 
@@ -116,6 +125,12 @@ if mode == "표로 보기":
         })
     tdf = pd.DataFrame(rows).sort_values("예정일")
     st.dataframe(tdf, use_container_width=True, hide_index=True)
+    i_s = sum(e["amount"] or 0 for e in events_f if e["direction"] == "in")
+    o_s = sum(e["amount"] or 0 for e in events_f if e["direction"] == "out")
+    fin = st.columns(3)
+    fin[0].metric("받을 합계", won(i_s))
+    fin[1].metric("나갈 합계", won(o_s))
+    fin[2].metric("순액 (받을 − 나갈)", won(i_s - o_s))
 
 # ── 달력으로 보기 ─────────────────────────────────────────────
 else:
@@ -158,4 +173,8 @@ else:
                 html += f"<div style='font-size:10.5px;color:{col}'>{sign}{won_short(e['amount'])}{chk}</div>"
             html += "</div>"
             cols[i].markdown(html, unsafe_allow_html=True)
+    me = [e for e in events_f if (e.get("due_date") or "")[:7] == f"{Y}-{M:02d}"]
+    mi = sum(e["amount"] or 0 for e in me if e["direction"] == "in")
+    mo = sum(e["amount"] or 0 for e in me if e["direction"] == "out")
+    st.caption(f"이 달 합계 — 받을 {won(mi)} · 나갈 {won(mo)} · 순 {won(mi - mo)}")
     st.caption("초록 +금액 = 받을 돈 · 빨강 −금액 = 나갈 돈 · ✓ = 완료")
