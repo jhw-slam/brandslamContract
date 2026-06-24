@@ -168,6 +168,39 @@ if mode == "표로 보기":
     fin[1].metric("나갈 합계", won(o_s))
     fin[2].metric("순액 (받을 − 나갈)", won(i_s - o_s))
 
+    # ── 행별 수정 · 완료 · 삭제 ──────────────────────────────
+    st.markdown("**내역 수정 · 완료 처리 · 삭제**")
+    CATS = ["선금", "잔금", "인보이스", "실행사 지급", "기타"]
+    for e in sorted(events_f, key=lambda x: (x.get("due_date") or "")):
+        head = (f"{(e.get('due_date') or '-')[:10]} · {'받을' if e['direction']=='in' else '나갈'} · "
+                f"{plabel.get(e.get('project_id'),'-')} · {e.get('category') or ''} · {won(e['amount'])} · "
+                f"{'✅완료' if e['paid'] else '⏳예정'}")
+        with st.expander("✎ " + head):
+            with st.form("edE" + e["id"]):
+                c = st.columns([1.2, 1.2, 1.4, 1.4])
+                dirv = c[0].selectbox("구분", ["받을 돈", "나갈 돈"],
+                                      index=0 if e["direction"] == "in" else 1)
+                catv = c[1].selectbox("항목", CATS, index=CATS.index(e["category"]) if e.get("category") in CATS else 4)
+                amtv = c[2].number_input("금액", min_value=0, value=int(e["amount"] or 0), step=100000)
+                try:
+                    dv = date.fromisoformat((e.get("due_date") or "")[:10])
+                except Exception:
+                    dv = date.today()
+                duev = c[3].date_input("예정일", value=dv)
+                titv = st.text_input("제목/메모", value=e.get("title") or "")
+                paidv = st.checkbox("입금/지급 완료", value=bool(e["paid"]))
+                b = st.columns([1, 1, 4])
+                if b[0].form_submit_button("저장", type="primary"):
+                    SUPA.table("cash_events").update({
+                        "direction": "in" if dirv == "받을 돈" else "out",
+                        "category": catv, "amount": int(amtv), "due_date": duev.isoformat(),
+                        "title": titv, "paid": paidv,
+                        "paid_date": duev.isoformat() if paidv else None}).eq("id", e["id"]).execute()
+                    st.toast("수정 저장됨 ✓"); st.rerun()
+                if b[1].form_submit_button("삭제"):
+                    SUPA.table("cash_events").delete().eq("id", e["id"]).execute()
+                    st.toast("삭제됨 ✓"); st.rerun()
+
 # ── 달력으로 보기 ─────────────────────────────────────────────
 else:
     if "cal_y" not in st.session_state:
