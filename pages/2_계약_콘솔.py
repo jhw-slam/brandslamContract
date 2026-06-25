@@ -1,5 +1,7 @@
 import os
+import io
 
+import pandas as pd
 import streamlit as st
 from supabase import create_client
 
@@ -244,6 +246,66 @@ with st.expander("선금·잔금 예정 자동 만들기 (계약금액 기반)")
         if rows:
             SUPA.table("cash_events").insert(rows).execute()
             st.toast("선금·잔금 일정 생성됨 ✓"); st.rerun()
+
+with st.expander("📥 지출 대량 등록 (엑셀/CSV 업로드)"):
+    st.caption("아래 양식을 받아 채운 뒤 업로드하면, 이 프로젝트의 송금 일정으로 한 번에 등록됩니다. "
+               "구분을 비우면 '나갈(매입)'로 들어갑니다.")
+    TEMPLATE_COLS = ["구분", "항목", "제목", "금액", "예정일", "완료", "메모"]
+    sample = pd.DataFrame([
+        {"구분": "나갈", "항목": "실행사 지급", "제목": "강리즈 군단 1차", "금액": 3000000, "예정일": "2026-07-10", "완료": "N", "메모": ""},
+        {"구분": "나갈", "항목": "기타", "제목": "배송비", "금액": 150000, "예정일": "2026-07-15", "완료": "Y", "메모": "택배"},
+    ], columns=TEMPLATE_COLS)
+    st.download_button("⬇️ 양식 내려받기 (CSV)", sample.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="지출_대량등록_양식.csv", mime="text/csv")
+
+    up = st.file_uploader("채운 양식 업로드 (.csv / .xlsx)", type=["csv", "xlsx"])
+    if up is not None:
+        try:
+            if up.name.lower().endswith(".xlsx"):
+                df = pd.read_excel(up)  # openpyxl 필요
+            else:
+                df = pd.read_csv(io.BytesIO(up.getvalue()), encoding="utf-8-sig")
+        except Exception as ex:
+            st.error(f"파일을 읽지 못했습니다: {ex}"); df = None
+
+        if df is not None:
+            df.columns = [str(c).strip() for c in df.columns]
+            miss = [c for c in ["항목", "금액"] if c not in df.columns]
+            if miss:
+                st.error(f"필수 열 누락: {', '.join(miss)} (양식의 헤더를 그대로 사용하세요)")
+            else:
+                rows, errs = [], []
+                for idx, r in df.iterrows():
+                    try:
+                        amt = int(float(str(r.get("금액", 0)).replace(",", "").strip() or 0))
+                        if amt <= 0:
+                            continue
+                        gubun = str(r.get("구분", "") or "").strip()
+                        direction = "in" if gubun.startswith("받을") or gubun == "매출" else "out"
+                        due_raw = str(r.get("예정일", "") or "").strip()[:10]
+                        due = pd.to_datetime(due_raw).date().isoformat() if due_raw else None
+                        paidv = str(r.get("완료", "") or "").strip().upper() in ("Y", "TRUE", "1", "O", "완료")
+                        rows.append({
+                            "project_id": p["id"], "direction": direction,
+                            "category": str(r.get("항목", "") or "기타").strip(),
+                            "title": str(r.get("제목", "") or "").strip() or None,
+                            "amount": amt, "due_date": due, "paid": paidv,
+                            "paid_date": due if paidv else None,
+                            "memo": str(r.get("메모", "") or "").strip() or None})
+                    except Exception as ex:
+                        errs.append(f"{idx+2}행: {ex}")
+                st.write(f"미리보기 — 등록 대상 {len(rows)}건" + (f" · 오류 {len(errs)}건" if errs else ""))
+                if rows:
+                    st.dataframe(pd.DataFrame([{
+                        "구분": "받을(매출)" if x["direction"] == "in" else "나갈(매입)",
+                        "항목": x["category"], "제목": x["title"], "금액": won(x["amount"]),
+                        "예정일": x["due_date"], "완료": "Y" if x["paid"] else "N"} for x in rows]),
+                        use_container_width=True, hide_index=True)
+                for e in errs:
+                    st.caption("⚠️ " + e)
+                if rows and st.button(f"✅ {len(rows)}건 등록", type="primary"):
+                    SUPA.table("cash_events").insert(rows).execute()
+                    st.toast(f"{len(rows)}건 등록됨 ✓ (전체 송금 스케쥴·종합상황판에 반영)"); st.rerun()
 
 # ── 계약서 미리보기 / 다운로드 ────────────────────────────────
 st.subheader("계약서")
