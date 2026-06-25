@@ -1,0 +1,63 @@
+name: Sync code to Supabase
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Upsert repo files to Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          python3 - <<'PY'
+          import os, json, urllib.request, pathlib, datetime
+
+          URL = os.environ["SUPABASE_URL"].rstrip("/")
+          KEY = os.environ["SUPABASE_SERVICE_KEY"]
+          EXTS  = {".py", ".txt", ".md", ".html", ".yml", ".yaml", ".toml", ".cfg", ".json"}
+          NAMES = {"Procfile", "requirements.txt"}
+          now = datetime.datetime.utcnow().isoformat() + "Z"
+
+          rows = []
+          for p in pathlib.Path(".").rglob("*"):
+              if not p.is_file():
+                  continue
+              s = str(p).replace("\\", "/")
+              if s.startswith("./"):
+                  s = s[2:]
+              if s.startswith(".git/") or "/.git/" in s or "node_modules/" in s:
+                  continue
+              if not (p.suffix in EXTS or p.name in NAMES):
+                  continue
+              try:
+                  data = p.read_text(encoding="utf-8")
+              except Exception:
+                  continue
+              if len(data) > 2_000_000:
+                  continue
+              rows.append({"path": s, "content": data, "size": len(data), "updated_at": now})
+
+          def post(batch):
+              body = json.dumps(batch).encode("utf-8")
+              req = urllib.request.Request(URL + "/rest/v1/repo_files?on_conflict=path",
+                                           data=body, method="POST")
+              req.add_header("apikey", KEY)
+              req.add_header("Authorization", "Bearer " + KEY)
+              req.add_header("Content-Type", "application/json")
+              req.add_header("Prefer", "resolution=merge-duplicates,return=minimal")
+              with urllib.request.urlopen(req) as r:
+                  print("upserted", len(batch), "-> status", r.status)
+
+          for i in range(0, len(rows), 20):
+              post(rows[i:i+20])
+          print("synced files:", len(rows))
+          for r in rows:
+              print(" -", r["path"])
+          PY
