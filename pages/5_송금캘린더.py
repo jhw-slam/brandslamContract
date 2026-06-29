@@ -98,32 +98,63 @@ def parse_hometax(rows):
         out.append(cur)
     return out
 
-def auto_match_tax(invoices):
-    """발행된(양수) 세금계산서를 '받을' cash_event(금액·날짜 근접)와 1:1로 매칭 → tax_issued 표시."""
+def reconcile_cancellations():
+    """음수(수정/취소) 계산서를 같은 거래처·같은 절대금액·날짜 근접인 양수(원본)와 짝지어
+    둘 다 canceled=True 로 표시. 원본이 cash_event에 연결돼 있었으면 연결도 해제."""
+    inv = SUPA.table("tax_invoices").select("*").execute().data
+    negs = [v for v in inv if (v.get("total_amount") or 0) < 0 and not v.get("canceled")]
+    pos = [v for v in inv if (v.get("total_amount") or 0) > 0 and not v.get("canceled")]
+    used, pairs = set(), 0
+
+    def _gap(a, b):
+        try:
+            return abs((date.fromisoformat(a["write_date"]) - date.fromisoformat(b["write_date"])).days)
+        except Exception:
+            return 999
+
+    for n in negs:
+        target = abs(n["total_amount"] or 0)
+        cands = [p for p in pos if p["approval_no"] not in used
+                 and p.get("buyer_biz_no") == n.get("buyer_biz_no")
+                 and (p.get("total_amount") or 0) == target]
+        cands.sort(key=lambda p: _gap(p, n))
+        if cands:
+            p = cands[0]
+            used.add(p["approval_no"]); used.add(n["approval_no"])
+            for ap in (p["approval_no"], n["approval_no"]):
+                SUPA.table("tax_invoices").update({"canceled": True}).eq("approval_no", ap).execute()
+            if p.get("matched_cash_event_id"):
+                SUPA.table("cash_events").update(
+                    {"tax_issued": False, "tax_invoice_no": None}).eq("id", p["matched_cash_event_id"]).execute()
+                SUPA.table("tax_invoices").update(
+                    {"matched_cash_event_id": None}).eq("approval_no", p["approval_no"]).execute()
+            pairs += 1
+    return pairs
+
+def auto_match_tax():
+    """살아있는(취소 안 됨·미연결) 발행분을 '받을' 일정과 금액·날짜로 1:1 자동 매칭."""
+    invs = [v for v in SUPA.table("tax_invoices").select("*").execute().data
+            if (v.get("total_amount") or 0) > 0 and not v.get("canceled") and not v.get("matched_cash_event_id")]
     rcv = [e for e in SUPA.table("cash_events").select("*").eq("direction", "in").execute().data
            if not e.get("tax_issued")]
     matched = 0
-    for v in invoices:
+    for v in invs:
         tot = v.get("total_amount") or 0; sup = v.get("supply_amount") or 0
-        if tot <= 0:  # 수정/취소(음수) 또는 금액없음은 건너뜀
-            continue
-        wd = v.get("write_date")
         try:
-            wdate = date.fromisoformat(wd) if wd else None
+            wdate = date.fromisoformat(v["write_date"]) if v.get("write_date") else None
         except Exception:
             wdate = None
         cand = []
         for e in rcv:
-            amt = e["amount"] or 0
-            if amt not in (tot, sup):
+            if (e["amount"] or 0) not in (tot, sup):
                 continue
-            ok_date = True
+            ok = True
             if wdate and e.get("due_date"):
                 try:
-                    ok_date = abs((date.fromisoformat(e["due_date"][:10]) - wdate).days) <= 45
+                    ok = abs((date.fromisoformat(e["due_date"][:10]) - wdate).days) <= 45
                 except Exception:
-                    ok_date = True
-            if ok_date:
+                    ok = True
+            if ok:
                 cand.append(e)
         if len(cand) == 1:
             e = cand[0]
@@ -267,9 +298,10 @@ with act[2].popover("🧾 세금계산서 업로드", use_container_width=True):
                         "supply_amount": v.get("supply_amount"), "vat": v.get("vat"),
                         "kind": v.get("kind"), "raw": v.get("raw")} for v in invs]
                     SUPA.table("tax_invoices").upsert(payload, on_conflict="approval_no").execute()
-                    n = auto_match_tax(invs)
-                    st.success(f"세금계산서 {len(payload)}건 저장 · '받을' 일정 {n}건 자동 발행완료 표시 ✓")
-                    st.toast("저장·매칭 완료"); st.rerun()
+                    cp = reconcile_cancellations()
+                    n = auto_match_tax()
+                    st.success(f"세금계산서 {len(payload)}건 저장 · 취소 짝 {cp}쌍 정리 · '받을' 일정 {n}건 자동 발행완료 ✓")
+                    st.toast("저장·정리·매칭 완료"); st.rerun()
 
 # ── 기간/상태/프로젝트 필터 적용 ──────────────────────────────
 def _in_period(e):
@@ -440,10 +472,16 @@ elif view == "세금계산서":
                 gap = 999
             return (amt_match, gap)
 
-        unmatched = [v for v in tinv if not v.get("matched_cash_event_id") and (v.get("total_amount") or 0) > 0]
+        unmatched = [v for v in tinv if not v.get("matched_cash_event_id")
+                     and (v.get("total_amount") or 0) > 0 and not v.get("canceled")]
         matched = [v for v in tinv if v.get("matched_cash_event_id")]
+        canceled = [v for v in tinv if v.get("canceled")]
 
-        st.markdown(f"**미연결 세금계산서 {len(unmatched)}건** — 후보를 고르고 '연결'")
+        rc = st.columns([3, 1])
+        rc[0].markdown(f"**미연결 세금계산서 {len(unmatched)}건** — 후보를 고르고 '연결'")
+        if rc[1].button("🔄 취소분 다시 정리"):
+            cp = reconcile_cancellations()
+            st.toast(f"취소 짝 {cp}쌍 정리됨 ✓"); st.rerun()
         for v in unmatched:
             c = st.columns([2.6, 3.0, 0.8])
             c[0].markdown(f"🧾 {v.get('write_date')} · **{v.get('buyer_name') or v.get('buyer_biz_no')}** · {won(v.get('total_amount'))}")
@@ -475,9 +513,14 @@ elif view == "세금계산서":
                     SUPA.table("tax_invoices").update({"matched_cash_event_id": None}).eq("approval_no", v["approval_no"]).execute()
                     st.toast("연결 해제됨 ✓"); st.rerun()
 
-        neg = [v for v in tinv if (v.get("total_amount") or 0) <= 0]
-        if neg:
-            st.caption(f"※ 수정/취소(음수) {len(neg)}건은 매칭 대상에서 제외했습니다.")
+        neg_unpaired = [v for v in tinv if (v.get("total_amount") or 0) < 0 and not v.get("canceled")]
+        if canceled:
+            with st.expander(f"🚫 취소(상쇄) 처리된 세금계산서 {len(canceled)}건 — 매칭 대상 제외"):
+                for v in sorted(canceled, key=lambda x: x.get("write_date") or ""):
+                    st.caption(f"{v.get('write_date')} · {v.get('buyer_name') or ''} · {won(v.get('total_amount'))} ({v.get('kind')})")
+        if neg_unpaired:
+            st.warning(f"⚠️ 짝을 못 찾은 수정/취소(음수) {len(neg_unpaired)}건 — 원본 금액·거래처가 다르면 수동 확인 필요. "
+                       "'🔄 취소분 다시 정리'를 눌러보세요.")
 
 # ── 하단 요약 (수익률) ────────────────────────────────────────
 if view in ("달력", "리스트"):
