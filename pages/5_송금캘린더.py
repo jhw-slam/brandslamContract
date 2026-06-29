@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import calendar
 from datetime import date, timedelta
 
@@ -50,6 +51,90 @@ def projects_map():
 def load_events():
     return SUPA.table("cash_events").select("*").order("due_date").execute().data
 
+# ── 홈택스 세금계산서 파싱 (매출 목록 .xls/.csv) ──────────────
+_APPROVAL = re.compile(r"\d{8}-\d{8}-\w+")
+_DATE = re.compile(r"20\d{2}-\d{2}-\d{2}")
+_BIZ = re.compile(r"\d{3}-\d{2}-\d{5}")
+_MONEY = re.compile(r"-?\d{1,3}(?:,\d{3})+")
+
+def _guess_name(cells):
+    for c in cells:
+        if any(t in c for t in ["(주)", "주식회사", "㈜"]):
+            return c
+    for c in cells:
+        if re.search(r"[가-힣]", c) and len(c) >= 2 and not re.search(
+                r"(작성|발급|전송|일자|공급|등록|대표|번호|종류|유형|인터넷|일반|수정|계산서|명세|합계|세액)", c):
+            return c
+    return None
+
+def parse_hometax(rows):
+    """rows: list[list[cell]] → list of tax-invoice dicts (position-independent)."""
+    out, cur = [], None
+    for row in rows:
+        cells = [str(c).strip() for c in row if str(c).strip() and str(c).strip().lower() != "nan"]
+        if not cells:
+            continue
+        joined = " ".join(cells)
+        appr = _APPROVAL.search(joined)
+        if appr:
+            if cur:
+                out.append(cur)
+            cur = {"approval_no": appr.group(), "raw": joined[:500]}
+            d = _DATE.search(joined); cur["write_date"] = d.group() if d else None
+            b = _BIZ.search(joined); cur["buyer_biz_no"] = b.group() if b else None
+            cur["buyer_name"] = _guess_name(
+                [c for c in cells if not _DATE.search(c) and not _BIZ.search(c) and not _APPROVAL.search(c)])
+            cur["kind"] = "수정" if "수정" in joined else "일반"
+        elif cur is not None and _MONEY.search(joined):
+            nums = [int(x.replace(",", "")) for x in _MONEY.findall(joined)]
+            d2 = _DATE.findall(joined)
+            if d2:
+                cur["issue_date"] = d2[0]
+            if len(nums) >= 1: cur["total_amount"] = nums[0]
+            if len(nums) >= 2: cur["supply_amount"] = nums[1]
+            if len(nums) >= 3: cur["vat"] = nums[2]
+            out.append(cur); cur = None
+    if cur:
+        out.append(cur)
+    return out
+
+def auto_match_tax(invoices):
+    """발행된(양수) 세금계산서를 '받을' cash_event(금액·날짜 근접)와 1:1로 매칭 → tax_issued 표시."""
+    rcv = [e for e in SUPA.table("cash_events").select("*").eq("direction", "in").execute().data
+           if not e.get("tax_issued")]
+    matched = 0
+    for v in invoices:
+        tot = v.get("total_amount") or 0; sup = v.get("supply_amount") or 0
+        if tot <= 0:  # 수정/취소(음수) 또는 금액없음은 건너뜀
+            continue
+        wd = v.get("write_date")
+        try:
+            wdate = date.fromisoformat(wd) if wd else None
+        except Exception:
+            wdate = None
+        cand = []
+        for e in rcv:
+            amt = e["amount"] or 0
+            if amt not in (tot, sup):
+                continue
+            ok_date = True
+            if wdate and e.get("due_date"):
+                try:
+                    ok_date = abs((date.fromisoformat(e["due_date"][:10]) - wdate).days) <= 45
+                except Exception:
+                    ok_date = True
+            if ok_date:
+                cand.append(e)
+        if len(cand) == 1:
+            e = cand[0]
+            SUPA.table("cash_events").update(
+                {"tax_issued": True, "tax_invoice_no": v["approval_no"]}).eq("id", e["id"]).execute()
+            SUPA.table("tax_invoices").update(
+                {"matched_cash_event_id": e["id"]}).eq("approval_no", v["approval_no"]).execute()
+            rcv = [x for x in rcv if x["id"] != e["id"]]
+            matched += 1
+    return matched
+
 projs, plabel = projects_map()
 pstage = {p["id"]: SLAB.get(p.get("stage"), p.get("stage") or "-") for p in projs}
 label2id = {plabel[p["id"]]: p["id"] for p in projs}
@@ -78,8 +163,8 @@ elif period == "직접 선택":
     if isinstance(dr, (list, tuple)) and len(dr) == 2:
         start, end = dr[0], dr[1]
 
-# ── 동작 버튼(팝오버): 일정 추가 · 지출 대량 업로드 ───────────
-act = st.columns([1.1, 1.5, 5])
+# ── 동작 버튼(팝오버): 일정 추가 · 지출 대량 업로드 · 세금계산서 ─
+act = st.columns([1.1, 1.5, 1.8, 4])
 with act[0].popover("➕ 일정 추가", use_container_width=True):
     with st.form("add_ev", clear_on_submit=True):
         popts = {"(프로젝트 없음)": None}
@@ -150,6 +235,42 @@ with act[1].popover("📥 지출 대량 업로드", use_container_width=True):
                     SUPA.table("cash_events").insert(rows).execute()
                     st.toast(f"{len(rows)}건 등록됨 ✓"); st.rerun()
 
+with act[2].popover("🧾 세금계산서 업로드", use_container_width=True):
+    st.caption("홈택스 '매출 전자세금계산서 목록' 파일(.xls/.csv)을 그대로 올리세요. "
+               "발행분을 '받을' 일정과 금액·날짜로 자동 매칭해 '발행완료'로 표시합니다.")
+    tup = st.file_uploader("홈택스 세금계산서 목록 (.xls / .csv)", type=["xls", "csv"], key="tax_up")
+    if tup is not None:
+        try:
+            if tup.name.lower().endswith(".csv"):
+                import csv as _csv
+                text = tup.getvalue().decode("utf-8-sig", errors="ignore")
+                rowdata = list(_csv.reader(io.StringIO(text)))
+            else:
+                xdf = pd.read_excel(tup, engine="xlrd", header=None)  # xlrd 필요(.xls)
+                rowdata = xdf.values.tolist()
+        except Exception as ex:
+            st.error(f"파일을 읽지 못했습니다: {ex}. (.xls는 requirements에 xlrd 필요)"); rowdata = None
+        if rowdata:
+            invs = parse_hometax(rowdata)
+            pos = [v for v in invs if (v.get("total_amount") or 0) > 0]
+            st.caption(f"파싱 {len(invs)}건 (발행분 {len(pos)}건 · 수정/취소 제외)")
+            if invs:
+                st.dataframe(pd.DataFrame([{
+                    "작성일": v.get("write_date"), "상호": v.get("buyer_name"),
+                    "등록번호": v.get("buyer_biz_no"), "합계": won(v.get("total_amount")),
+                    "구분": v.get("kind")} for v in invs]), use_container_width=True, hide_index=True)
+                if st.button("📥 저장 + 자동 매칭", type="primary"):
+                    payload = [{
+                        "approval_no": v["approval_no"], "write_date": v.get("write_date"),
+                        "issue_date": v.get("issue_date"), "buyer_biz_no": v.get("buyer_biz_no"),
+                        "buyer_name": v.get("buyer_name"), "total_amount": v.get("total_amount"),
+                        "supply_amount": v.get("supply_amount"), "vat": v.get("vat"),
+                        "kind": v.get("kind"), "raw": v.get("raw")} for v in invs]
+                    SUPA.table("tax_invoices").upsert(payload, on_conflict="approval_no").execute()
+                    n = auto_match_tax(invs)
+                    st.success(f"세금계산서 {len(payload)}건 저장 · '받을' 일정 {n}건 자동 발행완료 표시 ✓")
+                    st.toast("저장·매칭 완료"); st.rerun()
+
 # ── 기간/상태/프로젝트 필터 적용 ──────────────────────────────
 def _in_period(e):
     dd = (e.get("due_date") or "")[:10]
@@ -194,12 +315,17 @@ def edit_dialog(e):
     duev = c2[1].date_input("예정일", value=dv)
     titv = st.text_input("제목/메모", value=e.get("title") or "")
     paidv = st.checkbox("입금/지급 완료", value=bool(e["paid"]))
+    taxv = e.get("tax_issued"); taxno = e.get("tax_invoice_no") or ""
+    if e["direction"] == "in":
+        taxv = st.checkbox("세금계산서 발행완료", value=bool(e.get("tax_issued")))
+        taxno = st.text_input("승인번호(선택)", value=e.get("tax_invoice_no") or "")
     b = st.columns([1, 1, 3])
     if b[0].button("저장", type="primary"):
         SUPA.table("cash_events").update({
             "direction": "in" if dirv.startswith("받을") else "out", "category": catv,
             "amount": int(amtv), "due_date": duev.isoformat(), "title": titv, "paid": paidv,
-            "paid_date": duev.isoformat() if paidv else None}).eq("id", e["id"]).execute()
+            "paid_date": duev.isoformat() if paidv else None,
+            "tax_issued": bool(taxv), "tax_invoice_no": (taxno or None)}).eq("id", e["id"]).execute()
         st.session_state.edit_target = None; st.rerun()
     if b[1].button("삭제"):
         SUPA.table("cash_events").delete().eq("id", e["id"]).execute()
@@ -254,19 +380,47 @@ if view == "달력":
 
 else:  # 리스트
     st.caption(f"{period} · {projsel} · {flt} · {len(events)}건 (오른쪽 '수정'으로 편집·완료·삭제)")
-    h = st.columns([1.1, 0.8, 2.2, 1.3, 1.2, 0.8, 0.7])
-    for i, t in enumerate(["예정일", "구분", "프로젝트", "항목/제목", "금액", "상태", ""]):
+    h = st.columns([1.0, 0.7, 1.9, 1.4, 1.1, 0.7, 1.3, 0.7])
+    for i, t in enumerate(["예정일", "구분", "프로젝트", "항목/제목", "금액", "입금", "세금계산서", ""]):
         h[i].markdown(f"<div style='color:#888;font-size:12px'>{t}</div>", unsafe_allow_html=True)
     for e in sorted(events, key=lambda x: (x.get("due_date") or "")):
-        c = st.columns([1.1, 0.8, 2.2, 1.3, 1.2, 0.8, 0.7])
+        c = st.columns([1.0, 0.7, 1.9, 1.4, 1.1, 0.7, 1.3, 0.7])
         c[0].write((e.get("due_date") or "-")[:10])
         c[1].write("받을" if e["direction"] == "in" else "나갈")
         c[2].write(plabel.get(e.get("project_id"), "-"))
         c[3].write(f"{e.get('category') or ''} {('· ' + e['title']) if e.get('title') else ''}")
         c[4].write(won(e["amount"]))
         c[5].write("✅" if e["paid"] else "⏳")
-        if c[6].button("수정", key="ed" + e["id"]):
+        # 세금계산서: '받을'만 표시 (매출 발행)
+        if e["direction"] != "in":
+            c[6].write("—")
+        elif e.get("tax_issued"):
+            c[6].markdown("🧾 발행완료")
+        else:
+            urgent = False
+            dd = (e.get("due_date") or "")[:10]
+            if dd:
+                try:
+                    urgent = (date.fromisoformat(dd) - today).days <= 7
+                except Exception:
+                    urgent = False
+            c[6].markdown("🚨 **발행하세요**" if urgent else "⚠️ 미발행")
+        if c[7].button("수정", key="ed" + e["id"]):
             st.session_state.edit_target = e; st.rerun()
+
+    # 미발행 긴급 요약 (받을 · 7일 이내/경과 · 미발행)
+    urgent_list = []
+    for e in events:
+        if e["direction"] == "in" and not e.get("tax_issued") and (e.get("due_date") or ""):
+            try:
+                if (date.fromisoformat(e["due_date"][:10]) - today).days <= 7:
+                    urgent_list.append(e)
+            except Exception:
+                pass
+    if urgent_list:
+        st.error("🚨 세금계산서 발행 긴급 — 입금 예정 7일 이내인데 미발행: " +
+                 ", ".join(f"{plabel.get(e.get('project_id'),'-')} {won(e['amount'])}" for e in urgent_list[:6])
+                 + (" 외" if len(urgent_list) > 6 else ""))
 
 # ── 하단 요약 (수익률) ────────────────────────────────────────
 st.divider()
