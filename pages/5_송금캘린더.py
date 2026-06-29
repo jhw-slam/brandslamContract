@@ -148,7 +148,7 @@ period = top[0].selectbox("기간", ["최근 3개월", "최근 6개월", "올해
 proj_opts = ["전체 프로젝트"] + [plabel[p["id"]] for p in projs] + ["(프로젝트 없음)"]
 projsel = top[1].selectbox("프로젝트", proj_opts)
 flt = top[2].selectbox("상태", ["전체", "미입금", "입금완료", "미지급"])
-view = top[3].radio("보기", ["달력", "리스트"], horizontal=True)
+view = top[3].radio("보기", ["달력", "리스트", "세금계산서"], horizontal=True)
 
 today = date.today()
 start, end = today - timedelta(days=90), None
@@ -378,7 +378,7 @@ if view == "달력":
     mo = sum(e["amount"] or 0 for e in me if e["direction"] == "out")
     st.caption(f"이 달 합계 — 받을 {won(mi)} · 나갈 {won(mo)} · 순 {won(mi - mo)}  ·  초록=받을 / 빨강=나갈 / ✓=완료")
 
-else:  # 리스트
+elif view == "리스트":  # 리스트
     st.caption(f"{period} · {projsel} · {flt} · {len(events)}건 (오른쪽 '수정'으로 편집·완료·삭제)")
     h = st.columns([1.0, 0.7, 1.9, 1.4, 1.1, 0.7, 1.3, 0.7])
     for i, t in enumerate(["예정일", "구분", "프로젝트", "항목/제목", "금액", "입금", "세금계산서", ""]):
@@ -422,13 +422,71 @@ else:  # 리스트
                  ", ".join(f"{plabel.get(e.get('project_id'),'-')} {won(e['amount'])}" for e in urgent_list[:6])
                  + (" 외" if len(urgent_list) > 6 else ""))
 
+elif view == "세금계산서":
+    st.caption("홈택스에서 가져온 세금계산서를 '받을' 일정에 정확히 연결합니다. 금액·날짜가 가까운 후보가 위에 오게 정렬돼요.")
+    tinv = SUPA.table("tax_invoices").select("*").order("write_date", desc=True).execute().data
+    if not tinv:
+        st.info("업로드된 세금계산서가 없습니다. 위 '🧾 세금계산서 업로드'로 먼저 올리세요.")
+    else:
+        rcv = [e for e in events_all if e["direction"] == "in"]
+        ce_by_id = {e["id"]: e for e in events_all}
+
+        def cand_key(inv, e):
+            amt_match = 0 if e["amount"] in (inv.get("total_amount"), inv.get("supply_amount")) else 1
+            dd = (e.get("due_date") or "")[:10]
+            try:
+                gap = abs((date.fromisoformat(dd) - date.fromisoformat(inv["write_date"])).days) if (dd and inv.get("write_date")) else 999
+            except Exception:
+                gap = 999
+            return (amt_match, gap)
+
+        unmatched = [v for v in tinv if not v.get("matched_cash_event_id") and (v.get("total_amount") or 0) > 0]
+        matched = [v for v in tinv if v.get("matched_cash_event_id")]
+
+        st.markdown(f"**미연결 세금계산서 {len(unmatched)}건** — 후보를 고르고 '연결'")
+        for v in unmatched:
+            c = st.columns([2.6, 3.0, 0.8])
+            c[0].markdown(f"🧾 {v.get('write_date')} · **{v.get('buyer_name') or v.get('buyer_biz_no')}** · {won(v.get('total_amount'))}")
+            cands = sorted(rcv, key=lambda e: cand_key(v, e))
+            opts = {}
+            for e in cands[:25]:
+                tag = " ·🧾연결됨" if e.get("tax_issued") else ""
+                opts[f"{plabel.get(e.get('project_id'),'(프로젝트없음)')} · {(e.get('due_date') or '-')[:10]} · {won(e['amount'])}{tag}"] = e["id"]
+            opts["(연결 안 함)"] = None
+            pick = c[1].selectbox("연결할 받을 일정", list(opts.keys()), key="pk" + v["approval_no"], label_visibility="collapsed")
+            if c[2].button("연결", key="lk" + v["approval_no"], type="primary"):
+                ceid = opts[pick]
+                if ceid:
+                    SUPA.table("cash_events").update({"tax_issued": True, "tax_invoice_no": v["approval_no"]}).eq("id", ceid).execute()
+                    SUPA.table("tax_invoices").update({"matched_cash_event_id": ceid}).eq("approval_no", v["approval_no"]).execute()
+                    st.toast("연결됨 ✓"); st.rerun()
+
+        if matched:
+            st.divider()
+            st.markdown(f"**연결 완료 {len(matched)}건**")
+            for v in matched:
+                e = ce_by_id.get(v.get("matched_cash_event_id"))
+                c = st.columns([2.6, 3.0, 0.8])
+                c[0].markdown(f"🧾 {v.get('write_date')} · {v.get('buyer_name') or ''} · {won(v.get('total_amount'))}")
+                c[1].write(f"→ {plabel.get(e.get('project_id'),'-') if e else '?'} · {((e.get('due_date') or '-')[:10]) if e else ''} · {won(e['amount']) if e else ''}")
+                if c[2].button("해제", key="ul" + v["approval_no"]):
+                    if e:
+                        SUPA.table("cash_events").update({"tax_issued": False, "tax_invoice_no": None}).eq("id", e["id"]).execute()
+                    SUPA.table("tax_invoices").update({"matched_cash_event_id": None}).eq("approval_no", v["approval_no"]).execute()
+                    st.toast("연결 해제됨 ✓"); st.rerun()
+
+        neg = [v for v in tinv if (v.get("total_amount") or 0) <= 0]
+        if neg:
+            st.caption(f"※ 수정/취소(음수) {len(neg)}건은 매칭 대상에서 제외했습니다.")
+
 # ── 하단 요약 (수익률) ────────────────────────────────────────
-st.divider()
-i_s = sum(e["amount"] or 0 for e in events if e["direction"] == "in")
-o_s = sum(e["amount"] or 0 for e in events if e["direction"] == "out")
-rate = round((i_s - o_s) / i_s * 100, 1) if i_s else 0
-s = st.columns(4)
-s[0].metric("받을 합계", won(i_s))
-s[1].metric("나갈 합계", won(o_s))
-s[2].metric("순액 (받을 − 나갈)", won(i_s - o_s))
-s[3].metric("수익률", f"{rate}%")
+if view in ("달력", "리스트"):
+    st.divider()
+    i_s = sum(e["amount"] or 0 for e in events if e["direction"] == "in")
+    o_s = sum(e["amount"] or 0 for e in events if e["direction"] == "out")
+    rate = round((i_s - o_s) / i_s * 100, 1) if i_s else 0
+    s = st.columns(4)
+    s[0].metric("받을 합계", won(i_s))
+    s[1].metric("나갈 합계", won(o_s))
+    s[2].metric("순액 (받을 − 나갈)", won(i_s - o_s))
+    s[3].metric("수익률", f"{rate}%")
