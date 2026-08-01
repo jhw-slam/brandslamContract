@@ -100,9 +100,7 @@ with id_c1:
 
 st.divider()
 
-# ── 비전 캐스케이드 ─────────────────────────────────────────────
-st.subheader("비전 캐스케이드")
-
+# ── 비전 캐스케이드 (기본은 접어둠 — 펼쳐야 보이게) ──────────────
 TIERS = [
     {
         "name": "OWM", "sub": "그룹 비전",
@@ -121,24 +119,25 @@ TIERS = [
     },
 ]
 
-for t in TIERS:
-    with st.container(border=True):
-        c1, c2, c3 = st.columns([1, 2.3, 2.3])
-        with c1:
-            st.markdown(f"**{t['name']}**")
-            st.caption(t["sub"])
-        with c2:
-            st.markdown("**비전 · 미션**")
-            st.write(t["vision"])
-        with c3:
-            st.markdown("**결과적 목표**")
-            st.markdown(t["goal"])
+with st.expander("🗺️ 비전 캐스케이드 (OWM → LSP → 브랜드슬램) — 펼쳐서 보기", expanded=False):
+    for t in TIERS:
+        with st.container(border=True):
+            c1, c2, c3 = st.columns([1, 2.3, 2.3])
+            with c1:
+                st.markdown(f"**{t['name']}**")
+                st.caption(t["sub"])
+            with c2:
+                st.markdown("**비전 · 미션**")
+                st.write(t["vision"])
+            with c3:
+                st.markdown("**결과적 목표**")
+                st.markdown(t["goal"])
 
-st.write("")
-n1, n2, n3 = st.columns(3)
-n1.metric("연간 OWM 마케팅 예산", "120억")
-n2.metric("월 집행 목표", "10억 / 월")
-n3.metric("전략 / 준전략 브랜드", "10 / 50~70")
+    st.write("")
+    n1, n2, n3 = st.columns(3)
+    n1.metric("연간 OWM 마케팅 예산", "120억")
+    n2.metric("월 집행 목표", "10억 / 월")
+    n3.metric("전략 / 준전략 브랜드", "10 / 50~70")
 
 st.divider()
 
