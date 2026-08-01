@@ -71,18 +71,30 @@ div[data-testid="stExpander"] div[data-testid="stExpanderDetails"] { padding-top
 st.title("🎯 OKR 목표관리")
 st.caption("OWM → LSP → 브랜드슬램 비전 캐스케이드와 구성원별 OKR · 실시간 DB 연동")
 
-# ── 관리자 확인 (이메일) ────────────────────────────────────
+# ── 관리자 확인 (이메일 + 비밀번호) ──────────────────────────
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
 st.session_state.setdefault("user_email", "")
+st.session_state.setdefault("admin_pw", "")
 id_c1, id_c2 = st.columns([3, 1.4])
 with id_c2:
     st.session_state["user_email"] = st.text_input(
         "내 이메일", value=st.session_state["user_email"],
-        placeholder="jhw@slam-global.com", help="관리자 이메일로 입력하면 확정된 목표도 수정할 수 있어요."
+        placeholder="jhw@slam-global.com", help="관리자 이메일 + 관리자 비밀번호를 모두 맞게 입력해야 관리자 모드가 됩니다."
     )
-is_admin = st.session_state["user_email"].strip().lower() == ADMIN_EMAIL
+    email_matches = st.session_state["user_email"].strip().lower() == ADMIN_EMAIL
+    if email_matches:
+        st.session_state["admin_pw"] = st.text_input("관리자 비밀번호", type="password", value=st.session_state["admin_pw"])
+
+is_admin = bool(
+    ADMIN_PASSWORD and email_matches and st.session_state["admin_pw"] == ADMIN_PASSWORD
+)
 with id_c1:
     if is_admin:
         st.success("🔑 관리자 모드 — 확정된 목표를 포함해 모든 항목을 수정할 수 있습니다.")
+    elif email_matches and not ADMIN_PASSWORD:
+        st.error("서버에 ADMIN_PASSWORD 환경변수가 설정되어 있지 않습니다. 배포 환경변수를 추가해주세요.")
+    elif email_matches:
+        st.warning("관리자 이메일은 맞지만 비밀번호가 아직 틀렸거나 입력되지 않았습니다.")
     else:
         st.caption("일반 참여자 모드 — 확정 전 목표는 자유롭게 관리하고, 확정 이후 변경은 관리자만 가능합니다.")
 
@@ -501,15 +513,17 @@ def render_item_row(it, ctx, show_person=False):
     overdue_badge = " " + badge_html("late", "마감PT 대기") if is_overdue_for_closing(it) else ""
     cols_def = GRID_WITH_PERSON if show_person else GRID_NO_PERSON
     person_cell = f"<div class='okr-person'>{it['person']}</div>" if show_person else ""
-    html = f"""<div class='okr-row-html' style='grid-template-columns:{cols_def}'>
-        {person_cell}
-        <div><span class='okr-title'>{it['title']}{crown}</span><span class='okr-cat'>{it['category']}{extra}</span></div>
-        <div class='okr-num'>{CADENCE_LABEL[it['cadence']]}</div>
-        <div class='okr-num'>{qty_str}</div>
-        <div>{bar_html(pct, key)}</div>
-        <div class='okr-num'>{dl}</div>
-        <div>{badge_html(key, label)}{conf_badge}{overdue_badge}</div>
-    </div>"""
+    html = (
+        f"<div class='okr-row-html' style='grid-template-columns:{cols_def}'>"
+        f"{person_cell}"
+        f"<div><span class='okr-title'>{it['title']}{crown}</span><span class='okr-cat'>{it['category']}{extra}</span></div>"
+        f"<div class='okr-num'>{CADENCE_LABEL[it['cadence']]}</div>"
+        f"<div class='okr-num'>{qty_str}</div>"
+        f"<div>{bar_html(pct, key)}</div>"
+        f"<div class='okr-num'>{dl}</div>"
+        f"<div>{badge_html(key, label)}{conf_badge}{overdue_badge}</div>"
+        f"</div>"
+    )
     st.markdown(html, unsafe_allow_html=True)
     item_detail_form(it, ctx)
 
