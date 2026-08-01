@@ -26,8 +26,25 @@ def sb():
     return create_client(url, key)
 SUPA = sb()
 
+ADMIN_EMAIL = "jhw@slam-global.com"
+
 st.title("🎯 OKR 목표관리")
 st.caption("OWM → LSP → 브랜드슬램 비전 캐스케이드와 구성원별 OKR · 실시간 DB 연동")
+
+# ── 관리자 확인 (이메일) ────────────────────────────────────
+st.session_state.setdefault("user_email", "")
+id_c1, id_c2 = st.columns([3, 1.4])
+with id_c2:
+    st.session_state["user_email"] = st.text_input(
+        "내 이메일", value=st.session_state["user_email"],
+        placeholder="jhw@slam-global.com", help="관리자 이메일로 입력하면 확정된 목표도 수정할 수 있어요."
+    )
+is_admin = st.session_state["user_email"].strip().lower() == ADMIN_EMAIL
+with id_c1:
+    if is_admin:
+        st.success("🔑 관리자 모드 — 확정된 목표를 포함해 모든 항목을 수정할 수 있습니다.")
+    else:
+        st.caption("일반 참여자 모드 — 확정 전 목표는 자유롭게 관리하고, 확정 이후 변경은 관리자만 가능합니다.")
 
 st.divider()
 
@@ -76,19 +93,20 @@ st.divider()
 # ── 데이터 로드 ───────────────────────────────────────────────
 PEOPLE_ORDER = ["양혜준", "김선재", "정다영", "구정회", "박솔 이사", "미국 리드"]
 CADENCE_LABEL = {"weekly": "주간", "monthly": "월간", "quarterly": "분기", "once": "1회성"}
-BADGE = {  # key -> (배경, 글자색)
+CADENCE_KEYS = ["monthly", "weekly", "quarterly", "once"]
+BADGE = {
     "ok":    ("#e9f7ee", "#15803d"),
     "watch": ("#fdf2e0", "#b45309"),
     "late":  ("#fdecec", "#dc2626"),
     "blue":  ("#eaf0fd", "#2451c4"),
 }
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=10)
 def load_org():
     rows = SUPA.table("okr_org").select("*").execute().data
     return {r["person"]: r for r in rows}
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=10)
 def load_items():
     return SUPA.table("okr_items").select("*").order("created_at").execute().data
 
@@ -147,6 +165,11 @@ def pace_status(item, today=None):
         return ("watch", "주의")
     return ("ok", "정상 진행")
 
+def is_achieved(item):
+    target = float(item.get("target_qty") or 0)
+    progress = float(item.get("progress") or 0)
+    return target > 0 and progress >= target
+
 def deadline_label(item, today=None):
     _, end = period_for(item, today or date.today())
     return end.strftime("%m/%d")
@@ -186,16 +209,19 @@ def render_org_card(name):
         for i, kr in enumerate(krs, 1):
             warn = "⚠️" in kr
             st.markdown(f"{'⚠️ ' if warn else ''}**KR{i}** · {kr}")
-        with st.expander("Objective / KR 수정"):
-            with st.form(f"org_form_{name}"):
-                new_obj = st.text_input("Objective", value=org.get("objective", ""))
-                new_krs_txt = st.text_area("KR (한 줄에 하나씩)", value="\n".join(krs), height=110)
-                if st.form_submit_button("저장"):
-                    krs_list = [x.strip() for x in new_krs_txt.split("\n") if x.strip()]
-                    SUPA.table("okr_org").update(
-                        {"objective": new_obj.strip(), "krs": krs_list, "updated_at": datetime.utcnow().isoformat()}
-                    ).eq("person", name).execute()
-                    st.success("저장했습니다."); refresh()
+        with st.expander("Objective / KR 수정" + ("" if is_admin else " (관리자 전용)"), expanded=False):
+            if not is_admin:
+                st.info("Objective/KR 변경은 관리자(jhw@slam-global.com)만 할 수 있어요.")
+            else:
+                with st.form(f"org_form_{name}"):
+                    new_obj = st.text_input("Objective", value=org.get("objective", ""))
+                    new_krs_txt = st.text_area("KR (한 줄에 하나씩)", value="\n".join(krs), height=110)
+                    if st.form_submit_button("저장"):
+                        krs_list = [x.strip() for x in new_krs_txt.split("\n") if x.strip()]
+                        SUPA.table("okr_org").update(
+                            {"objective": new_obj.strip(), "krs": krs_list, "updated_at": datetime.utcnow().isoformat()}
+                        ).eq("person", name).execute()
+                        st.success("저장했습니다."); refresh()
 
 if selected != "전체 보기":
     render_org_card(selected)
@@ -216,25 +242,42 @@ total = len(scoped)
 late_n = sum(1 for it in scoped if pace_status(it)[0] == "late")
 watch_n = sum(1 for it in scoped if pace_status(it)[0] == "watch")
 confirmed_n = sum(1 for it in scoped if it["confirmed"])
-clarify_n = sum(1 for it in scoped if it["needs_clarification"])
+achieved_n = sum(1 for it in scoped if is_achieved(it))
 
 m = st.columns(5)
 m[0].metric("관리 중 업무", f"{total}건")
 m[1].metric("지연", f"{late_n}건", delta="확인 필요" if late_n else None, delta_color="inverse")
 m[2].metric("주의", f"{watch_n}건", delta="확인 필요" if watch_n else None, delta_color="inverse")
 m[3].metric("확정된 목표", f"{confirmed_n}/{total}")
-m[4].metric("설명필요 표시", f"{clarify_n}건")
+m[4].metric("🏆 달성", f"{achieved_n}건")
 
-# ── 탭 ────────────────────────────────────────────────────────
-tab_okr, tab_list, tab_cal, tab_late, tab_week, tab_confirmed = st.tabs(
-    ["OKR표", "리스트로 보기", "캘린더 보기", "미달성 KPI 보기", "이번주 수량체크", "협의된 목표 보기"]
+# ── 탭 (탭마다 폼 key가 겹치지 않도록 ctx를 구분해서 넘김) ────
+tab_okr, tab_list, tab_cal, tab_late, tab_week, tab_confirmed, tab_achieved = st.tabs(
+    ["OKR표", "리스트로 보기", "캘린더 보기", "미달성 KPI 보기", "이번주 수량체크", "협의된 목표 보기", "🏆 달성한 KPI"]
 )
 
-CADENCE_KEYS = ["monthly", "weekly", "quarterly", "once"]
+def build_payload_with_achievement(it, n_qty, n_progress):
+    """진행률이 목표를 넘기면 achieved_at 자동 기록, 다시 내려가면 해제."""
+    ratio = (n_progress / n_qty) if n_qty > 0 else 0
+    achieved_at = it.get("achieved_at")
+    if ratio >= 1 and not achieved_at:
+        achieved_at = date.today().isoformat()
+    elif ratio < 1 and achieved_at:
+        achieved_at = None
+    return achieved_at
 
-def item_detail_form(it):
-    with st.expander(f"상세보기 · {it['title']}"):
-        with st.form(f"edit_{it['id']}"):
+def item_detail_form(it, ctx):
+    """ctx: 'okr' | 'late' | 'cal' | 'achieved' — 같은 항목이 여러 탭에 동시에 나와도 폼 key가 겹치지 않게 함."""
+    locked = it["confirmed"] and not is_admin
+    label = f"상세보기 · {it['title']}" + (" 🔒" if locked else "")
+    with st.expander(label):
+        if locked:
+            st.info("🔒 이 목표는 이미 협의·확정되었습니다. 변경은 관리자(jhw@slam-global.com)만 할 수 있어요.")
+            st.write(f"목표 {it['target_qty']} {it['unit']} · 진행 {it['progress']} · 마감 {deadline_label(it)}")
+            if it.get("note"):
+                st.caption(it["note"])
+            return
+        with st.form(f"edit_{ctx}_{it['id']}"):
             e1, e2, e3, e4 = st.columns(4)
             n_title = e1.text_input("업무명", value=it["title"])
             n_qty = e2.number_input("목표 수량", value=float(it["target_qty"]), min_value=0.0)
@@ -249,48 +292,63 @@ def item_detail_form(it):
                 default_once = date.fromisoformat(it["once_date"]) if it.get("once_date") else date.today()
                 n_once = p2.date_input("마감일(1회성)", value=default_once)
             n_note = st.text_area("메모 / 상세 설명", value=it.get("note") or "")
+
             c1, c2 = st.columns(2)
-            n_confirmed = c1.checkbox("협의된 목표로 확정", value=it["confirmed"])
+            if is_admin:
+                n_confirmed = c1.checkbox("협의된 목표로 확정 (관리자 전용)", value=it["confirmed"])
+            else:
+                c1.caption("🔒 확정 여부는 관리자만 바꿀 수 있어요.")
+                n_confirmed = it["confirmed"]
             n_clarify = c2.checkbox("💬 설명필요 표시", value=it["needs_clarification"])
+
             b1, b2, b3 = st.columns([1, 1, 3])
             save = b1.form_submit_button("저장", type="primary")
             delete = b2.form_submit_button("삭제")
             if save:
+                achieved_at = build_payload_with_achievement(it, n_qty, n_progress)
                 payload = {
                     "title": n_title.strip(), "target_qty": n_qty, "unit": n_unit.strip() or "건",
                     "cadence": n_cadence, "progress": n_progress, "note": n_note,
-                    "confirmed": n_confirmed, "needs_clarification": n_clarify,
+                    "needs_clarification": n_clarify, "achieved_at": achieved_at,
                     "once_date": n_once.isoformat() if n_once else None,
                     "updated_at": datetime.utcnow().isoformat(),
                 }
-                if n_confirmed and not it["confirmed"]:
-                    payload["confirmed_at"] = date.today().isoformat()
-                elif not n_confirmed:
-                    payload["confirmed_at"] = None
+                if is_admin:
+                    payload["confirmed"] = n_confirmed
+                    if n_confirmed and not it["confirmed"]:
+                        payload["confirmed_at"] = date.today().isoformat()
+                    elif not n_confirmed:
+                        payload["confirmed_at"] = None
                 SUPA.table("okr_items").update(payload).eq("id", it["id"]).execute()
-                st.success("저장했습니다."); refresh()
+                if achieved_at and not it.get("achieved_at"):
+                    st.balloons()
+                    st.success("🏆 목표 달성! 축하합니다.")
+                else:
+                    st.success("저장했습니다.")
+                refresh()
             if delete:
                 SUPA.table("okr_items").delete().eq("id", it["id"]).execute()
                 st.warning("삭제했습니다."); refresh()
 
-def render_item_row(it, show_person=False):
+def render_item_row(it, ctx, show_person=False):
     key, label = pace_status(it)
     pct = progress_pct(it)
     dl = deadline_label(it)
+    crown = " 👑" if is_achieved(it) else ""
     cols = st.columns([0.9, 3.3, 1, 1.4, 1.4, 1, 1.4] if show_person else [3.6, 1, 1.4, 1.4, 1, 1.4])
     idx = 0
     if show_person:
         cols[idx].markdown(f"**{it['person']}**"); idx += 1
     qty_str = f"{it['progress']}/{it['target_qty']} {it['unit']}" if it["target_qty"] > 0 else "미확정"
     extra = " · 💬" if it["needs_clarification"] else ""
-    cols[idx].markdown(f"**{it['title']}**  \n<span style='font-size:11px;color:#9ca3af'>{it['category']}{extra}</span>", unsafe_allow_html=True); idx += 1
+    cols[idx].markdown(f"**{it['title']}{crown}**  \n<span style='font-size:11px;color:#9ca3af'>{it['category']}{extra}</span>", unsafe_allow_html=True); idx += 1
     cols[idx].write(CADENCE_LABEL[it["cadence"]]); idx += 1
     cols[idx].write(qty_str); idx += 1
     cols[idx].markdown(bar_html(pct, key), unsafe_allow_html=True); idx += 1
     cols[idx].write(dl); idx += 1
     conf_badge = " " + badge_html("blue", "확정") if it["confirmed"] else ""
     cols[idx].markdown(badge_html(key, label) + conf_badge, unsafe_allow_html=True)
-    item_detail_form(it)
+    item_detail_form(it, ctx)
     st.markdown("<hr style='margin:2px 0 10px;border-color:#eee'>", unsafe_allow_html=True)
 
 # ── OKR표 ───────────────────────────────────────────────────
@@ -322,7 +380,7 @@ with tab_okr:
             st.write("")
             continue
         for it in p_items:
-            render_item_row(it, show_person=False)
+            render_item_row(it, ctx="okr", show_person=False)
 
 # ── 리스트로 보기 ───────────────────────────────────────────
 with tab_list:
@@ -335,7 +393,7 @@ with tab_list:
         for it in all_items_sorted:
             key, label = pace_status(it)
             rows.append({
-                "담당자": it["person"], "업무": it["title"], "카테고리": it["category"],
+                "담당자": it["person"], "업무": ("👑 " if is_achieved(it) else "") + it["title"], "카테고리": it["category"],
                 "주기": CADENCE_LABEL[it["cadence"]],
                 "목표": f"{it['target_qty']} {it['unit']}" if it["target_qty"] > 0 else "미확정",
                 "진행": f"{it['progress']} ({progress_pct(it)}%)",
@@ -364,8 +422,8 @@ with tab_cal:
     grid_start = start_of_week(base)
     grid_end = end_of_week(end_of_month(base))
 
-    # 이 기간에 걸리는 항목별 마감일 계산
-    day_map = {}
+    day_map = {}       # 마감일 -> 항목들
+    crown_map = {}     # 달성일(achieved_at) -> 항목들
     for it in cal_items:
         c = it["cadence"]
         if c == "once":
@@ -374,15 +432,19 @@ with tab_cal:
                 d = date.fromisoformat(d) if isinstance(d, str) else d
                 if grid_start <= d <= grid_end:
                     day_map.setdefault(d, []).append(it)
-            continue
-        cursor = grid_start
-        seen = set()
-        while cursor <= grid_end:
-            _, end = period_for(it, cursor)
-            if grid_start <= end <= grid_end and end not in seen:
-                day_map.setdefault(end, []).append(it)
-                seen.add(end)
-            cursor += timedelta(days=7 if c == "weekly" else 30)
+        else:
+            cursor = grid_start
+            seen = set()
+            while cursor <= grid_end:
+                _, end = period_for(it, cursor)
+                if grid_start <= end <= grid_end and end not in seen:
+                    day_map.setdefault(end, []).append(it)
+                    seen.add(end)
+                cursor += timedelta(days=7 if c == "weekly" else 30)
+        if it.get("achieved_at"):
+            ad = date.fromisoformat(it["achieved_at"]) if isinstance(it["achieved_at"], str) else it["achieved_at"]
+            if grid_start <= ad <= grid_end:
+                crown_map.setdefault(ad, []).append(it)
 
     dows = ["월", "화", "수", "목", "금", "토", "일"]
     html = "<div style='display:grid;grid-template-columns:repeat(7,1fr);gap:6px'>"
@@ -392,9 +454,12 @@ with tab_cal:
     while cursor <= grid_end:
         out = cursor.month != base.month
         is_today = cursor == today
-        bg = "#f7f7f8" if out else "#fff"
-        border = "1px solid #16181d" if is_today else "1px solid #e7e8ec"
+        has_crown = cursor in crown_map
+        bg = "#fffbea" if has_crown else ("#f7f7f8" if out else "#fff")
+        border = "1.5px solid #d4a017" if has_crown else ("1px solid #16181d" if is_today else "1px solid #e7e8ec")
         chips = ""
+        if has_crown:
+            chips += "<div style='font-size:14px'>👑</div>"
         for it in day_map.get(cursor, [])[:3]:
             k, _ = pace_status(it)
             bg2, fg2 = BADGE[k]
@@ -409,16 +474,22 @@ with tab_cal:
         cursor += timedelta(days=1)
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
+    st.caption("👑 표시된 날짜 = 그날 목표를 달성한 기록이 있어요.")
 
     st.write("")
-    pick = st.date_input("특정 날짜의 마감 항목 보기", value=today)
+    pick = st.date_input("특정 날짜의 마감/달성 항목 보기", value=today)
     day_items = day_map.get(pick, [])
+    crown_items = crown_map.get(pick, [])
+    if crown_items:
+        st.markdown("**🏆 이 날짜에 달성한 목표**")
+        for it in crown_items:
+            render_item_row(it, ctx="cal_crown", show_person=(selected == "전체 보기"))
     if day_items:
         st.markdown(f"**{pick.strftime('%Y-%m-%d')} 마감 항목**")
         for it in day_items:
-            render_item_row(it, show_person=(selected == "전체 보기"))
-    else:
-        st.caption("해당 날짜에 마감되는 항목이 없습니다.")
+            render_item_row(it, ctx="cal", show_person=(selected == "전체 보기"))
+    if not day_items and not crown_items:
+        st.caption("해당 날짜에 마감·달성 기록이 없습니다.")
 
 # ── 미달성 KPI 보기 ─────────────────────────────────────────
 with tab_late:
@@ -440,7 +511,7 @@ with tab_late:
                 cc[0].markdown(f"**{it['person']} · {it['title']}**  \n<span style='font-size:11px;color:#9ca3af'>{it['category']}</span>", unsafe_allow_html=True)
                 cc[1].write(f"실제 {it['progress']} / 기대치 ≈ {expected} {it['unit']} (목표 {it['target_qty']})")
                 cc[2].markdown(badge_html(key, label), unsafe_allow_html=True)
-                item_detail_form(it)
+                item_detail_form(it, ctx="late")
 
 # ── 이번주 수량체크 ─────────────────────────────────────────
 with tab_week:
@@ -459,8 +530,9 @@ with tab_week:
                 new_val = wc[1].number_input("진행", value=float(it["progress"]), min_value=0.0, label_visibility="collapsed")
                 wc[2].markdown(bar_html(progress_pct(it), key) + " " + badge_html(key, label), unsafe_allow_html=True)
                 if wc[3].form_submit_button("저장"):
+                    achieved_at = build_payload_with_achievement(it, it["target_qty"], new_val)
                     SUPA.table("okr_items").update(
-                        {"progress": new_val, "updated_at": datetime.utcnow().isoformat()}
+                        {"progress": new_val, "achieved_at": achieved_at, "updated_at": datetime.utcnow().isoformat()}
                     ).eq("id", it["id"]).execute()
                     st.success("저장했습니다."); refresh()
 
@@ -469,7 +541,7 @@ with tab_confirmed:
     scope_items = items_of(selected) if selected != "전체 보기" else ITEMS
     confirmed_items = [it for it in scope_items if it["confirmed"]]
     if not confirmed_items:
-        st.info("아직 '확정'된 목표가 없습니다. 상세보기에서 **협의된 목표로 확정** 체크박스를 켜면 여기 표시됩니다.")
+        st.info("아직 '확정'된 목표가 없습니다. 상세보기에서 **협의된 목표로 확정**(관리자 전용)을 켜면 여기 표시됩니다.")
     else:
         rows = [{
             "담당자": it["person"], "업무": it["title"], "주기": CADENCE_LABEL[it["cadence"]],
@@ -477,6 +549,30 @@ with tab_confirmed:
             "확정일": it.get("confirmed_at") or "-",
         } for it in confirmed_items]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if not is_admin:
+            st.caption("🔒 확정된 목표의 변경은 관리자(jhw@slam-global.com)만 할 수 있어요.")
+
+# ── 🏆 달성한 KPI ───────────────────────────────────────────
+with tab_achieved:
+    scope_items = items_of(selected) if selected != "전체 보기" else ITEMS
+    achieved_items = [it for it in scope_items if is_achieved(it)]
+    achieved_items.sort(key=lambda x: x.get("achieved_at") or "", reverse=True)
+    if not achieved_items:
+        st.caption("아직 목표를 달성한 항목이 없습니다. 진행률이 목표치에 도달하면 여기 자동으로 올라오고, 캘린더에도 👑 표시가 붙어요.")
+    else:
+        st.markdown(
+            "<div style='background:linear-gradient(135deg,#fffbea,#fef3c7);border:1px solid #f2e0b8;"
+            "border-radius:12px;padding:14px 18px;margin-bottom:14px;font-weight:700;color:#92400e'>"
+            f"🏆 지금까지 {len(achieved_items)}개의 목표를 달성했습니다 — 명예의 전당</div>",
+            unsafe_allow_html=True
+        )
+        for it in achieved_items:
+            with st.container(border=True):
+                ac = st.columns([3, 2, 1.4])
+                ac[0].markdown(f"👑 **{it['person']} · {it['title']}**  \n<span style='font-size:11px;color:#9ca3af'>{it['category']}</span>", unsafe_allow_html=True)
+                ac[1].write(f"{it['target_qty']} {it['unit']} 달성 · {CADENCE_LABEL[it['cadence']]}")
+                ac[2].markdown(f"<span style='background:#fef3c7;color:#92400e;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:800'>🏆 {it.get('achieved_at') or ''}</span>", unsafe_allow_html=True)
+                item_detail_form(it, ctx="achieved")
 
 st.divider()
-st.caption("브랜드슬램 내부 참고용 · Supabase(okr_org / okr_items) 실시간 연동 · 분기 갱신 시 이전 분기 대비 달성률 함께 트래킹 예정")
+st.caption("브랜드슬램 내부 참고용 · Supabase(okr_org / okr_items) 실시간 연동 · 확정 목표는 관리자만 수정 가능")
