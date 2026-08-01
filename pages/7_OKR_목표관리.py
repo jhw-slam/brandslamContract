@@ -28,6 +28,33 @@ SUPA = sb()
 
 ADMIN_EMAIL = "jhw@slam-global.com"
 
+def send_via_resend(to_addr, subject, body_text, purpose="manual"):
+    """Resend API로 이메일 발송 + email_log 테이블에 기록. (RESEND_API_KEY 환경변수 필요)"""
+    import requests
+    api_key = os.environ.get("RESEND_API_KEY")
+    sender = os.environ.get("RESEND_FROM", "브랜드슬램 OKR <onboarding@resend.dev>")
+    if not api_key:
+        return False, "RESEND_API_KEY 환경변수가 설정되어 있지 않습니다."
+    try:
+        res = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"from": sender, "to": [to_addr], "subject": subject, "text": body_text},
+            timeout=15,
+        )
+        ok = res.status_code < 300
+        err = None if ok else f"{res.status_code} {res.text}"[:500]
+    except Exception as e:
+        ok, err = False, str(e)
+    try:
+        SUPA.table("email_log").insert({
+            "purpose": purpose, "recipient": to_addr, "subject": subject, "body": body_text,
+            "status": "sent" if ok else "failed", "error": err,
+        }).execute()
+    except Exception:
+        pass
+    return ok, err
+
 # ── 촘촘한 시트형 UI (Notion/Linear/엑셀 느낌) ────────────────
 st.markdown("""
 <style>
@@ -760,6 +787,50 @@ with tab_closing:
     overdue_items = [it for it in scope_items if is_overdue_for_closing(it)]
     st.caption("기간이 끝난 목표는 여기서 리포트를 제출하고, 관리자가 실제 성과를 확인·승인해야 비로소 마감됩니다. "
                "승인 전까지는 숫자를 계속 고칠 수 있어요 (면담하면서 같이 확인하고 조정 가능).")
+
+    if is_admin:
+        with st.expander("📧 리마인더 이메일 — 테스트 / 지금 즉시 발송 (관리자 전용)"):
+            st.caption("Resend 도메인 인증이 끝났으면 여기서 바로 테스트하거나, 목요일을 기다리지 않고 지금 리마인더를 보낼 수 있어요.")
+            tcol1, tcol2 = st.columns([3, 1])
+            test_addr = tcol1.text_input("테스트로 받을 이메일", value=ADMIN_EMAIL)
+            if tcol2.button("테스트 발송"):
+                ok, err = send_via_resend(
+                    test_addr, "[브랜드슬램 OKR] 테스트 메일",
+                    "이 메일이 도착했다면 Resend 연동이 정상 작동 중입니다.",
+                    purpose="test",
+                )
+                if ok:
+                    st.success(f"✅ {test_addr} 로 발송 완료! 받은편지함(스팸함도) 확인해보세요.")
+                else:
+                    st.error(f"발송 실패: {err}")
+
+            st.divider()
+            if st.button("🔔 지금 '이번주 마감 PT' 리마인더 즉시 발송 (전체 대상)"):
+                weekly_items_all = [it for it in ITEMS if it["cadence"] == "weekly"]
+                by_person_w = {}
+                for it in weekly_items_all:
+                    by_person_w.setdefault(it["person"], []).append(it)
+                sent, skipped = [], []
+                for name in PEOPLE_ORDER:
+                    org = ORG.get(name, {})
+                    email = (org.get("email") or "").strip()
+                    if org.get("pending") or not email:
+                        skipped.append(f"{name} (이메일 없음/공석)"); continue
+                    not_sub = [it for it in by_person_w.get(name, []) if not it.get("closing_submitted")]
+                    if not by_person_w.get(name):
+                        skipped.append(f"{name} (주간 KPI 없음)"); continue
+                    if not not_sub:
+                        skipped.append(f"{name} (이미 전부 제출함)"); continue
+                    lines = "\n".join(f"  - {it['title']} (진행 {it['progress']}/{it['target_qty']} {it['unit']})" for it in not_sub)
+                    body = (f"{name}님, 안녕하세요.\n\n이번 주 마감 PT를 아직 제출하지 않은 항목이 있어요:\n\n{lines}\n\n"
+                            "OKR 목표관리 페이지의 '🗓 마감 PT' 탭에서 이번 주 리포트를 작성해 제출해주세요.\n"
+                            "- 브랜드슬램 OKR 시스템 (관리자 수동 발송)")
+                    ok, err = send_via_resend(email, "[브랜드슬램 OKR] 이번 주 마감 PT 제출 요청", body, purpose="manual_weekly_reminder")
+                    (sent if ok else skipped).append(f"{name}{'' if ok else f' (실패: {err})'}")
+                st.success(f"발송 완료: {', '.join(sent) if sent else '없음'}")
+                if skipped:
+                    st.caption("건너뜀/실패: " + ", ".join(skipped))
+
     if not overdue_items:
         st.success("🎉 마감 PT 대기 중인 항목이 없습니다.")
     else:
