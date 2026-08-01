@@ -1,0 +1,25 @@
+name: Weekly Closing PT Reminder
+
+on:
+  schedule:
+    # 매주 목요일 06:00 UTC = 한국시간(KST) 목요일 오후 3시
+    - cron: '0 6 * * 4'
+  workflow_dispatch: {}   # 수동으로도 실행해볼 수 있게
+
+jobs:
+  send-reminders:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install supabase
+      - name: Send reminder emails
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          OKR_APP_URL: ${{ vars.OKR_APP_URL }}
+        run: python scripts/send_closing_reminders.py
