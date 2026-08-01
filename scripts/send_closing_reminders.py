@@ -2,38 +2,54 @@
 매주 목요일 오후, 아직 '마감 PT'를 제출하지 않은 담당자에게
 이번 주 마감 리포트를 제출하라고 이메일로 알려주는 스크립트.
 
+이메일 발송은 Resend(https://resend.com)의 API를 사용합니다.
+구글 2단계 인증 / 앱 비밀번호가 전혀 필요 없고, API 키 하나만 있으면 됩니다.
+
 필요한 환경변수 (GitHub Actions Secrets로 등록):
   SUPABASE_URL              - Supabase 프로젝트 URL
   SUPABASE_SERVICE_KEY       - Supabase 서비스 키 (okr_org / okr_items 읽기용)
-  GMAIL_SENDER               - 발송자 Gmail 주소 (예: kbeauty@slam-global.com)
-  GMAIL_APP_PASSWORD         - 위 계정의 Gmail 앱 비밀번호 (2단계 인증 계정에서 생성)
+  RESEND_API_KEY             - resend.com 가입 후 발급받은 API 키
+  RESEND_FROM                - 보내는 사람 표시 (예: "브랜드슬램 OKR <onboarding@resend.dev>")
+                                자체 도메인(slam-global.com)을 resend에 인증하면
+                                "브랜드슬램 OKR <okr@slam-global.com>" 처럼 쓸 수 있음
   OKR_APP_URL                - (선택) 실제 배포된 OKR 페이지 URL. 있으면 이메일 본문에 링크로 넣음
+
+resend 가입 방법 (2분):
+  1. https://resend.com 접속 → 구글 계정으로 가입
+  2. 왼쪽 메뉴 API Keys → Create API Key → 나오는 키를 RESEND_API_KEY로 저장
+  3. (선택) Domains 메뉴에서 slam-global.com 인증하면 실제 회사 도메인으로 발송 가능.
+     인증 안 해도 일단 onboarding@resend.dev 로 바로 보낼 수 있음 (테스트/내부용으로 충분)
 """
 import os
-import smtplib
-import ssl
-from email.mime.text import MIMEText
+import requests
 
 from supabase import create_client
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-GMAIL_SENDER = os.environ["GMAIL_SENDER"]
-GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
+RESEND_API_KEY = os.environ["RESEND_API_KEY"]
+RESEND_FROM = os.environ.get("RESEND_FROM", "브랜드슬램 OKR <onboarding@resend.dev>")
 OKR_APP_URL = os.environ.get("OKR_APP_URL", "").strip()
 
 SUPA = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
-def send_email(to_addr, subject, body):
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = GMAIL_SENDER
-    msg["To"] = to_addr
-    ctx = ssl.create_default_context()
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
-        server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
-        server.sendmail(GMAIL_SENDER, [to_addr], msg.as_string())
+def send_email(to_addr, subject, body_text):
+    res = requests.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "from": RESEND_FROM,
+            "to": [to_addr],
+            "subject": subject,
+            "text": body_text,
+        },
+        timeout=15,
+    )
+    if res.status_code >= 300:
+        print(f"  ⚠️ {to_addr} 발송 실패: {res.status_code} {res.text}")
+        return False
+    return True
 
 
 def main():
