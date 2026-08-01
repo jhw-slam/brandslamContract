@@ -1,8 +1,13 @@
 import os
+from datetime import date, datetime, timedelta
+
+import pandas as pd
 import streamlit as st
+from supabase import create_client
 
 st.set_page_config(page_title="OKR 목표관리", layout="wide")
 
+# ── 비밀번호 게이트 ───────────────────────────────────────────
 PW = os.environ.get("APP_PASSWORD")
 if PW and not st.session_state.get("ok"):
     pw = st.text_input("비밀번호", type="password")
@@ -13,8 +18,16 @@ if PW and not st.session_state.get("ok"):
             st.error("비밀번호가 올바르지 않습니다.")
     st.stop()
 
+@st.cache_resource
+def sb():
+    url = os.environ.get("SUPABASE_URL"); key = os.environ.get("SUPABASE_SERVICE_KEY")
+    if not url or not key:
+        st.error("❌ SUPABASE_URL / SUPABASE_SERVICE_KEY 환경변수가 없습니다."); st.stop()
+    return create_client(url, key)
+SUPA = sb()
+
 st.title("🎯 OKR 목표관리")
-st.caption("OWM → LSP → 브랜드슬램 비전 캐스케이드와 구성원별 OKR · 2026 Q3 기준")
+st.caption("OWM → LSP → 브랜드슬램 비전 캐스케이드와 구성원별 OKR · 실시간 DB 연동")
 
 st.divider()
 
@@ -60,185 +73,410 @@ n3.metric("전략 / 준전략 브랜드", "10 / 50~70")
 
 st.divider()
 
-# ── 개인별 OKR ──────────────────────────────────────────────────
-st.subheader("개인별 OKR")
-st.caption("이름 아래 'ᐳ 자세히보기'를 펼치면 담당업무 · KPI · 자격요건까지 볼 수 있어요.")
+# ── 데이터 로드 ───────────────────────────────────────────────
+PEOPLE_ORDER = ["양혜준", "김선재", "정다영", "구정회", "박솔 이사", "미국 리드"]
+CADENCE_LABEL = {"weekly": "주간", "monthly": "월간", "quarterly": "분기", "once": "1회성"}
+BADGE = {  # key -> (배경, 글자색)
+    "ok":    ("#e9f7ee", "#15803d"),
+    "watch": ("#fdf2e0", "#b45309"),
+    "late":  ("#fdecec", "#dc2626"),
+    "blue":  ("#eaf0fd", "#2451c4"),
+}
 
-PEOPLE = [
-    {
-        "name": "김선재 매니저", "tag": "영업",
-        "objective": "브랜드 예산 수금 파이프라인 안정화 및 확대",
-        "krs": [
-            "월 마케팅 예산 집행 10억 달성",
-            "전략브랜드 10개 유지 (in/out 관리)",
-            "준전략브랜드 50~70개 확보·운영",
-        ],
-        "duties": [
-            "브랜드사 대상 마케팅 플랜 피칭 및 예산(입금) 확보",
-            "전략브랜드 10개 / 준전략브랜드 50~70개 포트폴리오 관리 (in/out 판단 포함)",
-            "박솔 이사가 상황판을 통해 넘기는 킥오프 이후의 실무(계약, 예산 세부 협의, 실행 관리) 처리",
-            "영업 파이프라인 전체 오너십 및 신규 마케팅담당자(채용예정) 관리",
-        ],
-        "kpi": [
-            "월 예산 집행액 — 10억 (점진 확대)",
-            "전략브랜드 유지 수 — 10개 (in/out 관리)",
-            "준전략브랜드 운영 수 — 50~70개",
-            "신규 브랜드 계약 전환율 — 킥오프 대비 계약 성사율",
-        ],
-        "reqs": [
-            "화장품·소비재 또는 홍보대행사에서 인플루언서·미디어 마케팅 경력 3년 이상 (팀장급)",
-            "전략 수립뿐 아니라 실제 실행까지 이끄는 리더십과 추진력",
-            "다양한 이해관계자와 유연하게 커뮤니케이션하는 협업 역량",
-            "해외 법인·에이전시와 직접 소통 가능한 영어 커뮤니케이션 능력",
-        ],
-        "pending": False,
-    },
-    {
-        "name": "정다영 매니저", "tag": "플랫폼 · 개발자동화",
-        "objective": "AX 자동화 파이프라인 완성도 및 안정성 고도화",
-        "krs": [
-            "밈조사~컨텐츠검수 전 과정 자동화 가동률 유지",
-            "인니 staff 셀프 정산 시스템 구축 (→ 구정회 알바관리 시스템과 통합 예정)",
-        ],
-        "duties": [
-            "AX 파이프라인(밈조사→가이드생성→탐색→추출→시딩리스트제공→컨텐츠검수) 유지·고도화",
-            "자동화 도구/스크립트 개발 및 운영, 구정회(시스템개발)와 협업",
-            "인도네시아 staff/알바 인력의 '일한 만큼 자동 정산'되는 시스템 설계 총괄",
-            "데이터 기반 성과 지표 설계 및 실무(선재와 분담) 처리",
-        ],
-        "kpi": [
-            "자동화 파이프라인 가동률 — 전 과정 자동화 유지",
-            "브랜드 확장 대비 처리량 — 시딩리스트 처리 속도 유지",
-            "정산 자동화 시스템 구축 — 인니 staff 셀프 정산 시스템 런칭",
-            "KPI 재투자 활용도 — 성과 데이터의 다음 자동화·구조개선 반영 비율",
-        ],
-        "reqs": [
-            "실행부터 관리·설계까지 직접 해본 제로투원 경험",
-            "자동화/데이터 파이프라인 구축 경험",
-            "개발 리소스 배분 및 구정회와의 협업 경험",
-        ],
-        "pending": False,
-    },
-    {
-        "name": "구정회", "tag": "시스템 개발 · AI SaaS 툴",
-        "objective": "사내 AI SaaS 툴 스위트 개발로 전체 운영 자동화 인프라 구축 (정다영과 기획·오너십 공동)",
-        "krs": [
-            "OWM 보딩패스(인플루언서 QR 상품수령 인증) MVP 배포",
-            "랭킹보드 시스템 출시",
-            "전체 프로세스 마켓플레이스 구축",
-            "마켓플레이스 연계 알바(현장인력) 관리·정산 시스템 구축",
-            "브랜드 가이드라인 자동생성(밈추출+스크립트 대본 생성+영상분석) 파이프라인 고도화",
-        ],
-        "duties": [
-            "4+α 개발 미션 총괄: 보딩패스 / 랭킹보드 / 마켓플레이스 / 알바관리시스템 / 가이드라인 자동생성",
-            "정다영 매니저가 기획·오너십을 갖는 AX 파이프라인(밈조사→가이드생성→추출)의 개발 실행 담당",
-            "'인니 staff 셀프 정산 시스템(정다영 KR)'과 '알바관리 시스템'은 동일 대상 — 통합 설계로 진행",
-        ],
-        "kpi": [
-            "보딩패스 MVP 배포 여부 및 실사용 전환율",
-            "랭킹보드 출시 여부",
-            "마켓플레이스 모듈별 구축 진행률",
-            "알바관리 시스템 정산 자동화율",
-            "가이드라인 자동생성 콘텐츠 반영률",
-        ],
-        "reqs": ["채용 완료 — 별도 요건 불필요"],
-        "pending": False,
-    },
-    {
-        "name": "양혜준 리드", "tag": "중국팀",
-        "objective": "중국 시딩 체계 구축 및 자체 채널 성장",
-        "krs": [
-            "브랜드별 시딩전략 수립 및 전채널 시딩 실행",
-            "위챗 CRM 구축 및 전체 대화 가시성 확보",
-            "중국 계정 팔로워 10만 달성",
-            "익스클루시브 인플루언서 리스팅 확보",
-        ],
-        "duties": [
-            "중국 전채널 시딩 전략 수립 (브랜드별 맞춤 시딩 계획과 설득)",
-            "위챗 CRM 초기 구축, LSP 본사 직원과 공동 관리, 전체 대화 가시성 확보(슈퍼바이징)",
-            "본사 SNS 계정 운영 주도, '스타일코리아'형 중국 계정(OWM 1개, 브랜드슬램 1개) 팔로워 10만 목표",
-            "유통사업: 보세창고 내 1차 라이브 테스트 → 인허가 후 정식 라이브, 브랜드슬램은 중간 수수료만 수취",
-            "익스클루시브 인플루언서 리스팅 — 비용 대비 퍼포먼스 좋은 인원을 파격 조건으로 반소속화",
-        ],
-        "kpi": [
-            "계정 팔로워 수 (OWM·브랜드슬램 중국 계정 합산) — 10만",
-            "위챗 CRM 대화 가시성 확보율 — 100%",
-            "익스클루시브 리스팅 인플루언서 수 — 목표 별도 설정",
-            "보세창고 라이브 테스트 → 정식 라이브 전환율",
-        ],
-        "reqs": [
-            "중국 SNS(웨이신/위챗, 도우인, 샤오홍슈 등) 운영 및 왕홍 마케팅 실무 경험",
-            "위챗 미니프로그램·기업위챗 기반 CRM 이해",
-            "라이브커머스/보세창고 유통 구조 이해",
-        ],
-        "pending": False,
-    },
-    {
-        "name": "박솔 이사", "tag": "전략브랜드 킥오프 총괄",
-        "objective": "전략브랜드 킥오프 확산 및 전환율 확보",
-        "krs": [
-            "일 2건, 주 10건 이상 킥오프 진행",
-            "OWM 영업팀 연계 상황판 기반 미팅 확보",
-        ],
-        "duties": [
-            "전략브랜드 마케팅 회의 킥오프 주도적 운영",
-            "전략/비전략 브랜드 포함 매일 2개사, 주 10개 이상 화상미팅으로 킥오프 진행",
-            "OWM 영업팀과 협의해 '상황판'(브랜드슬램 주도 개발) 구축, 상황판 기반 미팅을 직접 확보",
-            "킥오프 이후 나머지 실무(계약 세부화, 실행 관리)는 다영·선재에게 이관",
-        ],
-        "kpi": [
-            "킥오프 진행 건수 — 일 2건 / 주 10건 이상",
-            "상황판 기반 미팅 확보율 — OWM 영업팀 연계 미팅 성사 건수",
-            "킥오프 → 예산 확정 전환율",
-        ],
-        "reqs": [
-            "다수 브랜드사 대상 짧은 시간 내 신뢰 형성 및 설득 역량",
-            "OWM 영업팀 등 유관 조직과의 조율·협업 능력",
-            "반복 가능한 킥오프 포맷 설계 및 운영 경험",
-        ],
-        "pending": False,
-    },
-    {
-        "name": "미국 리드", "tag": "채용예정 · 리드급",
-        "objective": "미국 시딩망 구축 및 틱톡샵 판매 기반 마련 · 익스클루시브 리스팅 확보",
-        "krs": ["채용 확정 후 KR 구체화 예정"],
-        "duties": [
-            "미국 시장 시딩망 구축 및 틱톡샵 판매 기반 마련",
-            "지사 없이 원격 운영 (업무용 휴대폰 사전 확보 완료)",
-            "에픽허브(물류사)와 연계한 유통·배송 체계 구축",
-            "익스클루시브 인플루언서 리스팅 — 미국 인플루언서 반소속화",
-        ],
-        "kpi": [
-            "신규 브랜드/시딩 파이프라인 확보 — 선재 조직과 동일 기준으로 비교",
-            "익스클루시브 리스팅 인원 수 — 별도 목표 설정 필요",
-            "틱톡샵 판매 전환 — 초기 셋업 완료 시점 기준",
-        ],
-        "reqs": ["채용 확정 후 JD 기반으로 구체화 예정"],
-        "pending": True,
-    },
-]
+@st.cache_data(ttl=15)
+def load_org():
+    rows = SUPA.table("okr_org").select("*").execute().data
+    return {r["person"]: r for r in rows}
 
-for p in PEOPLE:
+@st.cache_data(ttl=15)
+def load_items():
+    return SUPA.table("okr_items").select("*").order("created_at").execute().data
+
+def refresh():
+    load_org.clear(); load_items.clear(); st.rerun()
+
+ORG = load_org()
+ITEMS = load_items()
+
+# ── 기간/페이스 계산 ──────────────────────────────────────────
+def start_of_week(d): return d - timedelta(days=d.weekday())
+def end_of_week(d): return start_of_week(d) + timedelta(days=6)
+def start_of_month(d): return d.replace(day=1)
+def end_of_month(d):
+    nxt = d.replace(day=28) + timedelta(days=4)
+    return nxt.replace(day=1) - timedelta(days=1)
+def start_of_quarter(d):
+    q = (d.month - 1) // 3
+    return date(d.year, q * 3 + 1, 1)
+def end_of_quarter(d):
+    q = (d.month - 1) // 3
+    if q == 3:
+        return date(d.year, 12, 31)
+    return date(d.year, (q + 1) * 3 + 1, 1) - timedelta(days=1)
+
+def period_for(item, ref=None):
+    ref = ref or date.today()
+    c = item["cadence"]
+    if c == "weekly": return start_of_week(ref), end_of_week(ref)
+    if c == "monthly": return start_of_month(ref), end_of_month(ref)
+    if c == "quarterly": return start_of_quarter(ref), end_of_quarter(ref)
+    d = item.get("once_date")
+    if d:
+        d = date.fromisoformat(d) if isinstance(d, str) else d
+        return d, d
+    return ref, ref
+
+def pace_status(item, today=None):
+    today = today or date.today()
+    target = float(item.get("target_qty") or 0)
+    progress = float(item.get("progress") or 0)
+    if target <= 0:
+        return ("blue", "수치 미확정")
+    start, end = period_for(item, today)
+    total = max(1, (end - start).days + 1)
+    elapsed = min(total, max(0, (today - start).days + 1))
+    expected_ratio = elapsed / total
+    actual_ratio = progress / target
+    if actual_ratio >= 1:
+        return ("ok", "달성")
+    if today > end:
+        return ("late", "기한 초과")
+    if actual_ratio < expected_ratio * 0.8:
+        return ("late", "지연")
+    if actual_ratio < expected_ratio * 0.95:
+        return ("watch", "주의")
+    return ("ok", "정상 진행")
+
+def deadline_label(item, today=None):
+    _, end = period_for(item, today or date.today())
+    return end.strftime("%m/%d")
+
+def progress_pct(item):
+    t = float(item.get("target_qty") or 0)
+    if t <= 0: return 0
+    return max(0, min(100, round(float(item.get("progress") or 0) / t * 100)))
+
+def badge_html(key, label, extra=""):
+    bg, fg = BADGE[key]
+    return (f"<span style='background:{bg};color:{fg};padding:2px 9px;border-radius:20px;"
+            f"font-size:11px;font-weight:700;white-space:nowrap'>{label}</span>{extra}")
+
+def bar_html(pct, key):
+    _, fg = BADGE[key]
+    return (f"<div style='background:#eceef1;border-radius:4px;height:6px;width:90px'>"
+            f"<div style='background:{fg};width:{pct}%;height:100%;border-radius:4px'></div></div>"
+            f"<span style='font-size:11px;color:#888'>{pct}%</span>")
+
+def items_of(person):
+    return [it for it in ITEMS if it["person"] == person]
+
+# ── 담당자 선택 ───────────────────────────────────────────────
+st.subheader("개인별 OKR · KPI 관리")
+sel_col, _ = st.columns([2, 5])
+selected = sel_col.selectbox("담당자", ["전체 보기"] + PEOPLE_ORDER, index=1)
+
+# ── 상위 Objective/KR 고정 헤더 ───────────────────────────────
+def render_org_card(name):
+    org = ORG.get(name, {})
+    krs = org.get("krs") or []
     with st.container(border=True):
-        head_l, head_r = st.columns([5, 1])
-        with head_l:
-            st.markdown(f"#### {p['name']}")
-            st.caption(p["tag"] + ("  ·  🕗 채용예정" if p["pending"] else "  ·  2026 Q3"))
+        pending_tag = "  ·  🕗 채용예정" if org.get("pending") else ""
+        st.caption(f"{name} · {org.get('tag','')}{pending_tag}")
+        st.markdown(f"**Objective** · {org.get('objective') or '_미입력_'}")
+        for i, kr in enumerate(krs, 1):
+            warn = "⚠️" in kr
+            st.markdown(f"{'⚠️ ' if warn else ''}**KR{i}** · {kr}")
+        with st.expander("Objective / KR 수정"):
+            with st.form(f"org_form_{name}"):
+                new_obj = st.text_input("Objective", value=org.get("objective", ""))
+                new_krs_txt = st.text_area("KR (한 줄에 하나씩)", value="\n".join(krs), height=110)
+                if st.form_submit_button("저장"):
+                    krs_list = [x.strip() for x in new_krs_txt.split("\n") if x.strip()]
+                    SUPA.table("okr_org").update(
+                        {"objective": new_obj.strip(), "krs": krs_list, "updated_at": datetime.utcnow().isoformat()}
+                    ).eq("person", name).execute()
+                    st.success("저장했습니다."); refresh()
 
-        st.markdown(f"**Objective** · {p['objective']}")
-        for i, kr in enumerate(p["krs"], 1):
-            st.markdown(f"- **KR{i}** · {kr}")
+if selected != "전체 보기":
+    render_org_card(selected)
+else:
+    gcols = st.columns(2)
+    for i, name in enumerate(PEOPLE_ORDER):
+        with gcols[i % 2]:
+            org = ORG.get(name, {})
+            with st.container(border=True):
+                st.caption(f"{name} · {org.get('tag','')}")
+                st.markdown(f"**Objective** · {org.get('objective') or '_미입력_'}")
+                for j, kr in enumerate(org.get("krs") or [], 1):
+                    st.markdown(f"- KR{j} · {kr}")
 
-        with st.expander("자세히보기"):
-            st.markdown("**담당업무**")
-            for d in p["duties"]:
-                st.markdown(f"- {d}")
-            st.markdown("**KPI**")
-            for k in p["kpi"]:
-                st.markdown(f"- {k}")
-            st.markdown("**자격요건 · 우대사항**")
-            for r in p["reqs"]:
-                st.markdown(f"- {r}")
+# ── 요약 카드 ─────────────────────────────────────────────────
+scoped = items_of(selected) if selected != "전체 보기" else ITEMS
+total = len(scoped)
+late_n = sum(1 for it in scoped if pace_status(it)[0] == "late")
+watch_n = sum(1 for it in scoped if pace_status(it)[0] == "watch")
+confirmed_n = sum(1 for it in scoped if it["confirmed"])
+clarify_n = sum(1 for it in scoped if it["needs_clarification"])
+
+m = st.columns(5)
+m[0].metric("관리 중 업무", f"{total}건")
+m[1].metric("지연", f"{late_n}건", delta="확인 필요" if late_n else None, delta_color="inverse")
+m[2].metric("주의", f"{watch_n}건", delta="확인 필요" if watch_n else None, delta_color="inverse")
+m[3].metric("확정된 목표", f"{confirmed_n}/{total}")
+m[4].metric("설명필요 표시", f"{clarify_n}건")
+
+# ── 탭 ────────────────────────────────────────────────────────
+tab_okr, tab_list, tab_cal, tab_late, tab_week, tab_confirmed = st.tabs(
+    ["OKR표", "리스트로 보기", "캘린더 보기", "미달성 KPI 보기", "이번주 수량체크", "협의된 목표 보기"]
+)
+
+CADENCE_KEYS = ["monthly", "weekly", "quarterly", "once"]
+
+def item_detail_form(it):
+    with st.expander(f"상세보기 · {it['title']}"):
+        with st.form(f"edit_{it['id']}"):
+            e1, e2, e3, e4 = st.columns(4)
+            n_title = e1.text_input("업무명", value=it["title"])
+            n_qty = e2.number_input("목표 수량", value=float(it["target_qty"]), min_value=0.0)
+            n_unit = e3.text_input("단위", value=it["unit"] or "건")
+            n_cadence = e4.selectbox("주기", CADENCE_KEYS,
+                                      index=CADENCE_KEYS.index(it["cadence"]),
+                                      format_func=lambda x: CADENCE_LABEL[x])
+            p1, p2 = st.columns(2)
+            n_progress = p1.number_input("현재 진행", value=float(it["progress"]), min_value=0.0)
+            n_once = None
+            if n_cadence == "once":
+                default_once = date.fromisoformat(it["once_date"]) if it.get("once_date") else date.today()
+                n_once = p2.date_input("마감일(1회성)", value=default_once)
+            n_note = st.text_area("메모 / 상세 설명", value=it.get("note") or "")
+            c1, c2 = st.columns(2)
+            n_confirmed = c1.checkbox("협의된 목표로 확정", value=it["confirmed"])
+            n_clarify = c2.checkbox("💬 설명필요 표시", value=it["needs_clarification"])
+            b1, b2, b3 = st.columns([1, 1, 3])
+            save = b1.form_submit_button("저장", type="primary")
+            delete = b2.form_submit_button("삭제")
+            if save:
+                payload = {
+                    "title": n_title.strip(), "target_qty": n_qty, "unit": n_unit.strip() or "건",
+                    "cadence": n_cadence, "progress": n_progress, "note": n_note,
+                    "confirmed": n_confirmed, "needs_clarification": n_clarify,
+                    "once_date": n_once.isoformat() if n_once else None,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+                if n_confirmed and not it["confirmed"]:
+                    payload["confirmed_at"] = date.today().isoformat()
+                elif not n_confirmed:
+                    payload["confirmed_at"] = None
+                SUPA.table("okr_items").update(payload).eq("id", it["id"]).execute()
+                st.success("저장했습니다."); refresh()
+            if delete:
+                SUPA.table("okr_items").delete().eq("id", it["id"]).execute()
+                st.warning("삭제했습니다."); refresh()
+
+def render_item_row(it, show_person=False):
+    key, label = pace_status(it)
+    pct = progress_pct(it)
+    dl = deadline_label(it)
+    cols = st.columns([0.9, 3.3, 1, 1.4, 1.4, 1, 1.4] if show_person else [3.6, 1, 1.4, 1.4, 1, 1.4])
+    idx = 0
+    if show_person:
+        cols[idx].markdown(f"**{it['person']}**"); idx += 1
+    qty_str = f"{it['progress']}/{it['target_qty']} {it['unit']}" if it["target_qty"] > 0 else "미확정"
+    extra = " · 💬" if it["needs_clarification"] else ""
+    cols[idx].markdown(f"**{it['title']}**  \n<span style='font-size:11px;color:#9ca3af'>{it['category']}{extra}</span>", unsafe_allow_html=True); idx += 1
+    cols[idx].write(CADENCE_LABEL[it["cadence"]]); idx += 1
+    cols[idx].write(qty_str); idx += 1
+    cols[idx].markdown(bar_html(pct, key), unsafe_allow_html=True); idx += 1
+    cols[idx].write(dl); idx += 1
+    conf_badge = " " + badge_html("blue", "확정") if it["confirmed"] else ""
+    cols[idx].markdown(badge_html(key, label) + conf_badge, unsafe_allow_html=True)
+    item_detail_form(it)
+    st.markdown("<hr style='margin:2px 0 10px;border-color:#eee'>", unsafe_allow_html=True)
+
+# ── OKR표 ───────────────────────────────────────────────────
+with tab_okr:
+    people_shown = [selected] if selected != "전체 보기" else PEOPLE_ORDER
+    if selected != "전체 보기":
+        with st.expander("+ 새 업무 추가"):
+            with st.form(f"add_{selected}", clear_on_submit=True):
+                a1, a2, a3, a4 = st.columns(4)
+                t_title = a1.text_input("업무명")
+                t_qty = a2.number_input("수량", min_value=0.0, value=0.0)
+                t_unit = a3.text_input("단위", value="건")
+                t_cadence = a4.selectbox("주기", CADENCE_KEYS, format_func=lambda x: CADENCE_LABEL[x])
+                if st.form_submit_button("추가"):
+                    if t_title.strip():
+                        SUPA.table("okr_items").insert({
+                            "person": selected, "title": t_title.strip(), "target_qty": t_qty,
+                            "unit": t_unit.strip() or "건", "cadence": t_cadence,
+                        }).execute()
+                        st.success("추가했습니다."); refresh()
+                    else:
+                        st.error("업무명을 입력해주세요.")
+    for p in people_shown:
+        p_items = items_of(p)
+        if selected == "전체 보기":
+            st.markdown(f"#### {p} · {ORG.get(p,{}).get('tag','')}")
+        if not p_items:
+            st.caption("아직 등록된 업무가 없습니다." + ("" if selected != "전체 보기" else " (위에서 담당자를 선택해 추가하세요)"))
+            st.write("")
+            continue
+        for it in p_items:
+            render_item_row(it, show_person=False)
+
+# ── 리스트로 보기 ───────────────────────────────────────────
+with tab_list:
+    all_items = items_of(selected) if selected != "전체 보기" else ITEMS
+    if not all_items:
+        st.caption("표시할 항목이 없습니다.")
+    else:
+        all_items_sorted = sorted(all_items, key=lambda x: (pace_status(x)[0] != "late", pace_status(x)[0] != "watch"))
+        rows = []
+        for it in all_items_sorted:
+            key, label = pace_status(it)
+            rows.append({
+                "담당자": it["person"], "업무": it["title"], "카테고리": it["category"],
+                "주기": CADENCE_LABEL[it["cadence"]],
+                "목표": f"{it['target_qty']} {it['unit']}" if it["target_qty"] > 0 else "미확정",
+                "진행": f"{it['progress']} ({progress_pct(it)}%)",
+                "마감": deadline_label(it), "상태": label,
+                "확정": "✅" if it["confirmed"] else "",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+# ── 캘린더 보기 ─────────────────────────────────────────────
+with tab_cal:
+    cal_items = items_of(selected) if selected != "전체 보기" else ITEMS
+    today = date.today()
+    month_offset = st.session_state.get("okr_cal_offset", 0)
+    cnav = st.columns([1, 3, 1])
+    if cnav[0].button("‹ 이전달"):
+        st.session_state["okr_cal_offset"] = month_offset - 1; st.rerun()
+    if cnav[2].button("다음달 ›"):
+        st.session_state["okr_cal_offset"] = month_offset + 1; st.rerun()
+
+    base_month = today.month - 1 + month_offset
+    base_year = today.year + base_month // 12
+    base_month = base_month % 12 + 1
+    base = date(base_year, base_month, 1)
+    cnav[1].markdown(f"<div style='text-align:center;font-weight:800;font-size:16px'>{base.year}년 {base.month}월</div>", unsafe_allow_html=True)
+
+    grid_start = start_of_week(base)
+    grid_end = end_of_week(end_of_month(base))
+
+    # 이 기간에 걸리는 항목별 마감일 계산
+    day_map = {}
+    for it in cal_items:
+        c = it["cadence"]
+        if c == "once":
+            d = it.get("once_date")
+            if d:
+                d = date.fromisoformat(d) if isinstance(d, str) else d
+                if grid_start <= d <= grid_end:
+                    day_map.setdefault(d, []).append(it)
+            continue
+        cursor = grid_start
+        seen = set()
+        while cursor <= grid_end:
+            _, end = period_for(it, cursor)
+            if grid_start <= end <= grid_end and end not in seen:
+                day_map.setdefault(end, []).append(it)
+                seen.add(end)
+            cursor += timedelta(days=7 if c == "weekly" else 30)
+
+    dows = ["월", "화", "수", "목", "금", "토", "일"]
+    html = "<div style='display:grid;grid-template-columns:repeat(7,1fr);gap:6px'>"
+    for dw in dows:
+        html += f"<div style='font-size:11px;color:#9ca3af;text-align:center;font-weight:700'>{dw}</div>"
+    cursor = grid_start
+    while cursor <= grid_end:
+        out = cursor.month != base.month
+        is_today = cursor == today
+        bg = "#f7f7f8" if out else "#fff"
+        border = "1px solid #16181d" if is_today else "1px solid #e7e8ec"
+        chips = ""
+        for it in day_map.get(cursor, [])[:3]:
+            k, _ = pace_status(it)
+            bg2, fg2 = BADGE[k]
+            chips += (f"<div style='background:{bg2};color:{fg2};font-size:10px;padding:2px 5px;"
+                      f"border-radius:4px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>"
+                      f"{it['person']} · {it['title']}</div>")
+        extra = len(day_map.get(cursor, [])) - 3
+        if extra > 0:
+            chips += f"<div style='font-size:10px;color:#9ca3af'>+{extra}건 더</div>"
+        html += (f"<div style='background:{bg};border:{border};border-radius:8px;padding:6px;min-height:74px'>"
+                 f"<div style='font-size:11px;font-weight:700;color:#6b7280'>{cursor.day}</div>{chips}</div>")
+        cursor += timedelta(days=1)
+    html += "</div>"
+    st.markdown(html, unsafe_allow_html=True)
+
+    st.write("")
+    pick = st.date_input("특정 날짜의 마감 항목 보기", value=today)
+    day_items = day_map.get(pick, [])
+    if day_items:
+        st.markdown(f"**{pick.strftime('%Y-%m-%d')} 마감 항목**")
+        for it in day_items:
+            render_item_row(it, show_person=(selected == "전체 보기"))
+    else:
+        st.caption("해당 날짜에 마감되는 항목이 없습니다.")
+
+# ── 미달성 KPI 보기 ─────────────────────────────────────────
+with tab_late:
+    scope_items = items_of(selected) if selected != "전체 보기" else ITEMS
+    risky = [it for it in scope_items if pace_status(it)[0] in ("late", "watch")]
+    if not risky:
+        st.success("🎉 현재 지연·주의 항목이 없습니다.")
+    else:
+        risky.sort(key=lambda x: pace_status(x)[0] != "late")
+        for it in risky:
+            start, end = period_for(it)
+            today = date.today()
+            total = max(1, (end - start).days + 1)
+            elapsed = min(total, max(0, (today - start).days + 1))
+            expected = round(float(it["target_qty"]) * elapsed / total) if it["target_qty"] else 0
+            key, label = pace_status(it)
+            with st.container(border=True):
+                cc = st.columns([3, 2, 1.4])
+                cc[0].markdown(f"**{it['person']} · {it['title']}**  \n<span style='font-size:11px;color:#9ca3af'>{it['category']}</span>", unsafe_allow_html=True)
+                cc[1].write(f"실제 {it['progress']} / 기대치 ≈ {expected} {it['unit']} (목표 {it['target_qty']})")
+                cc[2].markdown(badge_html(key, label), unsafe_allow_html=True)
+                item_detail_form(it)
+
+# ── 이번주 수량체크 ─────────────────────────────────────────
+with tab_week:
+    scope_items = items_of(selected) if selected != "전체 보기" else ITEMS
+    weekly_items = [it for it in scope_items if it["cadence"] == "weekly"]
+    if not weekly_items:
+        st.caption("주간 단위로 관리 중인 업무가 없습니다. OKR표에서 주기를 '주간'으로 등록해보세요.")
+    else:
+        wk_start = start_of_week(date.today())
+        st.caption(f"이번 주 · {wk_start.strftime('%m/%d')} 시작")
+        for it in weekly_items:
+            key, label = pace_status(it)
+            with st.form(f"week_{it['id']}"):
+                wc = st.columns([3, 1.2, 1.4, 1])
+                wc[0].markdown(f"**{it['person']} · {it['title']}**  \n<span style='font-size:11px;color:#9ca3af'>이번 주 목표 {it['target_qty']} {it['unit']}</span>", unsafe_allow_html=True)
+                new_val = wc[1].number_input("진행", value=float(it["progress"]), min_value=0.0, label_visibility="collapsed")
+                wc[2].markdown(bar_html(progress_pct(it), key) + " " + badge_html(key, label), unsafe_allow_html=True)
+                if wc[3].form_submit_button("저장"):
+                    SUPA.table("okr_items").update(
+                        {"progress": new_val, "updated_at": datetime.utcnow().isoformat()}
+                    ).eq("id", it["id"]).execute()
+                    st.success("저장했습니다."); refresh()
+
+# ── 협의된 목표 보기 ─────────────────────────────────────────
+with tab_confirmed:
+    scope_items = items_of(selected) if selected != "전체 보기" else ITEMS
+    confirmed_items = [it for it in scope_items if it["confirmed"]]
+    if not confirmed_items:
+        st.info("아직 '확정'된 목표가 없습니다. 상세보기에서 **협의된 목표로 확정** 체크박스를 켜면 여기 표시됩니다.")
+    else:
+        rows = [{
+            "담당자": it["person"], "업무": it["title"], "주기": CADENCE_LABEL[it["cadence"]],
+            "목표": f"{it['target_qty']} {it['unit']}", "마감": deadline_label(it),
+            "확정일": it.get("confirmed_at") or "-",
+        } for it in confirmed_items]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 st.divider()
-st.caption("브랜드슬램 내부 참고용 · 분기 갱신 시 이전 분기 대비 달성률/YoY 성장률 함께 트래킹 예정")
+st.caption("브랜드슬램 내부 참고용 · Supabase(okr_org / okr_items) 실시간 연동 · 분기 갱신 시 이전 분기 대비 달성률 함께 트래킹 예정")
