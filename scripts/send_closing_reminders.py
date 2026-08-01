@@ -34,7 +34,7 @@ OKR_APP_URL = os.environ.get("OKR_APP_URL", "").strip()
 SUPA = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
-def send_email(to_addr, subject, body_text):
+def send_email(to_addr, subject, body_text, purpose="weekly_closing_reminder"):
     res = requests.post(
         "https://api.resend.com/emails",
         headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
@@ -46,10 +46,15 @@ def send_email(to_addr, subject, body_text):
         },
         timeout=15,
     )
-    if res.status_code >= 300:
+    ok = res.status_code < 300
+    SUPA.table("email_log").insert({
+        "purpose": purpose, "recipient": to_addr, "subject": subject, "body": body_text,
+        "status": "sent" if ok else "failed",
+        "error": None if ok else f"{res.status_code} {res.text}"[:500],
+    }).execute()
+    if not ok:
         print(f"  ⚠️ {to_addr} 발송 실패: {res.status_code} {res.text}")
-        return False
-    return True
+    return ok
 
 
 def main():
