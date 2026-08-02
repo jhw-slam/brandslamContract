@@ -1,7 +1,11 @@
 import os
+import io
+import re
+import json
 from datetime import date, datetime, timedelta
 
 import pandas as pd
+import requests
 import streamlit as st
 from supabase import create_client
 
@@ -30,7 +34,6 @@ ADMIN_EMAIL = "jhw@slam-global.com"
 
 def send_via_resend(to_addr, subject, body_text, purpose="manual"):
     """Resend API로 이메일 발송 + email_log 테이블에 기록. (RESEND_API_KEY 환경변수 필요)"""
-    import requests
     api_key = os.environ.get("RESEND_API_KEY")
     sender = os.environ.get("RESEND_FROM", "브랜드슬램 OKR <onboarding@resend.dev>")
     if not api_key:
@@ -54,6 +57,71 @@ def send_via_resend(to_addr, subject, body_text, purpose="manual"):
     except Exception:
         pass
     return ok, err
+
+
+# ── 리포트 업로드 → LLM 기반 KPI 자동 추출 ────────────────────
+def extract_text_from_upload(uploaded_file):
+    name = uploaded_file.name.lower()
+    data = uploaded_file.read()
+    if name.endswith(".docx"):
+        from docx import Document
+        doc = Document(io.BytesIO(data))
+        parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        for tbl in doc.tables:
+            for row in tbl.rows:
+                parts.append(" | ".join(c.text for c in row.cells))
+        return "\n".join(parts)
+    if name.endswith(".pdf"):
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(data))
+        return "\n".join((page.extract_text() or "") for page in reader.pages)
+    try:
+        return data.decode("utf-8")
+    except Exception:
+        return data.decode("utf-8", errors="ignore")
+
+def _parse_json_array(text):
+    m = re.search(r"\[.*\]", text, re.S)
+    if not m:
+        raise ValueError("응답에서 JSON 배열을 찾지 못했습니다: " + text[:200])
+    return json.loads(m.group(0))
+
+def call_claude_extract(person, raw_text, few_shot):
+    """Anthropic API로 문서에서 정량 KPI 항목을 뽑아 JSON 리스트로 반환.
+    few_shot: 그 사람의 과거 업로드 중 실제로 반영됐던 (원문, 추출결과) 몇 건 — 스타일 일관성을 위한 참고자료."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None, "ANTHROPIC_API_KEY 환경변수가 설정되어 있지 않습니다."
+    system = (
+        "너는 한국 스타트업의 업무계획서/KPI 보고서에서 '수량으로 측정 가능한 목표'만 뽑아내는 도우미다. "
+        "출력은 오직 JSON 배열이어야 하고, 그 외 설명 텍스트는 절대 포함하지 않는다. "
+        "각 항목 형식: {\"category\": 짧은 분류명, \"title\": 업무명(간결하게), "
+        "\"target_qty\": 숫자(문서에 수치가 없으면 0), \"unit\": 단위(건/명/회 등), "
+        "\"cadence\": \"weekly\"|\"monthly\"|\"quarterly\"|\"once\" 중 하나, "
+        "\"note\": 원문에서 이 항목의 근거가 된 문구 한 줄}. "
+        "월 N건처럼 명시된 것은 monthly, 주 N회는 weekly, 분기/누적 목표는 quarterly, "
+        "일회성 프로젝트/마감이 있는 건은 once로 분류해라."
+    )
+    messages = []
+    for ex in (few_shot or [])[:2]:
+        messages.append({"role": "user", "content": f"문서:\n{(ex.get('raw_text') or '')[:800]}"})
+        messages.append({"role": "assistant", "content": json.dumps(ex.get("extracted_json") or [], ensure_ascii=False)})
+    messages.append({"role": "user", "content": f"담당자: {person}\n\n문서 내용:\n{raw_text[:6000]}"})
+    try:
+        res = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-sonnet-4-6", "max_tokens": 2000, "system": system, "messages": messages},
+            timeout=60,
+        )
+        if res.status_code >= 300:
+            return None, f"{res.status_code} {res.text[:300]}"
+        data = res.json()
+        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+        items = _parse_json_array(text)
+        return items, None
+    except Exception as e:
+        return None, str(e)
 
 # ── 촘촘한 시트형 UI (Notion/Linear/엑셀 느낌) ────────────────
 st.markdown("""
@@ -404,8 +472,8 @@ elif overdue_n:
     st.warning(f"⏰ 기간이 끝난 목표 {overdue_n}건이 상사 확인을 기다리고 있어요. '🗓 마감 PT' 탭에서 리포트를 제출해주세요.")
 
 # ── 탭 (탭마다 폼 key가 겹치지 않도록 ctx를 구분해서 넘김) ────
-tab_okr, tab_list, tab_cal, tab_late, tab_week, tab_confirmed, tab_achieved, tab_closing, tab_history = st.tabs(
-    ["OKR표", "리스트로 보기", "캘린더 보기", "미달성 KPI 보기", "이번주 수량체크", "협의된 목표 보기", "🏆 달성한 KPI", "🗓 마감 PT", "📜 지난 기록"]
+tab_okr, tab_list, tab_cal, tab_late, tab_week, tab_confirmed, tab_achieved, tab_closing, tab_history, tab_upload = st.tabs(
+    ["OKR표", "리스트로 보기", "캘린더 보기", "미달성 KPI 보기", "이번주 수량체크", "협의된 목표 보기", "🏆 달성한 KPI", "🗓 마감 PT", "📜 지난 기록", "📥 리포트 업로드"]
 )
 
 def build_payload_with_achievement(it, n_qty, n_progress):
@@ -891,6 +959,97 @@ with tab_history:
             "달성": "✅" if r["achieved"] else "",
         } for r in hist_rows]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+# ── 📥 리포트 업로드 (문서 → Claude가 KPI 후보 추출 → 검토 → 반영) ──
+with tab_upload:
+    st.caption(
+        "직원이 보내온 업무계획서·KPI 리포트 파일(.docx / .pdf / .txt)을 그대로 올리면, "
+        "Claude가 읽고 수량화 가능한 목표를 뽑아 후보로 보여줍니다. "
+        "**바로 반영되지 않고, 검토·수정 후 '반영' 버튼을 눌러야만** OKR표에 들어가요. "
+        "올린 문서와 추출 결과는 전부 저장되고, 다음 분석 때 같은 담당자의 과거 사례를 참고자료로 함께 사용합니다."
+    )
+    up_person = st.selectbox("이 리포트는 누구 것인가요?", PEOPLE_ORDER, key="upload_person")
+    up_file = st.file_uploader("리포트 파일 업로드", type=["docx", "pdf", "txt"], key="upload_file")
+
+    if up_file is not None and st.button("🧠 Claude로 KPI 추출하기"):
+        with st.spinner("문서를 읽고 KPI 후보를 뽑는 중..."):
+            raw_text = extract_text_from_upload(up_file)
+            past = SUPA.table("okr_report_uploads").select("raw_text,extracted_json") \
+                .eq("person", up_person).eq("applied", True) \
+                .order("created_at", desc=True).limit(2).execute().data
+            items, err = call_claude_extract(up_person, raw_text, past)
+            upload_row = SUPA.table("okr_report_uploads").insert({
+                "person": up_person, "filename": up_file.name, "raw_text": raw_text,
+                "extracted_json": items, "admin_email": st.session_state.get("user_email", ""),
+            }).execute().data[0]
+            if err:
+                st.error(f"추출 실패: {err}")
+            else:
+                st.session_state["pending_extract"] = {"upload_id": upload_row["id"], "person": up_person, "items": items}
+                st.success(f"{len(items)}개 KPI 후보를 찾았습니다. 아래에서 검토 후 반영해주세요.")
+
+    pending = st.session_state.get("pending_extract")
+    if pending:
+        st.markdown(f"### 🔎 추출 결과 검토 · {pending['person']}")
+        keep_flags = []
+        edited_items = []
+        for i, item in enumerate(pending["items"]):
+            with st.container(border=True):
+                k1, k2 = st.columns([0.4, 5.6])
+                keep = k1.checkbox("반영", value=True, key=f"keep_{i}")
+                with k2:
+                    c1, c2, c3, c4 = st.columns(4)
+                    e_title = c1.text_input("업무명", value=item.get("title", ""), key=f"et_{i}")
+                    e_qty = c2.number_input("목표 수량", value=float(item.get("target_qty") or 0), key=f"eq_{i}")
+                    e_unit = c3.text_input("단위", value=item.get("unit", "건"), key=f"eu_{i}")
+                    cad_options = ["monthly", "weekly", "quarterly", "once"]
+                    default_cad = item.get("cadence") if item.get("cadence") in cad_options else "monthly"
+                    e_cad = c4.selectbox("주기", cad_options, index=cad_options.index(default_cad),
+                                         format_func=lambda x: CADENCE_LABEL[x], key=f"ec_{i}")
+                    e_cat = st.text_input("카테고리", value=item.get("category", "미분류"), key=f"ecat_{i}")
+                    if item.get("note"):
+                        st.caption(f"📎 근거: {item['note']}")
+            keep_flags.append(keep)
+            edited_items.append({"category": e_cat, "title": e_title, "target_qty": e_qty, "unit": e_unit, "cadence": e_cad})
+
+        bcol1, bcol2 = st.columns([1, 1])
+        if bcol1.button("✅ 체크된 항목을 OKR표에 반영", type="primary"):
+            inserted = 0
+            final_kept_items = []
+            for keep, it in zip(keep_flags, edited_items):
+                if not keep or not it["title"].strip():
+                    continue
+                payload = {"person": pending["person"], **it}
+                if it["cadence"] in ("weekly", "monthly", "quarterly"):
+                    ns, ne = period_bounds(it["cadence"], date.today())
+                    payload["period_start"] = ns.isoformat(); payload["period_end"] = ne.isoformat()
+                SUPA.table("okr_items").insert(payload).execute()
+                final_kept_items.append(it)
+                inserted += 1
+            # 실제로 반영된(=사람이 최종 확정한) 항목으로 덮어써야, 다음번 참고자료가 'AI 원본 추측'이 아니라
+            # '사람이 고친 정답'이 된다 — 이게 있어야 같은 실수가 반복되지 않는다.
+            SUPA.table("okr_report_uploads").update({
+                "applied": True, "extracted_json": final_kept_items,
+            }).eq("id", pending["upload_id"]).execute()
+            st.session_state.pop("pending_extract", None)
+            st.success(f"{inserted}개 항목을 {pending['person']}님의 OKR표에 반영했습니다. (수정하신 내용은 다음 분석 때 참고자료로 쓰입니다)")
+            refresh()
+        if bcol2.button("취소"):
+            st.session_state.pop("pending_extract", None)
+            st.rerun()
+
+    st.divider()
+    st.caption("📚 지난 업로드 이력")
+    hist_up = SUPA.table("okr_report_uploads").select("person,filename,applied,created_at") \
+        .order("created_at", desc=True).limit(30).execute().data
+    if hist_up:
+        st.dataframe(pd.DataFrame([{
+            "담당자": r["person"], "파일명": r["filename"],
+            "반영 여부": "✅ 반영됨" if r["applied"] else "검토만 함",
+            "업로드 시각": r["created_at"],
+        } for r in hist_up]), use_container_width=True, hide_index=True)
+    else:
+        st.caption("아직 업로드 이력이 없습니다.")
 
 st.divider()
 st.caption("브랜드슬램 내부 참고용 · Supabase(okr_org / okr_items) 실시간 연동 · 확정 목표는 관리자만 수정 가능")
