@@ -2,6 +2,7 @@ import os
 import io
 import re
 import json
+import hashlib
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -86,6 +87,33 @@ def _parse_json_array(text):
         raise ValueError("응답에서 JSON 배열을 찾지 못했습니다: " + text[:200])
     return json.loads(m.group(0))
 
+_KPI_UNIT_WORDS = ("건", "명", "회", "%", "억", "만원", "개", "차", "매출", "목표", "수량", "월", "주", "분기", "달성", "이상", "이하")
+
+def filter_numeric_lines(text):
+    """숫자나 KPI스러운 단위 표현이 있는 줄만 남겨서 Claude에 보낼 토큰을 줄인다.
+    (수식어/배경설명 같은 순수 서술문은 KPI 추출에 크게 필요 없는 경우가 많음)"""
+    kept = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if re.search(r"\d", s) or any(w in s for w in _KPI_UNIT_WORDS):
+            kept.append(s)
+    return "\n".join(kept)
+
+def content_hash_of(text):
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+def find_cached_extraction(hash_value):
+    """완전히 같은 문서(hash 동일)를 예전에 이미 분석한 적 있으면 그 결과를 그대로 재사용 —
+    API를 다시 호출하지 않아서 토큰을 아낀다."""
+    if not hash_value:
+        return None
+    rows = SUPA.table("okr_report_uploads").select("extracted_json") \
+        .eq("content_hash", hash_value).eq("applied", True) \
+        .order("created_at", desc=True).limit(1).execute().data
+    return rows[0]["extracted_json"] if rows else None
+
 def call_claude_extract(person, raw_text, few_shot):
     """Anthropic API로 문서에서 정량 KPI 항목을 뽑아 JSON 리스트로 반환.
     few_shot: 그 사람의 과거 업로드 중 실제로 반영됐던 (원문, 추출결과) 몇 건 — 스타일 일관성을 위한 참고자료."""
@@ -104,14 +132,17 @@ def call_claude_extract(person, raw_text, few_shot):
     )
     messages = []
     for ex in (few_shot or [])[:2]:
-        messages.append({"role": "user", "content": f"문서:\n{(ex.get('raw_text') or '')[:800]}"})
+        ex_text = filter_numeric_lines(ex.get("raw_text") or "") or (ex.get("raw_text") or "")[:400]
+        messages.append({"role": "user", "content": f"문서:\n{ex_text[:500]}"})
         messages.append({"role": "assistant", "content": json.dumps(ex.get("extracted_json") or [], ensure_ascii=False)})
-    messages.append({"role": "user", "content": f"담당자: {person}\n\n문서 내용:\n{raw_text[:6000]}"})
+    filtered = filter_numeric_lines(raw_text)
+    send_text = filtered if len(filtered) >= 30 else raw_text[:3000]
+    messages.append({"role": "user", "content": f"담당자: {person}\n\n문서에서 숫자·수량 관련 줄만 추린 내용:\n{send_text[:4000]}"})
     try:
         res = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-6", "max_tokens": 2000, "system": system, "messages": messages},
+            json={"model": "claude-sonnet-5", "max_tokens": 2000, "system": system, "messages": messages},
             timeout=60,
         )
         if res.status_code >= 300:
@@ -280,6 +311,19 @@ def period_bounds(cadence, ref):
     if cadence == "monthly": return start_of_month(ref), end_of_month(ref)
     if cadence == "quarterly": return start_of_quarter(ref), end_of_quarter(ref)
     return ref, ref
+
+def next_period_bounds(cadence, ref):
+    """'다음 기간' 기준점을 하나 앞으로 밀어서 그 기간의 시작/끝을 계산한다."""
+    if cadence == "weekly":
+        ref2 = ref + timedelta(days=7)
+    elif cadence == "monthly":
+        ref2 = date(ref.year + (1 if ref.month == 12 else 0), (ref.month % 12) + 1, 1)
+    elif cadence == "quarterly":
+        q = (ref.month - 1) // 3
+        ref2 = date(ref.year + (1 if q == 3 else 0), 1 if q == 3 else (q + 1) * 3 + 1, 1)
+    else:
+        ref2 = ref
+    return period_bounds(cadence, ref2)
 
 def period_for(item, ref=None):
     ref = ref or date.today()
@@ -969,28 +1013,48 @@ with tab_upload:
         "올린 문서와 추출 결과는 전부 저장되고, 다음 분석 때 같은 담당자의 과거 사례를 참고자료로 함께 사용합니다."
     )
     up_person = st.selectbox("이 리포트는 누구 것인가요?", PEOPLE_ORDER, key="upload_person")
+    up_period_choice = st.radio(
+        "이 리포트는 어느 기간의 목표인가요?",
+        ["이번 기간 (지금 진행 중인 주/달/분기)", "다음 기간 (아직 시작 전)"],
+        horizontal=True, key="upload_period_choice",
+        help="예: 8월 말에 9월 계획서를 올리는 거라면 '다음 기간'을 선택하세요. 잘못 고르면 엉뚱한 기간에 목표가 꽂힙니다.",
+    )
     up_file = st.file_uploader("리포트 파일 업로드", type=["docx", "pdf", "txt"], key="upload_file")
 
     if up_file is not None and st.button("🧠 Claude로 KPI 추출하기"):
         with st.spinner("문서를 읽고 KPI 후보를 뽑는 중..."):
             raw_text = extract_text_from_upload(up_file)
-            past = SUPA.table("okr_report_uploads").select("raw_text,extracted_json") \
-                .eq("person", up_person).eq("applied", True) \
-                .order("created_at", desc=True).limit(2).execute().data
-            items, err = call_claude_extract(up_person, raw_text, past)
+            h = content_hash_of(raw_text)
+            cached = find_cached_extraction(h)
+            if cached is not None:
+                items, err = cached, None
+                st.info("🔁 예전에 완전히 똑같은 문서를 이미 분석한 적이 있어서, API를 다시 부르지 않고 저장된 결과를 그대로 불러왔습니다 (토큰 절약).")
+            elif len(filter_numeric_lines(raw_text)) < 30:
+                items, err = [], None
+                st.warning("이 문서에서 숫자/수량 관련 문장을 거의 찾지 못했어요. API 호출 없이 건너뛰었습니다 — 수치가 명시된 리포트를 올려주세요.")
+            else:
+                items, err = call_claude_extract(up_person, raw_text, SUPA.table("okr_report_uploads").select("raw_text,extracted_json")
+                                                  .eq("person", up_person).eq("applied", True)
+                                                  .order("created_at", desc=True).limit(2).execute().data)
             upload_row = SUPA.table("okr_report_uploads").insert({
                 "person": up_person, "filename": up_file.name, "raw_text": raw_text,
-                "extracted_json": items, "admin_email": st.session_state.get("user_email", ""),
+                "extracted_json": items, "content_hash": h,
+                "admin_email": st.session_state.get("user_email", ""),
             }).execute().data[0]
             if err:
                 st.error(f"추출 실패: {err}")
-            else:
-                st.session_state["pending_extract"] = {"upload_id": upload_row["id"], "person": up_person, "items": items}
+            elif items:
+                st.session_state["pending_extract"] = {
+                    "upload_id": upload_row["id"], "person": up_person, "items": items,
+                    "period_choice": up_period_choice,
+                }
                 st.success(f"{len(items)}개 KPI 후보를 찾았습니다. 아래에서 검토 후 반영해주세요.")
 
     pending = st.session_state.get("pending_extract")
     if pending:
         st.markdown(f"### 🔎 추출 결과 검토 · {pending['person']}")
+        st.caption(f"적용 시점: **{pending.get('period_choice', '이번 기간')}**")
+        existing_lookup = {it["title"].strip().lower(): it for it in items_of(pending["person"])}
         keep_flags = []
         edited_items = []
         for i, item in enumerate(pending["items"]):
@@ -1009,30 +1073,53 @@ with tab_upload:
                     e_cat = st.text_input("카테고리", value=item.get("category", "미분류"), key=f"ecat_{i}")
                     if item.get("note"):
                         st.caption(f"📎 근거: {item['note']}")
+
+                    dup = existing_lookup.get(e_title.strip().lower())
+                    dup_id = None
+                    if dup:
+                        if dup["confirmed"] and not is_admin:
+                            st.warning(f"⚠️ 동일한 이름의 항목이 이미 있고 **확정되어 잠겨 있습니다** (진행 {dup['progress']}/{dup['target_qty']}). "
+                                       "업데이트하려면 관리자로 로그인하거나, 업무명을 다르게 바꿔 새 항목으로 추가하세요.")
+                        else:
+                            update_mode = st.checkbox(
+                                f"⚠️ 이미 같은 이름의 항목이 있어요 (진행 {dup['progress']}/{dup['target_qty']} {dup['unit']}) — "
+                                "새로 만들지 않고 그 항목을 업데이트", value=True, key=f"upd_{i}",
+                            )
+                            dup_id = dup["id"] if update_mode else None
             keep_flags.append(keep)
-            edited_items.append({"category": e_cat, "title": e_title, "target_qty": e_qty, "unit": e_unit, "cadence": e_cad})
+            edited_items.append({"category": e_cat, "title": e_title, "target_qty": e_qty, "unit": e_unit, "cadence": e_cad, "_dup_id": dup_id})
 
         bcol1, bcol2 = st.columns([1, 1])
         if bcol1.button("✅ 체크된 항목을 OKR표에 반영", type="primary"):
-            inserted = 0
+            inserted, updated = 0, 0
             final_kept_items = []
+            use_next_period = str(pending.get("period_choice", "")).startswith("다음")
             for keep, it in zip(keep_flags, edited_items):
                 if not keep or not it["title"].strip():
                     continue
-                payload = {"person": pending["person"], **it}
-                if it["cadence"] in ("weekly", "monthly", "quarterly"):
-                    ns, ne = period_bounds(it["cadence"], date.today())
-                    payload["period_start"] = ns.isoformat(); payload["period_end"] = ne.isoformat()
-                SUPA.table("okr_items").insert(payload).execute()
+                dup_id = it.pop("_dup_id", None)
+                if dup_id:
+                    SUPA.table("okr_items").update({
+                        "category": it["category"], "unit": it["unit"], "cadence": it["cadence"],
+                        "target_qty": it["target_qty"], "updated_at": datetime.utcnow().isoformat(),
+                    }).eq("id", dup_id).execute()
+                    updated += 1
+                else:
+                    payload = {"person": pending["person"], **it}
+                    if it["cadence"] in ("weekly", "monthly", "quarterly"):
+                        ns, ne = (next_period_bounds if use_next_period else period_bounds)(it["cadence"], date.today())
+                        payload["period_start"] = ns.isoformat(); payload["period_end"] = ne.isoformat()
+                    SUPA.table("okr_items").insert(payload).execute()
+                    inserted += 1
                 final_kept_items.append(it)
-                inserted += 1
             # 실제로 반영된(=사람이 최종 확정한) 항목으로 덮어써야, 다음번 참고자료가 'AI 원본 추측'이 아니라
             # '사람이 고친 정답'이 된다 — 이게 있어야 같은 실수가 반복되지 않는다.
             SUPA.table("okr_report_uploads").update({
                 "applied": True, "extracted_json": final_kept_items,
             }).eq("id", pending["upload_id"]).execute()
             st.session_state.pop("pending_extract", None)
-            st.success(f"{inserted}개 항목을 {pending['person']}님의 OKR표에 반영했습니다. (수정하신 내용은 다음 분석 때 참고자료로 쓰입니다)")
+            st.success(f"새로 추가 {inserted}건, 기존 항목 업데이트 {updated}건 — {pending['person']}님의 OKR표에 반영했습니다. "
+                       "(마감돼서 '지난 기록'으로 넘어간 과거 데이터는 이 작업으로 절대 바뀌지 않습니다)")
             refresh()
         if bcol2.button("취소"):
             st.session_state.pop("pending_extract", None)
