@@ -51,6 +51,34 @@ def projects_map():
 def load_events():
     return SUPA.table("cash_events").select("*").order("due_date").execute().data
 
+def load_bank_txns():
+    return SUPA.table("bank_transactions").select("*").order("txn_date").execute().data
+
+def matched_txns_for(event_id, bank_txns):
+    return [t for t in bank_txns if t.get("matched_cash_event_id") == event_id]
+
+def matched_sum_for(event_id, bank_txns):
+    return sum(t["amount"] or 0 for t in matched_txns_for(event_id, bank_txns))
+
+def suggest_txn_candidates(event, bank_txns, limit=15):
+    """시점(예정일)·잔여금액 기준으로 후보 계좌거래를 추천 정렬한다."""
+    try:
+        due = date.fromisoformat((event.get("due_date") or "")[:10])
+    except Exception:
+        due = None
+    remaining = (event["amount"] or 0) - matched_sum_for(event["id"], bank_txns)
+    cands = [t for t in bank_txns if t["direction"] == event["direction"] and not t.get("matched_cash_event_id")]
+
+    def _score(t):
+        try:
+            gap = abs((date.fromisoformat(t["txn_date"]) - due).days) if (due and t.get("txn_date")) else 999
+        except Exception:
+            gap = 999
+        amt_diff = abs((t["amount"] or 0) - remaining)
+        return (gap, amt_diff)
+
+    return sorted(cands, key=_score)[:limit]
+
 # ── 은행 거래내역 파싱 (은행마다 헤더가 달라서 유연하게 컬럼을 찾음) ──
 _COLKEY = {
     "date": ["거래일시", "거래일자", "거래일", "일자", "날짜", "이용일자", "승인일자"],
@@ -112,8 +140,8 @@ def parse_bank_rows(df):
         out.append({"direction": direction, "amount": amount, "due_date": due, "desc": desc})
     return out, None
 
-def dedup_against_existing(rows, existing):
-    seen_existing = {(e["direction"], e.get("amount") or 0, (e.get("due_date") or "")[:10]) for e in existing}
+def dedup_against_existing(rows, existing_bank_txns):
+    seen_existing = {(t["direction"], t.get("amount") or 0, (t.get("txn_date") or "")[:10]) for t in existing_bank_txns}
     seen_batch = set()
     for r in rows:
         key = (r["direction"], r["amount"], r["due_date"] or "")
@@ -241,6 +269,7 @@ projs, plabel = projects_map()
 pstage = {p["id"]: SLAB.get(p.get("stage"), p.get("stage") or "-") for p in projs}
 label2id = {plabel[p["id"]]: p["id"] for p in projs}
 events_all = load_events()
+bank_txns_all = load_bank_txns()
 
 st.title("송금 캘린더")
 
@@ -345,7 +374,7 @@ with act[2].popover("🏦 계좌 거래내역 업로드", use_container_width=Tr
             elif not parsed:
                 st.warning("입금/출금 금액이 있는 행을 찾지 못했습니다.")
             else:
-                parsed = dedup_against_existing(parsed, events_all)
+                parsed = dedup_against_existing(parsed, bank_txns_all)
                 st.caption(f"총 {len(parsed)}건 인식됨")
                 sel = []
                 for i, r in enumerate(parsed):
@@ -364,18 +393,18 @@ with act[2].popover("🏦 계좌 거래내역 업로드", use_container_width=Tr
                     c2.write(f"{r['due_date'] or '날짜불명'} · {tag} · {won(r['amount'])} · {r['desc']}{reason_txt}")
                     sel.append(checked)
                 n_keep = sum(sel)
+                st.caption("등록 후 '리스트' 보기에서 미입금/미지급 항목을 열면 이 거래들을 매칭할 수 있어요.")
                 if st.button(f"✅ 체크된 {n_keep}건 등록", type="primary", disabled=n_keep == 0):
                     rows_to_add = []
                     for keep, r in zip(sel, parsed):
                         if not keep:
                             continue
                         rows_to_add.append({
-                            "project_id": None, "direction": r["direction"], "category": "은행거래",
-                            "title": r["desc"] or None, "amount": r["amount"], "due_date": r["due_date"],
-                            "paid": True, "paid_date": r["due_date"],
+                            "direction": r["direction"], "amount": r["amount"],
+                            "txn_date": r["due_date"], "description": r["desc"] or None,
                         })
-                    SUPA.table("cash_events").insert(rows_to_add).execute()
-                    st.toast(f"{len(rows_to_add)}건 등록됨 ✓"); st.rerun()
+                    SUPA.table("bank_transactions").insert(rows_to_add).execute()
+                    st.toast(f"{len(rows_to_add)}건 등록됨 ✓ — 이제 '리스트'에서 매칭해주세요"); st.rerun()
 
 # ── 기간/상태/프로젝트 필터 적용 ──────────────────────────────
 def _in_period(e):
@@ -485,18 +514,24 @@ if view == "달력":
     st.caption(f"이 달 합계 — 받을 {won(mi)} · 나갈 {won(mo)} · 순 {won(mi - mo)}  ·  초록=받을 / 빨강=나갈 / ✓=완료")
 
 elif view == "리스트":  # 리스트
-    st.caption(f"{period} · {projsel} · {flt} · {len(events)}건 (오른쪽 '수정'으로 편집·완료·삭제)")
-    h = st.columns([1.0, 0.7, 1.9, 1.4, 1.1, 0.7, 1.3, 0.7])
+    st.caption(f"{period} · {projsel} · {flt} · {len(events)}건 (오른쪽 '수정'으로 편집·완료·삭제, '매칭'으로 계좌거래 연결)")
+    h = st.columns([1.0, 0.7, 1.9, 1.4, 1.1, 1.1, 1.3, 0.7])
     for i, t in enumerate(["예정일", "구분", "프로젝트", "항목/제목", "금액", "입금", "세금계산서", ""]):
         h[i].markdown(f"<div style='color:#888;font-size:12px'>{t}</div>", unsafe_allow_html=True)
     for e in sorted(events, key=lambda x: (x.get("due_date") or "")):
-        c = st.columns([1.0, 0.7, 1.9, 1.4, 1.1, 0.7, 1.3, 0.7])
+        received = matched_sum_for(e["id"], bank_txns_all)
+        c = st.columns([1.0, 0.7, 1.9, 1.4, 1.1, 1.1, 1.3, 0.7])
         c[0].write((e.get("due_date") or "-")[:10])
         c[1].write("받을" if e["direction"] == "in" else "나갈")
         c[2].write(plabel.get(e.get("project_id"), "-"))
         c[3].write(f"{e.get('category') or ''} {('· ' + e['title']) if e.get('title') else ''}")
         c[4].write(won(e["amount"]))
-        c[5].write("✅" if e["paid"] else "⏳")
+        if e["paid"]:
+            c[5].write("✅ 완료")
+        elif received > 0:
+            c[5].markdown(f"🟡 {won_short(received)}/{won_short(e['amount'])}")
+        else:
+            c[5].write("⏳")
         # 세금계산서: '받을'만 표시 (매출 발행)
         if e["direction"] != "in":
             c[6].write("—")
@@ -514,6 +549,44 @@ elif view == "리스트":  # 리스트
         if c[7].button("수정", key="ed" + e["id"]):
             st.session_state.edit_target = e; st.rerun()
 
+        if not e["paid"]:
+            with st.expander(f"🔗 매칭 — {plabel.get(e.get('project_id'),'(프로젝트없음)')} · 잔여 {won(e['amount'] - received)}"):
+                already = matched_txns_for(e["id"], bank_txns_all)
+                if already:
+                    st.caption("이미 매칭된 계좌거래")
+                    for t in already:
+                        mc = st.columns([4, 1])
+                        mc[0].write(f"{t.get('txn_date') or '-'} · {won(t['amount'])} · {t.get('description') or ''}")
+                        if mc[1].button("해제", key="unlk" + t["id"]):
+                            SUPA.table("bank_transactions").update({"matched_cash_event_id": None}).eq("id", t["id"]).execute()
+                            st.rerun()
+                    st.divider()
+                cands = suggest_txn_candidates(e, bank_txns_all)
+                if not cands:
+                    st.caption("매칭 후보가 될 미매칭 계좌거래가 없습니다. 위 '🏦 계좌 거래내역 업로드'로 먼저 올려주세요.")
+                else:
+                    st.caption("예정일에 가깝고 잔여금액과 비슷한 순서로 추천했어요. 여러 건을 함께 체크해 나눠 받은 금액도 합칠 수 있습니다.")
+                    picks = []
+                    running = 0
+                    for j, t in enumerate(cands):
+                        pc = st.columns([0.5, 4.5])
+                        chk = pc[0].checkbox("선택", value=False, key=f"pick_{e['id']}_{j}", label_visibility="collapsed")
+                        pc[1].write(f"{t.get('txn_date') or '날짜불명'} · {won(t['amount'])} · {t.get('description') or ''}")
+                        if chk:
+                            picks.append(t); running += t["amount"] or 0
+                    st.caption(f"선택 합계: {won(running)}  (잔여 {won(e['amount'] - received)} 대비)")
+                    if st.button(f"✅ 선택한 {len(picks)}건 매칭", key="matchbtn" + e["id"], disabled=not picks):
+                        for t in picks:
+                            SUPA.table("bank_transactions").update({"matched_cash_event_id": e["id"]}).eq("id", t["id"]).execute()
+                        new_total = received + running
+                        if new_total >= (e["amount"] or 0):
+                            last_date = max((t.get("txn_date") for t in picks if t.get("txn_date")), default=e.get("due_date"))
+                            SUPA.table("cash_events").update({"paid": True, "paid_date": last_date}).eq("id", e["id"]).execute()
+                            st.toast("매칭 완료 — 목표 금액을 채워 '완료'로 표시됩니다 ✓")
+                        else:
+                            st.toast(f"매칭됨 ✓ (아직 {won(e['amount'] - new_total)} 남음)")
+                        st.rerun()
+
     # 미발행 긴급 요약 (받을 · 7일 이내/경과 · 미발행)
     urgent_list = []
     for e in events:
@@ -527,6 +600,23 @@ elif view == "리스트":  # 리스트
         st.error("🚨 세금계산서 발행 긴급 — 입금 예정 7일 이내인데 미발행: " +
                  ", ".join(f"{plabel.get(e.get('project_id'),'-')} {won(e['amount'])}" for e in urgent_list[:6])
                  + (" 외" if len(urgent_list) > 6 else ""))
+
+    unmatched_txns = [t for t in bank_txns_all if not t.get("matched_cash_event_id")]
+    if unmatched_txns:
+        with st.expander(f"📎 어디에도 매칭 안 된 계좌거래 {len(unmatched_txns)}건 — 예정된 항목이 없던 거래"):
+            st.caption("위 '🔗 매칭'에 연결할 데가 없으면, 여기서 개별로 새 항목을 만들 수 있어요.")
+            for t in sorted(unmatched_txns, key=lambda x: x.get("txn_date") or "", reverse=True):
+                uc = st.columns([4, 1])
+                tag = "받을" if t["direction"] == "in" else "나갈"
+                uc[0].write(f"{t.get('txn_date') or '-'} · {tag} · {won(t['amount'])} · {t.get('description') or ''}")
+                if uc[1].button("새 항목으로", key="mkce" + t["id"]):
+                    new_ce = SUPA.table("cash_events").insert({
+                        "project_id": None, "direction": t["direction"], "category": "은행거래",
+                        "title": t.get("description"), "amount": t["amount"], "due_date": t.get("txn_date"),
+                        "paid": True, "paid_date": t.get("txn_date"),
+                    }).execute().data[0]
+                    SUPA.table("bank_transactions").update({"matched_cash_event_id": new_ce["id"]}).eq("id", t["id"]).execute()
+                    st.toast("새 항목으로 등록됨 ✓"); st.rerun()
 
 elif view == "세금계산서":
     st.caption("홈택스에서 가져온 세금계산서를 '받을' 일정에 정확히 연결합니다. 금액·날짜가 가까운 후보가 위에 오게 정렬돼요.")
