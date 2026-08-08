@@ -90,7 +90,7 @@ _COLKEY = {
 
 def _find_col(columns, keys):
     for col in columns:
-        c = str(col).strip()
+        c = re.sub(r"\s+", "", str(col).strip())
         for k in keys:
             if k in c:
                 return col
@@ -114,6 +114,57 @@ def looks_like_payroll(desc):
     """메모에 사내 직원 이름이 포함되면 급여로 간주해 무조건 제외 (금액 크기와 무관 — 소액 인플루언서 해외송금은 별개)."""
     s = re.sub(r"\s+", "", (desc or ""))
     return any(name in s for name in STAFF_PAYROLL_NAMES)
+
+# 일부 은행 엑셀은 파일 자체에 오타가 있어 openpyxl이 못 읾을 때가 있음
+# (예: SC제일은행 — styles.xml에 applyNumberFormat이 applyNumberForm으로 잘못 저장됨).
+# 통계/서식 정보는 필요 없고 값만 필요하므로, 문제되는 속성명을 고쳐서 재포장한 뒤 읽는다.
+def _fix_xlsx_style_bug(data: bytes) -> bytes:
+    try:
+        import zipfile
+        zin = zipfile.ZipFile(io.BytesIO(data))
+        buf = io.BytesIO()
+        zout = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+        changed = False
+        for item in zin.infolist():
+            content = zin.read(item.filename)
+            if item.filename == "xl/styles.xml" and b"applyNumberForm=" in content:
+                content = content.replace(b"applyNumberForm=", b"applyNumberFormat=")
+                changed = True
+            zout.writestr(item, content)
+        zout.close()
+        return buf.getvalue() if changed else data
+    except Exception:
+        return data
+
+_HEADER_DATE_KW = ("거래일시", "거래일자", "거래일", "일자", "날짜")
+_HEADER_AMT_KW = ("찾으신", "맡기신", "출금", "입금")
+
+def _find_table_header_row(raw_df, max_scan=60):
+    """은행 엑셀은 위에 계좌정보 몇 줄이 더 있는 경우가 많아, 진짜 표 헤더가 몇 번째 줄인지 자동으로 찾는다."""
+    for i in range(min(max_scan, len(raw_df))):
+        cells = [str(x) for x in raw_df.iloc[i].tolist() if str(x) != "nan"]
+        joined = "".join(cells)
+        if any(k in joined for k in _HEADER_DATE_KW) and any(k in joined for k in _HEADER_AMT_KW):
+            return i
+    return None
+
+def read_bank_file(uploaded_file):
+    """csv/xlsx를 읽어, 헤더가 몇 번째 줄에 있든 실제 거래 표를 찾아 DataFrame으로 반환한다."""
+    name = uploaded_file.name.lower()
+    if name.endswith(".xlsx"):
+        data = _fix_xlsx_style_bug(uploaded_file.getvalue())
+        raw = pd.read_excel(io.BytesIO(data), header=None)
+    else:
+        raw = pd.read_csv(io.BytesIO(uploaded_file.getvalue()), encoding="utf-8-sig", header=None)
+    hidx = _find_table_header_row(raw)
+    if hidx is None:
+        # 헤더를 못 찾으면 첫 줄을 헤더로 보고 그냥 시도 (기존 동작과 동일)
+        raw.columns = [str(c).strip() for c in raw.iloc[0].tolist()]
+        return raw.iloc[1:].reset_index(drop=True)
+    header = [str(x).strip() if str(x) != "nan" else f"col_{i}" for i, x in enumerate(raw.iloc[hidx].tolist())]
+    df = raw.iloc[hidx + 1:].copy()
+    df.columns = header
+    return df.dropna(how="all").reset_index(drop=True)
 
 def parse_bank_rows(df):
     """df: 은행에서 그대로 다운받은 표. 컬럼명이 은행마다 달라서 키워드로 유연하게 찾는다."""
@@ -140,11 +191,12 @@ def parse_bank_rows(df):
         out.append({"direction": direction, "amount": amount, "due_date": due, "desc": desc})
     return out, None
 
-def dedup_against_existing(rows, existing_bank_txns):
-    seen_existing = {(t["direction"], t.get("amount") or 0, (t.get("txn_date") or "")[:10]) for t in existing_bank_txns}
+def dedup_against_existing(rows, existing_bank_txns, account_label):
+    seen_existing = {(t.get("account_label") or "", t["direction"], t.get("amount") or 0, (t.get("txn_date") or "")[:10])
+                      for t in existing_bank_txns}
     seen_batch = set()
     for r in rows:
-        key = (r["direction"], r["amount"], r["due_date"] or "")
+        key = (account_label, r["direction"], r["amount"], r["due_date"] or "")
         r["_dup_existing"] = key in seen_existing
         r["_dup_batch"] = key in seen_batch
         seen_batch.add(key)
@@ -359,11 +411,17 @@ with act[2].popover("🏦 계좌 거래내역 업로드", use_container_width=Tr
     st.caption("은행에서 그냥 다운받은 거래내역 파일을 그대로 올리세요. 금액 크기는 필터링하지 않습니다 "
                "(소액 해외 송금도 그대로 들어와요). 사내 정책상 일부 거래와 중복 건은 자동으로 제외 체크됩니다. "
                "프로젝트 연결 없이 '은행거래' 항목으로 일괄 등록됩니다.")
+    existing_accounts = sorted({t.get("account_label") for t in bank_txns_all if t.get("account_label")})
+    acc_opts = existing_accounts + ["+ 새 계좌 이름 직접 입력"]
+    acc_pick = st.selectbox("이 파일은 어느 계좌 것인가요? (계좌별로 구분해야 중복 체크가 정확해요)", acc_opts)
+    account_label = st.text_input("계좌 이름 입력", placeholder="예: 국민은행 법인, 카카오뱅크") \
+        if acc_pick == "+ 새 계좌 이름 직접 입력" else acc_pick
     bank_up = st.file_uploader("계좌 거래내역 (.csv / .xlsx)", type=["csv", "xlsx"], key="bank_up")
-    if bank_up is not None:
+    if bank_up is not None and not account_label.strip():
+        st.warning("계좌 이름을 먼저 입력해주세요.")
+    elif bank_up is not None:
         try:
-            bdf = pd.read_excel(bank_up) if bank_up.name.lower().endswith(".xlsx") \
-                else pd.read_csv(io.BytesIO(bank_up.getvalue()), encoding="utf-8-sig")
+            bdf = read_bank_file(bank_up)
             bdf.columns = [str(c).strip() for c in bdf.columns]
         except Exception as ex:
             st.error(f"파일을 읽지 못했습니다: {ex}"); bdf = None
@@ -374,8 +432,8 @@ with act[2].popover("🏦 계좌 거래내역 업로드", use_container_width=Tr
             elif not parsed:
                 st.warning("입금/출금 금액이 있는 행을 찾지 못했습니다.")
             else:
-                parsed = dedup_against_existing(parsed, bank_txns_all)
-                st.caption(f"총 {len(parsed)}건 인식됨")
+                parsed = dedup_against_existing(parsed, bank_txns_all, account_label.strip())
+                st.caption(f"**{account_label.strip()}** · 총 {len(parsed)}건 인식됨")
                 sel = []
                 for i, r in enumerate(parsed):
                     reasons = []
@@ -402,6 +460,7 @@ with act[2].popover("🏦 계좌 거래내역 업로드", use_container_width=Tr
                         rows_to_add.append({
                             "direction": r["direction"], "amount": r["amount"],
                             "txn_date": r["due_date"], "description": r["desc"] or None,
+                            "account_label": account_label.strip(),
                         })
                     SUPA.table("bank_transactions").insert(rows_to_add).execute()
                     st.toast(f"{len(rows_to_add)}건 등록됨 ✓ — 이제 '리스트'에서 매칭해주세요"); st.rerun()
@@ -556,7 +615,7 @@ elif view == "리스트":  # 리스트
                     st.caption("이미 매칭된 계좌거래")
                     for t in already:
                         mc = st.columns([4, 1])
-                        mc[0].write(f"{t.get('txn_date') or '-'} · {won(t['amount'])} · {t.get('description') or ''}")
+                        mc[0].write(f"[{t.get('account_label') or '계좌미표시'}] {t.get('txn_date') or '-'} · {won(t['amount'])} · {t.get('description') or ''}")
                         if mc[1].button("해제", key="unlk" + t["id"]):
                             SUPA.table("bank_transactions").update({"matched_cash_event_id": None}).eq("id", t["id"]).execute()
                             st.rerun()
@@ -571,7 +630,7 @@ elif view == "리스트":  # 리스트
                     for j, t in enumerate(cands):
                         pc = st.columns([0.5, 4.5])
                         chk = pc[0].checkbox("선택", value=False, key=f"pick_{e['id']}_{j}", label_visibility="collapsed")
-                        pc[1].write(f"{t.get('txn_date') or '날짜불명'} · {won(t['amount'])} · {t.get('description') or ''}")
+                        pc[1].write(f"[{t.get('account_label') or '계좌미표시'}] {t.get('txn_date') or '날짜불명'} · {won(t['amount'])} · {t.get('description') or ''}")
                         if chk:
                             picks.append(t); running += t["amount"] or 0
                     st.caption(f"선택 합계: {won(running)}  (잔여 {won(e['amount'] - received)} 대비)")
@@ -608,7 +667,7 @@ elif view == "리스트":  # 리스트
             for t in sorted(unmatched_txns, key=lambda x: x.get("txn_date") or "", reverse=True):
                 uc = st.columns([4, 1])
                 tag = "받을" if t["direction"] == "in" else "나갈"
-                uc[0].write(f"{t.get('txn_date') or '-'} · {tag} · {won(t['amount'])} · {t.get('description') or ''}")
+                uc[0].write(f"[{t.get('account_label') or '계좌미표시'}] {t.get('txn_date') or '-'} · {tag} · {won(t['amount'])} · {t.get('description') or ''}")
                 if uc[1].button("새 항목으로", key="mkce" + t["id"]):
                     new_ce = SUPA.table("cash_events").insert({
                         "project_id": None, "direction": t["direction"], "category": "은행거래",
