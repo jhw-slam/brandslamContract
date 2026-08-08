@@ -266,7 +266,7 @@ elif period == "직접 선택":
         start, end = dr[0], dr[1]
 
 # ── 동작 버튼(팝오버): 일정 추가 · 지출 대량 업로드 · 세금계산서 ─
-act = st.columns([1.1, 1.5, 1.8, 1.8, 2.2])
+act = st.columns([1.1, 1.8, 1.8, 2.2])
 with act[0].popover("➕ 일정 추가", use_container_width=True):
     with st.form("add_ev", clear_on_submit=True):
         popts = {"(프로젝트 없음)": None}
@@ -289,55 +289,7 @@ with act[0].popover("➕ 일정 추가", use_container_width=True):
                 "paid_date": due.isoformat() if paid else None}).execute()
             st.rerun()
 
-with act[1].popover("📥 지출 대량 업로드", use_container_width=True):
-    st.caption("양식을 받아 채운 뒤 업로드하면 한 번에 등록됩니다. 구분을 비우면 '나갈(매입)'.")
-    bpopts = {"(프로젝트 없음)": None}
-    for p in projs:
-        bpopts[plabel[p["id"]]] = p["id"]
-    bpj = st.selectbox("등록할 프로젝트", list(bpopts.keys()), key="bulk_pj")
-    cols_t = ["구분", "항목", "제목", "금액", "예정일", "완료", "메모"]
-    sample = pd.DataFrame([
-        {"구분": "나갈", "항목": "실행사 지급", "제목": "강리즈 군단 1차", "금액": 3000000, "예정일": "2026-07-10", "완료": "N", "메모": ""},
-        {"구분": "나갈", "항목": "기타", "제목": "배송비", "금액": 150000, "예정일": "2026-07-15", "완료": "Y", "메모": "택배"},
-    ], columns=cols_t)
-    st.download_button("⬇️ 양식 내려받기 (CSV)", sample.to_csv(index=False).encode("utf-8-sig"),
-                       file_name="지출_대량등록_양식.csv", mime="text/csv")
-    up = st.file_uploader("채운 양식 (.csv / .xlsx)", type=["csv", "xlsx"])
-    if up is not None:
-        try:
-            df = pd.read_excel(up) if up.name.lower().endswith(".xlsx") else pd.read_csv(io.BytesIO(up.getvalue()), encoding="utf-8-sig")
-        except Exception as ex:
-            st.error(f"파일을 읽지 못했습니다: {ex}"); df = None
-        if df is not None:
-            df.columns = [str(c).strip() for c in df.columns]
-            if not {"항목", "금액"}.issubset(set(df.columns)):
-                st.error("필수 열 누락: 항목, 금액 (양식 헤더를 그대로 사용하세요)")
-            else:
-                rows = []
-                for _, r in df.iterrows():
-                    try:
-                        amt = int(float(str(r.get("금액", 0)).replace(",", "").strip() or 0))
-                        if amt <= 0:
-                            continue
-                        g = str(r.get("구분", "") or "").strip()
-                        due_raw = str(r.get("예정일", "") or "").strip()[:10]
-                        due = pd.to_datetime(due_raw).date().isoformat() if due_raw else None
-                        pv = str(r.get("완료", "") or "").strip().upper() in ("Y", "TRUE", "1", "O", "완료")
-                        rows.append({"project_id": bpopts[bpj],
-                                     "direction": "in" if g.startswith("받을") or g == "매출" else "out",
-                                     "category": str(r.get("항목", "") or "기타").strip(),
-                                     "title": str(r.get("제목", "") or "").strip() or None,
-                                     "amount": amt, "due_date": due, "paid": pv,
-                                     "paid_date": due if pv else None,
-                                     "memo": str(r.get("메모", "") or "").strip() or None})
-                    except Exception:
-                        pass
-                st.caption(f"등록 대상 {len(rows)}건")
-                if rows and st.button(f"✅ {len(rows)}건 등록", type="primary"):
-                    SUPA.table("cash_events").insert(rows).execute()
-                    st.toast(f"{len(rows)}건 등록됨 ✓"); st.rerun()
-
-with act[2].popover("🧾 세금계산서 업로드", use_container_width=True):
+with act[1].popover("🧾 세금계산서 업로드", use_container_width=True):
     st.caption("홈택스 '매출 전자세금계산서 목록' 파일(.xls/.csv)을 그대로 올리세요. "
                "발행분을 '받을' 일정과 금액·날짜로 자동 매칭해 '발행완료'로 표시합니다.")
     tup = st.file_uploader("홈택스 세금계산서 목록 (.xls / .csv)", type=["xls", "csv"], key="tax_up")
@@ -374,10 +326,9 @@ with act[2].popover("🧾 세금계산서 업로드", use_container_width=True):
                     st.success(f"세금계산서 {len(payload)}건 저장 · 취소 짝 {cp}쌍 정리 · '받을' 일정 {n}건 자동 발행완료 ✓")
                     st.toast("저장·정리·매칭 완료"); st.rerun()
 
-with act[3].popover("🏦 계좌 거래내역 업로드", use_container_width=True):
+with act[2].popover("🏦 계좌 거래내역 업로드", use_container_width=True):
     st.caption("은행에서 그냥 다운받은 거래내역 파일을 그대로 올리세요. 금액 크기는 필터링하지 않습니다 "
-               "(소액 해외 인플루언서 송금도 그대로 들어와요). "
-               f"**{'·'.join(STAFF_PAYROLL_NAMES)} 이름이 적힌 급여성 거래**와 **이미 등록된 중복**만 자동으로 제외 체크됩니다. "
+               "(소액 해외 송금도 그대로 들어와요). 사내 정책상 일부 거래와 중복 건은 자동으로 제외 체크됩니다. "
                "프로젝트 연결 없이 '은행거래' 항목으로 일괄 등록됩니다.")
     bank_up = st.file_uploader("계좌 거래내역 (.csv / .xlsx)", type=["csv", "xlsx"], key="bank_up")
     if bank_up is not None:
@@ -400,7 +351,7 @@ with act[3].popover("🏦 계좌 거래내역 업로드", use_container_width=Tr
                 for i, r in enumerate(parsed):
                     reasons = []
                     if looks_like_payroll(r["desc"]):
-                        reasons.append("직원 급여로 추정 — 절대 가져오지 않음")
+                        reasons.append("제외 대상")
                     if r["_dup_existing"]:
                         reasons.append("이미 등록된 것과 중복")
                     if r["_dup_batch"]:
@@ -409,7 +360,7 @@ with act[3].popover("🏦 계좌 거래내역 업로드", use_container_width=Tr
                     c1, c2 = st.columns([0.5, 5.5])
                     checked = c1.checkbox("포함", value=default_check, key=f"bankrow_{i}", label_visibility="collapsed")
                     tag = "받을" if r["direction"] == "in" else "나갈"
-                    reason_txt = f" — ⚠️ {' · '.join(reasons)}" if reasons else ""
+                    reason_txt = f" — {' · '.join(reasons)}" if reasons else ""
                     c2.write(f"{r['due_date'] or '날짜불명'} · {tag} · {won(r['amount'])} · {r['desc']}{reason_txt}")
                     sel.append(checked)
                 n_keep = sum(sel)
