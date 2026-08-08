@@ -3,6 +3,8 @@ import io
 import re
 import json
 import hashlib
+import uuid
+import mimetypes
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -32,6 +34,58 @@ def sb():
 SUPA = sb()
 
 ADMIN_EMAIL = "jhw@slam-global.com"
+
+ATTACH_BUCKET = "okr-attachments"
+
+def upload_photo(file, person):
+    """이미지를 Supabase Storage에 올리고 공개 URL을 반환한다."""
+    ext = (file.name.rsplit(".", 1)[-1] if "." in file.name else "jpg").lower()
+    path = f"{person}/{uuid.uuid4().hex}.{ext}"
+    data = file.read()
+    content_type = mimetypes.guess_type(file.name)[0] or "application/octet-stream"
+    SUPA.storage.from_(ATTACH_BUCKET).upload(path, data, {"content-type": content_type})
+    return SUPA.storage.from_(ATTACH_BUCKET).get_public_url(path)
+
+def render_attachments_editor(item, key_prefix):
+    """업무 항목 하나에 링크/사진을 추가하고, 이미 첨부된 것들을 보여주는 위젯."""
+    atts = item.get("attachments") or []
+    if atts:
+        for idx, a in enumerate(atts):
+            with st.container(border=True):
+                ac1, ac2 = st.columns([5, 1])
+                if a.get("type") == "photo":
+                    ac1.image(a["url"], width=180)
+                    ac1.caption(a.get("label") or "완료 스크린샷")
+                else:
+                    ac1.markdown(f"🔗 [{a.get('label') or a['url']}]({a['url']})")
+                if ac2.button("삭제", key=f"delatt_{key_prefix}_{idx}"):
+                    new_atts = [x for j, x in enumerate(atts) if j != idx]
+                    SUPA.table("okr_items").update({"attachments": new_atts}).eq("id", item["id"]).execute()
+                    refresh()
+    with st.form(f"add_attach_{key_prefix}", clear_on_submit=True):
+        st.caption("🔗 링크 또는 📷 완료 화면 캡처 추가")
+        a1, a2 = st.columns(2)
+        link_url = a1.text_input("링크 URL (선택)")
+        link_label = a2.text_input("링크 설명 (선택)")
+        photo_file = st.file_uploader("사진 첨부 (선택)", type=["png", "jpg", "jpeg", "webp"], key=f"photofile_{key_prefix}")
+        if st.form_submit_button("➕ 첨부 추가"):
+            new_atts = list(atts)
+            added = False
+            if link_url.strip():
+                new_atts.append({"type": "link", "url": link_url.strip(), "label": link_label.strip(), "added_at": datetime.utcnow().isoformat()})
+                added = True
+            if photo_file is not None:
+                try:
+                    url = upload_photo(photo_file, item["person"])
+                    new_atts.append({"type": "photo", "url": url, "label": photo_file.name, "added_at": datetime.utcnow().isoformat()})
+                    added = True
+                except Exception as e:
+                    st.error(f"사진 업로드 실패: {e}")
+            if added:
+                SUPA.table("okr_items").update({"attachments": new_atts}).eq("id", item["id"]).execute()
+                st.success("첨부를 추가했습니다."); refresh()
+            else:
+                st.warning("링크나 사진을 하나 이상 입력해주세요.")
 
 def send_via_resend(to_addr, subject, body_text, purpose="manual"):
     """Resend API로 이메일 발송 + email_log 테이블에 기록. (RESEND_API_KEY 환경변수 필요)"""
@@ -87,17 +141,23 @@ def _parse_json_array(text):
         raise ValueError("응답에서 JSON 배열을 찾지 못했습니다: " + text[:200])
     return json.loads(m.group(0))
 
-_KPI_UNIT_WORDS = ("건", "명", "회", "%", "억", "만원", "개", "차", "매출", "목표", "수량", "월", "주", "분기", "달성", "이상", "이하")
+_KPI_UNIT_WORDS = ("건", "명", "회", "%", "억", "만원", "개", "차", "매출", "목표", "수량", "월", "주", "분기",
+                    "달성", "이상", "이하", "협업", "진행", "구축", "확보", "운영", "관리", "리스트", "제공")
+_BULLET_MARKERS = re.compile(r"^\s*([\*\-•▪◦]|\d+[\)\.]|\(?\d+\)|[①②③④⑤⑥⑦⑧⑨])")
 
 def filter_numeric_lines(text):
-    """숫자나 KPI스러운 단위 표현이 있는 줄만 남겨서 Claude에 보낼 토큰을 줄인다.
-    (수식어/배경설명 같은 순수 서술문은 KPI 추출에 크게 필요 없는 경우가 많음)"""
+    """토큰을 줄이되 '누락'이 훨씬 더 큰 문제이므로 회수율(recall)을 우선한다.
+    숫자/단위 표현이 있는 줄, 목록·번호 형태의 줄, 짧은 줄(제목/헤더일 가능성)은 전부 남기고,
+    확실히 긴 순수 서술형 문단(80자 이상이면서 위 어떤 조건도 안 걸리는 줄)만 잘라낸다."""
     kept = []
     for line in text.splitlines():
         s = line.strip()
         if not s:
             continue
-        if re.search(r"\d", s) or any(w in s for w in _KPI_UNIT_WORDS):
+        has_digit_or_unit = bool(re.search(r"\d", s)) or any(w in s for w in _KPI_UNIT_WORDS)
+        looks_like_list_item = bool(_BULLET_MARKERS.match(s))
+        is_short = len(s) <= 80
+        if has_digit_or_unit or looks_like_list_item or is_short:
             kept.append(s)
     return "\n".join(kept)
 
@@ -121,10 +181,14 @@ def call_claude_extract(person, raw_text, few_shot):
     if not api_key:
         return None, "ANTHROPIC_API_KEY 환경변수가 설정되어 있지 않습니다."
     system = (
-        "너는 한국 스타트업의 업무계획서/KPI 보고서에서 '수량으로 측정 가능한 목표'만 뽑아내는 도우미다. "
+        "너는 한국 스타트업의 업무계획서/KPI 보고서에서 '측정 가능한 목표'를 최대한 빠짐없이 뽑아내는 도우미다. "
+        "가장 중요한 원칙: **놓치는 것이 훨씬 나쁘다.** 확신이 안 서도 일단 후보로 포함시켜라 — "
+        "사람이 나중에 검토 화면에서 체크 해제하면 되니, 너는 과감하게 넓게 뽑아라. "
+        "숫자가 명시되지 않은 목표(예: '~와 협업 진행', 'DB 구축')도 target_qty를 0으로 넣어 반드시 포함해라. "
+        "글머리 기호(*, -, 1), 숫자.)로 시작하는 줄, 소제목처럼 보이는 짧은 줄들도 놓치지 말고 전부 검토해라. "
         "출력은 오직 JSON 배열이어야 하고, 그 외 설명 텍스트는 절대 포함하지 않는다. "
         "각 항목 형식: {\"category\": 짧은 분류명, \"title\": 업무명(간결하게), "
-        "\"target_qty\": 숫자(문서에 수치가 없으면 0), \"unit\": 단위(건/명/회 등), "
+        "\"target_qty\": 숫자(문서에 수치가 없으면 0), \"unit\": 단위(건/명/회 등, 수치 없으면 \"건\"), "
         "\"cadence\": \"weekly\"|\"monthly\"|\"quarterly\"|\"once\" 중 하나, "
         "\"note\": 원문에서 이 항목의 근거가 된 문구 한 줄}. "
         "월 N건처럼 명시된 것은 monthly, 주 N회는 weekly, 분기/누적 목표는 quarterly, "
@@ -132,17 +196,17 @@ def call_claude_extract(person, raw_text, few_shot):
     )
     messages = []
     for ex in (few_shot or [])[:2]:
-        ex_text = filter_numeric_lines(ex.get("raw_text") or "") or (ex.get("raw_text") or "")[:400]
-        messages.append({"role": "user", "content": f"문서:\n{ex_text[:500]}"})
+        ex_text = filter_numeric_lines(ex.get("raw_text") or "") or (ex.get("raw_text") or "")[:600]
+        messages.append({"role": "user", "content": f"문서:\n{ex_text[:800]}"})
         messages.append({"role": "assistant", "content": json.dumps(ex.get("extracted_json") or [], ensure_ascii=False)})
     filtered = filter_numeric_lines(raw_text)
-    send_text = filtered if len(filtered) >= 30 else raw_text[:3000]
-    messages.append({"role": "user", "content": f"담당자: {person}\n\n문서에서 숫자·수량 관련 줄만 추린 내용:\n{send_text[:4000]}"})
+    send_text = filtered if len(filtered) >= 30 else raw_text[:6000]
+    messages.append({"role": "user", "content": f"담당자: {person}\n\n문서 내용 (목표와 무관해 보이는 순수 서술 문단만 일부 제거됨, 나머지는 원문 그대로):\n{send_text[:8000]}"})
     try:
         res = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-5", "max_tokens": 2000, "system": system, "messages": messages},
+            json={"model": "claude-sonnet-5", "max_tokens": 4000, "system": system, "messages": messages},
             timeout=60,
         )
         if res.status_code >= 300:
@@ -516,8 +580,8 @@ elif overdue_n:
     st.warning(f"⏰ 기간이 끝난 목표 {overdue_n}건이 상사 확인을 기다리고 있어요. '🗓 마감 PT' 탭에서 리포트를 제출해주세요.")
 
 # ── 탭 (탭마다 폼 key가 겹치지 않도록 ctx를 구분해서 넘김) ────
-tab_okr, tab_list, tab_cal, tab_late, tab_week, tab_confirmed, tab_achieved, tab_closing, tab_history, tab_upload = st.tabs(
-    ["OKR표", "리스트로 보기", "캘린더 보기", "미달성 KPI 보기", "이번주 수량체크", "협의된 목표 보기", "🏆 달성한 KPI", "🗓 마감 PT", "📜 지난 기록", "📥 리포트 업로드"]
+tab_okr, tab_list, tab_cal, tab_late, tab_week, tab_confirmed, tab_achieved, tab_closing, tab_history, tab_upload, tab_gallery = st.tabs(
+    ["OKR표", "리스트로 보기", "캘린더 보기", "미달성 KPI 보기", "이번주 수량체크", "협의된 목표 보기", "🏆 달성한 KPI", "🗓 마감 PT", "📜 지난 기록", "📥 리포트 업로드", "🖼 첨부 모아보기"]
 )
 
 def build_payload_with_achievement(it, n_qty, n_progress):
@@ -541,6 +605,14 @@ def item_detail_form(it, ctx):
             st.write(f"목표 {it['target_qty']} {it['unit']} · 진행 {it['progress']} · 마감 {deadline_label(it)}")
             if it.get("note"):
                 st.caption(it["note"])
+            atts = it.get("attachments") or []
+            if atts:
+                st.markdown("**📎 첨부 (보기 전용 — 확정된 목표라 추가/삭제 불가)**")
+                for a in atts:
+                    if a.get("type") == "photo":
+                        st.image(a["url"], width=180, caption=a.get("label"))
+                    else:
+                        st.markdown(f"🔗 [{a.get('label') or a['url']}]({a['url']})")
             return
 
         if recurring and it.get("period_start") and it.get("period_end"):
@@ -630,6 +702,9 @@ def item_detail_form(it, ctx):
                 SUPA.table("okr_items").delete().eq("id", it["id"]).execute()
                 st.warning("삭제했습니다."); refresh()
 
+        st.markdown("**📎 링크 · 완료 스크린샷**")
+        render_attachments_editor(it, key_prefix=f"{ctx}_{it['id']}")
+
 GRID_WITH_PERSON = "0.7fr 3.1fr 0.8fr 1.1fr 1.3fr 0.7fr 1.2fr"
 GRID_NO_PERSON = "3.6fr 0.8fr 1.1fr 1.3fr 0.7fr 1.2fr"
 
@@ -676,11 +751,25 @@ with tab_okr:
                 t_qty = a2.number_input("수량", min_value=0.0, value=0.0)
                 t_unit = a3.text_input("단위", value="건")
                 t_cadence = a4.selectbox("주기", CADENCE_KEYS, format_func=lambda x: CADENCE_LABEL[x])
+                st.caption("🔗 링크·📷 사진은 선택사항이에요 (나중에 상세보기에서도 계속 추가할 수 있습니다)")
+                l1, l2 = st.columns(2)
+                t_link = l1.text_input("링크 URL (선택)")
+                t_link_label = l2.text_input("링크 설명 (선택)")
+                t_photo = st.file_uploader("사진 첨부 (선택)", type=["png", "jpg", "jpeg", "webp"], key="new_item_photo")
                 if st.form_submit_button("추가"):
                     if t_title.strip():
+                        attachments = []
+                        if t_link.strip():
+                            attachments.append({"type": "link", "url": t_link.strip(), "label": t_link_label.strip(), "added_at": datetime.utcnow().isoformat()})
+                        if t_photo is not None:
+                            try:
+                                url = upload_photo(t_photo, selected)
+                                attachments.append({"type": "photo", "url": url, "label": t_photo.name, "added_at": datetime.utcnow().isoformat()})
+                            except Exception as e:
+                                st.error(f"사진 업로드 실패: {e}")
                         payload = {
                             "person": selected, "title": t_title.strip(), "target_qty": t_qty,
-                            "unit": t_unit.strip() or "건", "cadence": t_cadence,
+                            "unit": t_unit.strip() or "건", "cadence": t_cadence, "attachments": attachments,
                         }
                         if t_cadence in ("weekly", "monthly", "quarterly"):
                             ns, ne = period_bounds(t_cadence, date.today())
@@ -1020,12 +1109,13 @@ with tab_upload:
         help="예: 8월 말에 9월 계획서를 올리는 거라면 '다음 기간'을 선택하세요. 잘못 고르면 엉뚱한 기간에 목표가 꽂힙니다.",
     )
     up_file = st.file_uploader("리포트 파일 업로드", type=["docx", "pdf", "txt"], key="upload_file")
+    force_reanalyze = st.checkbox("캐시 무시하고 다시 분석 (같은 파일로 재테스트할 때 체크)", value=False, key="upload_force")
 
     if up_file is not None and st.button("🧠 Claude로 KPI 추출하기"):
         with st.spinner("문서를 읽고 KPI 후보를 뽑는 중..."):
             raw_text = extract_text_from_upload(up_file)
             h = content_hash_of(raw_text)
-            cached = find_cached_extraction(h)
+            cached = None if force_reanalyze else find_cached_extraction(h)
             if cached is not None:
                 items, err = cached, None
                 st.info("🔁 예전에 완전히 똑같은 문서를 이미 분석한 적이 있어서, API를 다시 부르지 않고 저장된 결과를 그대로 불러왔습니다 (토큰 절약).")
@@ -1137,6 +1227,42 @@ with tab_upload:
         } for r in hist_up]), use_container_width=True, hide_index=True)
     else:
         st.caption("아직 업로드 이력이 없습니다.")
+
+# ── 🖼 첨부 모아보기 (모든 링크·사진을 한 곳에서) ──────────────
+with tab_gallery:
+    all_scope = items_of(selected) if selected != "전체 보기" else ITEMS
+    gallery_person = st.selectbox("담당자 필터", ["전체"] + PEOPLE_ORDER,
+                                   index=(0 if selected == "전체 보기" else PEOPLE_ORDER.index(selected) + 1))
+    flat = []
+    for it in ITEMS:
+        if gallery_person != "전체" and it["person"] != gallery_person:
+            continue
+        for a in (it.get("attachments") or []):
+            flat.append({**a, "person": it["person"], "item_title": it["title"]})
+    flat.sort(key=lambda x: x.get("added_at") or "", reverse=True)
+
+    if not flat:
+        st.caption("아직 첨부된 링크·사진이 없습니다. 각 업무의 '상세 · 수정'에서 추가할 수 있어요.")
+    else:
+        gcol1, gcol2 = st.columns(2)
+        photos = [f for f in flat if f.get("type") == "photo"]
+        links = [f for f in flat if f.get("type") != "photo"]
+        gcol1.metric("📷 사진", f"{len(photos)}건")
+        gcol2.metric("🔗 링크", f"{len(links)}건")
+        st.divider()
+
+        if photos:
+            st.markdown("#### 📷 완료 스크린샷")
+            pcols = st.columns(4)
+            for i, p in enumerate(photos):
+                with pcols[i % 4]:
+                    st.image(p["url"], use_container_width=True)
+                    st.caption(f"{p['person']} · {p['item_title']}")
+
+        if links:
+            st.markdown("#### 🔗 링크")
+            for l in links:
+                st.markdown(f"- [{l.get('label') or l['url']}]({l['url']}) — *{l['person']} · {l['item_title']}*")
 
 st.divider()
 st.caption("브랜드슬램 내부 참고용 · Supabase(okr_org / okr_items) 실시간 연동 · 확정 목표는 관리자만 수정 가능")
