@@ -80,12 +80,14 @@ def suggest_txn_candidates(event, bank_txns, limit=15):
     return sorted(cands, key=_score)[:limit]
 
 # ── 은행 거래내역 파싱 (은행마다 헤더가 달라서 유연하게 컬럼을 찾음) ──
+# 급여 지급 대상 — 이 6명 이름이 메모에 포함된 거래는 절대 가져오지 않는다 (인원 변경 시 이 목록만 수정).
+STAFF_PAYROLL_NAMES = ["김선재", "정다영", "양혜준", "구정회", "박솔", "장현우"]
+
 _COLKEY = {
     "date": ["거래일시", "거래일자", "거래일", "일자", "날짜", "이용일자", "승인일자"],
     "deposit": ["입금액", "입금", "맡기신금액", "들어온금액"],
     "withdraw": ["출금액", "출금", "찾으신금액", "나간금액", "이용금액"],
     "desc": ["거래내용", "내용", "적요", "거래구분", "받으신분", "보내신분", "가맹점명", "메모", "비고"],
-    "balance": ["거래후잔액", "잔액"],
 }
 
 def _find_col(columns, keys):
@@ -96,24 +98,16 @@ def _find_col(columns, keys):
                 return col
     return None
 
-def _to_amount(v):
-    if v is None:
-        return 0
-    s = str(v).strip().replace(",", "").replace("₩", "")
-    if s in ("", "-", "nan", "None"):
-        return 0
-    try:
-        return abs(int(float(s)))
-    except Exception:
-        return 0
-
-# 급여 지급 대상 — 이 6명 이름이 메모에 포함된 거래는 절대 가져오지 않는다 (인원 변경 시 이 목록만 수정).
-STAFF_PAYROLL_NAMES = ["김선재", "정다영", "양혜준", "구정회", "박솔", "장현우"]
-
 def looks_like_payroll(desc):
     """메모에 사내 직원 이름이 포함되면 급여로 간주해 무조건 제외 (금액 크기와 무관 — 소액 인플루언서 해외송금은 별개)."""
     s = re.sub(r"\s+", "", (desc or ""))
     return any(name in s for name in STAFF_PAYROLL_NAMES)
+
+def _unescape_x(s):
+    """엑셀이 전각 특수문자(－（） 등)를 _xFF0D_ 같은 이스케이프로 저장해두는 경우가 있어 실제 문자로 되돌린다."""
+    if not isinstance(s, str):
+        return s
+    return re.sub(r"_x([0-9A-Fa-f]{4})_", lambda m: chr(int(m.group(1), 16)), s)
 
 # 일부 은행 엑셀은 파일 자체에 오타가 있어 openpyxl이 못 읾을 때가 있음
 # (예: SC제일은행 — styles.xml에 applyNumberFormat이 applyNumberForm으로 잘못 저장됨).
@@ -148,48 +142,129 @@ def _find_table_header_row(raw_df, max_scan=60):
             return i
     return None
 
-def read_bank_file(uploaded_file):
-    """csv/xlsx를 읽어, 헤더가 몇 번째 줄에 있든 실제 거래 표를 찾아 DataFrame으로 반환한다."""
-    name = uploaded_file.name.lower()
-    if name.endswith(".xlsx"):
-        data = _fix_xlsx_style_bug(uploaded_file.getvalue())
-        raw = pd.read_excel(io.BytesIO(data), header=None)
-    else:
-        raw = pd.read_csv(io.BytesIO(uploaded_file.getvalue()), encoding="utf-8-sig", header=None)
-    hidx = _find_table_header_row(raw)
-    if hidx is None:
-        # 헤더를 못 찾으면 첫 줄을 헤더로 보고 그냥 시도 (기존 동작과 동일)
-        raw.columns = [str(c).strip() for c in raw.iloc[0].tolist()]
-        return raw.iloc[1:].reset_index(drop=True)
-    header = [str(x).strip() if str(x) != "nan" else f"col_{i}" for i, x in enumerate(raw.iloc[hidx].tolist())]
-    df = raw.iloc[hidx + 1:].copy()
-    df.columns = header
-    return df.dropna(how="all").reset_index(drop=True)
+def _date_ok(v):
+    try:
+        return pd.notna(pd.to_datetime(str(v)[:19], errors="coerce"))
+    except Exception:
+        return False
 
-def parse_bank_rows(df):
-    """df: 은행에서 그대로 다운받은 표. 컬럼명이 은행마다 달라서 키워드로 유연하게 찾는다."""
-    cols = list(df.columns)
-    c_date = _find_col(cols, _COLKEY["date"])
-    c_dep = _find_col(cols, _COLKEY["deposit"])
-    c_wd = _find_col(cols, _COLKEY["withdraw"])
-    c_desc = _find_col(cols, _COLKEY["desc"])
-    if not c_date or not (c_dep or c_wd):
-        return None, f"필수 컬럼을 못 찾았습니다 (날짜: {c_date}, 입금: {c_dep}, 출금: {c_wd}). 헤더를 확인해주세요."
+def _date_count(series):
+    return sum(1 for v in series.dropna() if _date_ok(v))
+
+def _numeric_count(series):
+    n = 0
+    for v in series.dropna():
+        try:
+            float(str(v).replace(",", "")); n += 1
+        except Exception:
+            pass
+    return n
+
+def _hangul_total(series):
+    return sum(len(re.findall(r"[가-힣]", str(v))) for v in series.dropna())
+
+def _guess_headerless_columns(raw_df):
+    """헤더 행이 없는 시트(은행이 페이지를 나눠서 첫 페이지만 헤더를 넣는 경우)에서,
+    값의 '개수'(비율이 아니라) 기준으로 날짜/입금/출금/설명 컬럼을 추정한다.
+    비율 기준으로 하면 값이 거의 없는 컬럼이 우연히 100% 매칭돼 잘못 뽑히는 문제가 있어 개수를 쓴다."""
+    cols = list(raw_df.columns)
+    if not cols:
+        return None
+    dcounts = {c: _date_count(raw_df[c]) for c in cols}
+    c_date = max(dcounts, key=dcounts.get)
+    if dcounts[c_date] < 3:
+        return None
+    numeric_cols = [c for c in cols if c != c_date and _numeric_count(raw_df[c]) >= max(3, len(raw_df) // 4)]
+    numeric_cols = sorted(numeric_cols, key=lambda c: cols.index(c))
+    if len(numeric_cols) < 2:
+        return None
+    c_wd, c_dep = numeric_cols[0], numeric_cols[1]
+    text_cols = [c for c in cols if c not in (c_date, c_wd, c_dep)]
+    text_cols_scored = sorted(text_cols, key=lambda c: -_hangul_total(raw_df[c]))
+    c_desc = text_cols_scored[0] if text_cols_scored else None
+    return c_date, c_wd, c_dep, c_desc
+
+def _extract_rows_from_sheet(df, c_date, c_wd, c_dep, c_desc):
     out = []
     for _, r in df.iterrows():
-        dep = _to_amount(r.get(c_dep)) if c_dep else 0
-        wd = _to_amount(r.get(c_wd)) if c_wd else 0
-        if dep == 0 and wd == 0:
-            continue
-        direction, amount = ("in", dep) if dep > wd else ("out", wd)
+        dv = r.get(c_date)
+        if not _date_ok(dv):
+            continue  # 요약/합계/안내문 등 거래가 아닌 줄은 날짜가 없어 자동으로 걸러짐
+        wd = 0.0
+        dep = 0.0
         try:
-            d = pd.to_datetime(str(r.get(c_date))[:10], errors="coerce")
-            due = d.date().isoformat() if pd.notna(d) else None
+            wd = float(str(r.get(c_wd, 0)).replace(",", "")) if c_wd is not None else 0.0
         except Exception:
-            due = None
-        desc = str(r.get(c_desc)).strip() if c_desc else ""
+            pass
+        try:
+            dep = float(str(r.get(c_dep, 0)).replace(",", "")) if c_dep is not None else 0.0
+        except Exception:
+            pass
+        if wd == 0 and dep == 0:
+            continue
+        direction, amount = ("out", int(abs(wd))) if wd > dep else ("in", int(abs(dep)))
+        d = pd.to_datetime(str(dv)[:19], errors="coerce")
+        due = d.date().isoformat() if pd.notna(d) else None
+        desc = _unescape_x(str(r.get(c_desc, "")).strip()) if c_desc is not None else ""
         out.append({"direction": direction, "amount": amount, "due_date": due, "desc": desc})
-    return out, None
+    return out
+
+def read_and_parse_bank_file(uploaded_file):
+    """csv/xlsx를 읽어 거래 목록을 반환한다. xlsx는 시트가 여러 개로 나뉜 경우(은행이 페이지별로
+    별도 시트에 저장하는 경우가 흔함) 전부 순회하며, 각 시트마다 헤더가 있으면 헤더로, 없으면
+    값 패턴으로 컬럼을 추정해 최대한 다 긁어온다."""
+    name = uploaded_file.name.lower()
+    all_rows = []
+    sheet_info = []
+    if name.endswith(".xlsx"):
+        data = _fix_xlsx_style_bug(uploaded_file.getvalue())
+        xls = pd.ExcelFile(io.BytesIO(data))
+        for sheetname in xls.sheet_names:
+            raw = pd.read_excel(xls, sheet_name=sheetname, header=None)
+            hidx = _find_table_header_row(raw)
+            if hidx is not None:
+                header = [str(x).strip() if str(x) != "nan" else f"col_{i}" for i, x in enumerate(raw.iloc[hidx].tolist())]
+                df = raw.iloc[hidx + 1:].copy()
+                df.columns = header
+                c_date = _find_col(df.columns, _COLKEY["date"])
+                c_dep = _find_col(df.columns, _COLKEY["deposit"])
+                c_wd = _find_col(df.columns, _COLKEY["withdraw"])
+                c_desc = _find_col(df.columns, _COLKEY["desc"])
+                if c_date is None or (c_dep is None and c_wd is None):
+                    guess = _guess_headerless_columns(df)
+                    if guess:
+                        c_date, c_wd, c_dep, c_desc = guess
+            else:
+                guess = _guess_headerless_columns(raw)
+                if not guess:
+                    continue
+                c_date, c_wd, c_dep, c_desc = guess
+                df = raw
+            if c_date is None or (c_wd is None and c_dep is None):
+                continue
+            rows = _extract_rows_from_sheet(df, c_date, c_wd, c_dep, c_desc)
+            if rows:
+                all_rows.extend(rows)
+                sheet_info.append(f"{sheetname}({len(rows)}건)")
+    else:
+        raw = pd.read_csv(io.BytesIO(uploaded_file.getvalue()), encoding="utf-8-sig", header=None)
+        hidx = _find_table_header_row(raw)
+        if hidx is not None:
+            header = [str(x).strip() if str(x) != "nan" else f"col_{i}" for i, x in enumerate(raw.iloc[hidx].tolist())]
+            df = raw.iloc[hidx + 1:].copy(); df.columns = header
+        else:
+            df = raw.copy(); df.columns = [str(c).strip() for c in raw.iloc[0].tolist()]; df = df.iloc[1:]
+        c_date = _find_col(df.columns, _COLKEY["date"])
+        c_dep = _find_col(df.columns, _COLKEY["deposit"])
+        c_wd = _find_col(df.columns, _COLKEY["withdraw"])
+        c_desc = _find_col(df.columns, _COLKEY["desc"])
+        if c_date is not None and (c_dep is not None or c_wd is not None):
+            all_rows = _extract_rows_from_sheet(df, c_date, c_wd, c_dep, c_desc)
+            sheet_info = [f"CSV({len(all_rows)}건)"]
+
+    if not all_rows:
+        return None, "거래 데이터를 찾지 못했습니다. 파일 형식을 확인해주세요."
+    return all_rows, " · ".join(sheet_info)
 
 def dedup_against_existing(rows, existing_bank_txns, account_label):
     seen_existing = {(t.get("account_label") or "", t["direction"], t.get("amount") or 0, (t.get("txn_date") or "")[:10])
@@ -421,15 +496,14 @@ with act[2].popover("🏦 계좌 거래내역 업로드", use_container_width=Tr
         st.warning("계좌 이름을 먼저 입력해주세요.")
     elif bank_up is not None:
         try:
-            bdf = read_bank_file(bank_up)
-            bdf.columns = [str(c).strip() for c in bdf.columns]
+            parsed, perr_or_info = read_and_parse_bank_file(bank_up)
         except Exception as ex:
-            st.error(f"파일을 읽지 못했습니다: {ex}"); bdf = None
-        if bdf is not None:
-            parsed, perr = parse_bank_rows(bdf)
-            if perr:
-                st.error(perr)
-            elif not parsed:
+            parsed, perr_or_info = None, f"파일을 읽지 못했습니다: {ex}"
+        if parsed is None:
+            st.error(perr_or_info)
+        else:
+            st.caption(f"시트별 인식 현황: {perr_or_info}")
+            if not parsed:
                 st.warning("입금/출금 금액이 있는 행을 찾지 못했습니다.")
             else:
                 parsed = dedup_against_existing(parsed, bank_txns_all, account_label.strip())
