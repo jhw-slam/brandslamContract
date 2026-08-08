@@ -40,7 +40,7 @@ def won_short(n):
 
 SLAB = {"LEAD": "제안·미팅", "SENT": "계약서 발송", "SIGNED": "서명 완료", "DEPOSIT": "선금 입금",
         "PROGRESS": "캠페인 진행", "BALANCE": "잔금 청구", "SETTLED": "정산 완료"}
-CATS = ["선금", "잔금", "인보이스", "실행사 지급", "기타"]
+CATS = ["선금", "잔금", "인보이스", "실행사 지급", "은행거래", "기타"]
 
 def projects_map():
     projs = SUPA.table("projects").select("id,brand,product,company_id,stage").execute().data
@@ -50,6 +50,77 @@ def projects_map():
 
 def load_events():
     return SUPA.table("cash_events").select("*").order("due_date").execute().data
+
+# ── 은행 거래내역 파싱 (은행마다 헤더가 달라서 유연하게 컬럼을 찾음) ──
+_COLKEY = {
+    "date": ["거래일시", "거래일자", "거래일", "일자", "날짜", "이용일자", "승인일자"],
+    "deposit": ["입금액", "입금", "맡기신금액", "들어온금액"],
+    "withdraw": ["출금액", "출금", "찾으신금액", "나간금액", "이용금액"],
+    "desc": ["거래내용", "내용", "적요", "거래구분", "받으신분", "보내신분", "가맹점명", "메모", "비고"],
+    "balance": ["거래후잔액", "잔액"],
+}
+
+def _find_col(columns, keys):
+    for col in columns:
+        c = str(col).strip()
+        for k in keys:
+            if k in c:
+                return col
+    return None
+
+def _to_amount(v):
+    if v is None:
+        return 0
+    s = str(v).strip().replace(",", "").replace("₩", "")
+    if s in ("", "-", "nan", "None"):
+        return 0
+    try:
+        return abs(int(float(s)))
+    except Exception:
+        return 0
+
+# 급여 지급 대상 — 이 6명 이름이 메모에 포함된 거래는 절대 가져오지 않는다 (인원 변경 시 이 목록만 수정).
+STAFF_PAYROLL_NAMES = ["김선재", "정다영", "양혜준", "구정회", "박솔", "장현우"]
+
+def looks_like_payroll(desc):
+    """메모에 사내 직원 이름이 포함되면 급여로 간주해 무조건 제외 (금액 크기와 무관 — 소액 인플루언서 해외송금은 별개)."""
+    s = re.sub(r"\s+", "", (desc or ""))
+    return any(name in s for name in STAFF_PAYROLL_NAMES)
+
+def parse_bank_rows(df):
+    """df: 은행에서 그대로 다운받은 표. 컬럼명이 은행마다 달라서 키워드로 유연하게 찾는다."""
+    cols = list(df.columns)
+    c_date = _find_col(cols, _COLKEY["date"])
+    c_dep = _find_col(cols, _COLKEY["deposit"])
+    c_wd = _find_col(cols, _COLKEY["withdraw"])
+    c_desc = _find_col(cols, _COLKEY["desc"])
+    if not c_date or not (c_dep or c_wd):
+        return None, f"필수 컬럼을 못 찾았습니다 (날짜: {c_date}, 입금: {c_dep}, 출금: {c_wd}). 헤더를 확인해주세요."
+    out = []
+    for _, r in df.iterrows():
+        dep = _to_amount(r.get(c_dep)) if c_dep else 0
+        wd = _to_amount(r.get(c_wd)) if c_wd else 0
+        if dep == 0 and wd == 0:
+            continue
+        direction, amount = ("in", dep) if dep > wd else ("out", wd)
+        try:
+            d = pd.to_datetime(str(r.get(c_date))[:10], errors="coerce")
+            due = d.date().isoformat() if pd.notna(d) else None
+        except Exception:
+            due = None
+        desc = str(r.get(c_desc)).strip() if c_desc else ""
+        out.append({"direction": direction, "amount": amount, "due_date": due, "desc": desc})
+    return out, None
+
+def dedup_against_existing(rows, existing):
+    seen_existing = {(e["direction"], e.get("amount") or 0, (e.get("due_date") or "")[:10]) for e in existing}
+    seen_batch = set()
+    for r in rows:
+        key = (r["direction"], r["amount"], r["due_date"] or "")
+        r["_dup_existing"] = key in seen_existing
+        r["_dup_batch"] = key in seen_batch
+        seen_batch.add(key)
+    return rows
 
 # ── 홈택스 세금계산서 파싱 (매출 목록 .xls/.csv) ──────────────
 _APPROVAL = re.compile(r"\d{8}-\d{8}-\w+")
@@ -195,7 +266,7 @@ elif period == "직접 선택":
         start, end = dr[0], dr[1]
 
 # ── 동작 버튼(팝오버): 일정 추가 · 지출 대량 업로드 · 세금계산서 ─
-act = st.columns([1.1, 1.5, 1.8, 4])
+act = st.columns([1.1, 1.5, 1.8, 1.8, 2.2])
 with act[0].popover("➕ 일정 추가", use_container_width=True):
     with st.form("add_ev", clear_on_submit=True):
         popts = {"(프로젝트 없음)": None}
@@ -302,6 +373,58 @@ with act[2].popover("🧾 세금계산서 업로드", use_container_width=True):
                     n = auto_match_tax()
                     st.success(f"세금계산서 {len(payload)}건 저장 · 취소 짝 {cp}쌍 정리 · '받을' 일정 {n}건 자동 발행완료 ✓")
                     st.toast("저장·정리·매칭 완료"); st.rerun()
+
+with act[3].popover("🏦 계좌 거래내역 업로드", use_container_width=True):
+    st.caption("은행에서 그냥 다운받은 거래내역 파일을 그대로 올리세요. 금액 크기는 필터링하지 않습니다 "
+               "(소액 해외 인플루언서 송금도 그대로 들어와요). "
+               f"**{'·'.join(STAFF_PAYROLL_NAMES)} 이름이 적힌 급여성 거래**와 **이미 등록된 중복**만 자동으로 제외 체크됩니다. "
+               "프로젝트 연결 없이 '은행거래' 항목으로 일괄 등록됩니다.")
+    bank_up = st.file_uploader("계좌 거래내역 (.csv / .xlsx)", type=["csv", "xlsx"], key="bank_up")
+    if bank_up is not None:
+        try:
+            bdf = pd.read_excel(bank_up) if bank_up.name.lower().endswith(".xlsx") \
+                else pd.read_csv(io.BytesIO(bank_up.getvalue()), encoding="utf-8-sig")
+            bdf.columns = [str(c).strip() for c in bdf.columns]
+        except Exception as ex:
+            st.error(f"파일을 읽지 못했습니다: {ex}"); bdf = None
+        if bdf is not None:
+            parsed, perr = parse_bank_rows(bdf)
+            if perr:
+                st.error(perr)
+            elif not parsed:
+                st.warning("입금/출금 금액이 있는 행을 찾지 못했습니다.")
+            else:
+                parsed = dedup_against_existing(parsed, events_all)
+                st.caption(f"총 {len(parsed)}건 인식됨")
+                sel = []
+                for i, r in enumerate(parsed):
+                    reasons = []
+                    if looks_like_payroll(r["desc"]):
+                        reasons.append("직원 급여로 추정 — 절대 가져오지 않음")
+                    if r["_dup_existing"]:
+                        reasons.append("이미 등록된 것과 중복")
+                    if r["_dup_batch"]:
+                        reasons.append("이 파일 안에서 중복")
+                    default_check = len(reasons) == 0
+                    c1, c2 = st.columns([0.5, 5.5])
+                    checked = c1.checkbox("포함", value=default_check, key=f"bankrow_{i}", label_visibility="collapsed")
+                    tag = "받을" if r["direction"] == "in" else "나갈"
+                    reason_txt = f" — ⚠️ {' · '.join(reasons)}" if reasons else ""
+                    c2.write(f"{r['due_date'] or '날짜불명'} · {tag} · {won(r['amount'])} · {r['desc']}{reason_txt}")
+                    sel.append(checked)
+                n_keep = sum(sel)
+                if st.button(f"✅ 체크된 {n_keep}건 등록", type="primary", disabled=n_keep == 0):
+                    rows_to_add = []
+                    for keep, r in zip(sel, parsed):
+                        if not keep:
+                            continue
+                        rows_to_add.append({
+                            "project_id": None, "direction": r["direction"], "category": "은행거래",
+                            "title": r["desc"] or None, "amount": r["amount"], "due_date": r["due_date"],
+                            "paid": True, "paid_date": r["due_date"],
+                        })
+                    SUPA.table("cash_events").insert(rows_to_add).execute()
+                    st.toast(f"{len(rows_to_add)}건 등록됨 ✓"); st.rerun()
 
 # ── 기간/상태/프로젝트 필터 적용 ──────────────────────────────
 def _in_period(e):
