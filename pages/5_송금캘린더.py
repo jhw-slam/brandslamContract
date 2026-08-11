@@ -3,6 +3,7 @@ import io
 import re
 import calendar
 import hashlib
+import uuid
 from datetime import date, timedelta
 
 import pandas as pd
@@ -79,6 +80,60 @@ def suggest_txn_candidates(event, bank_txns, limit=15):
         return (gap, amt_diff)
 
     return sorted(cands, key=_score)[:limit]
+
+def _split_bank_txn_leftover(txn, leftover_amount):
+    """계좌거래의 남는 부분을 새로운 미매칭 거래로 따로 만든다 (원본 행의 amount는 호출한 쪽에서 이미 줄여둔 상태)."""
+    new_hash = hashlib.md5(f"{txn['id']}-split-{leftover_amount}-{uuid.uuid4().hex}".encode()).hexdigest()
+    leftover_row = SUPA.table("bank_transactions").insert({
+        "direction": txn["direction"], "amount": leftover_amount,
+        "txn_date": txn.get("txn_date"), "txn_datetime": txn.get("txn_datetime"),
+        "description": (txn.get("description") or "") + " (잉여분 자동분리)",
+        "account_label": txn.get("account_label"), "dedup_hash": new_hash,
+    }).execute().data[0]
+    return leftover_row
+
+def apply_match_with_overflow(event, picks, events_all, bank_txns_all, _depth=0):
+    """선택한 계좌거래를 이 항목에 순서대로 채워나간다. 목표금액을 넘기면 그 초과분을 쪼개서
+    같은 프로젝트·같은 방향(받을/나갈)의 다른 미완료 항목이 정확히 1개면 그쪽에 자동으로 이어붙인다
+    (여러 개면 어디로 보낼지 모호하니 사람이 판단하도록 미매칭 상태로 남겨둠)."""
+    remaining = (event["amount"] or 0) - matched_sum_for(event["id"], bank_txns_all)
+    filled_amount = 0
+    overflow_txn = None
+    for t in picks:
+        amt = t["amount"] or 0
+        if remaining <= 0:
+            overflow_txn = t  # 이 항목은 이미 다 찼음 — 이 거래 전체가 잉여
+            break
+        if amt <= remaining:
+            SUPA.table("bank_transactions").update({"matched_cash_event_id": event["id"]}).eq("id", t["id"]).execute()
+            remaining -= amt
+            filled_amount += amt
+        else:
+            SUPA.table("bank_transactions").update(
+                {"amount": remaining, "matched_cash_event_id": event["id"]}
+            ).eq("id", t["id"]).execute()
+            filled_amount += remaining
+            overflow_txn = _split_bank_txn_leftover(t, amt - remaining)
+            remaining = 0
+            break
+
+    total_received = matched_sum_for(event["id"], bank_txns_all) + filled_amount
+    became_paid = False
+    if (event["amount"] or 0) > 0 and total_received >= event["amount"]:
+        SUPA.table("cash_events").update({"paid": True, "paid_date": date.today().isoformat()}).eq("id", event["id"]).execute()
+        became_paid = True
+
+    cascaded_to = None
+    if overflow_txn and _depth < 3:
+        siblings = [ev for ev in events_all
+                    if ev.get("project_id") == event.get("project_id") and ev["id"] != event["id"]
+                    and ev["direction"] == event["direction"] and not ev["paid"]]
+        if len(siblings) == 1:
+            sib = siblings[0]
+            apply_match_with_overflow(sib, [overflow_txn], events_all, bank_txns_all, _depth + 1)
+            cascaded_to = sib
+            overflow_txn = None
+    return became_paid, overflow_txn, cascaded_to
 
 # ── 은행 거래내역 파싱 (은행마다 헤더가 달라서 유연하게 컬럼을 찾음) ──
 # 급여 지급 대상 — 이 6명 이름이 메모에 포함된 거래는 절대 가져오지 않는다 (인원 변경 시 이 목록만 수정).
@@ -733,15 +788,17 @@ elif view == "리스트":  # 리스트
                             picks.append(t); running += t["amount"] or 0
                     st.caption(f"선택 합계: {won(running)}  (잔여 {won(e['amount'] - received)} 대비)")
                     if st.button(f"✅ 선택한 {len(picks)}건 매칭", key="matchbtn" + e["id"], disabled=not picks):
-                        for t in picks:
-                            SUPA.table("bank_transactions").update({"matched_cash_event_id": e["id"]}).eq("id", t["id"]).execute()
-                        new_total = received + running
-                        if new_total >= (e["amount"] or 0):
-                            last_date = max((t.get("txn_date") for t in picks if t.get("txn_date")), default=e.get("due_date"))
-                            SUPA.table("cash_events").update({"paid": True, "paid_date": last_date}).eq("id", e["id"]).execute()
+                        became_paid, leftover_unmatched, cascaded_to = apply_match_with_overflow(e, picks, events_all, bank_txns_all)
+                        if became_paid and cascaded_to:
+                            st.toast(f"매칭 완료 — 목표를 채워 '완료'로 표시. 초과분은 같은 프로젝트의 "
+                                     f"'{cascaded_to.get('category') or ''}' 항목으로 자동 이어붙였습니다 ✓")
+                        elif became_paid:
                             st.toast("매칭 완료 — 목표 금액을 채워 '완료'로 표시됩니다 ✓")
+                        elif leftover_unmatched:
+                            st.toast("매칭됨 ✓ (초과분이 있는데, 같은 프로젝트에 다른 미완료 항목이 없거나 여러 개라 "
+                                     "'미매칭 계좌거래'로 남겨뒀어요 — 직접 확인해주세요)")
                         else:
-                            st.toast(f"매칭됨 ✓ (아직 {won(e['amount'] - new_total)} 남음)")
+                            st.toast("매칭됨 ✓ (아직 목표 금액에 도달하지 않았어요)")
                         st.rerun()
 
     # 미발행 긴급 요약 (받을 · 7일 이내/경과 · 미발행)
