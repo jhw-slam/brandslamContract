@@ -24,6 +24,9 @@ _FONT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
 _FONT_NAME = "NotoSansKR"
 if _FONT_NAME not in pdfmetrics.getRegisteredFontNames() and os.path.exists(_FONT_PATH):
     pdfmetrics.registerFont(TTFont(_FONT_NAME, _FONT_PATH))
+    pdfmetrics.registerFontFamily(
+        _FONT_NAME, normal=_FONT_NAME, bold=_FONT_NAME, italic=_FONT_NAME, boldItalic=_FONT_NAME
+    )
 
 # ── 비밀번호 게이트 ───────────────────────────────────────────
 PW = os.environ.get("APP_PASSWORD")
