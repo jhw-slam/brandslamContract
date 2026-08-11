@@ -2,6 +2,7 @@ import os
 import io
 import re
 import calendar
+import hashlib
 from datetime import date, timedelta
 
 import pandas as pd
@@ -211,7 +212,8 @@ def _extract_rows_from_sheet(df, c_date, c_wd, c_dep, c_desc):
         d = pd.to_datetime(str(dv)[:19], errors="coerce")
         due = d.date().isoformat() if pd.notna(d) else None
         desc = _unescape_x(str(r.get(c_desc, "")).strip()) if c_desc is not None else ""
-        out.append({"direction": direction, "amount": amount, "due_date": due, "desc": desc})
+        raw_dt = str(dv).strip()  # 시:분:초까지 포함된 원본 문자열 그대로 보존 (중복 판정용)
+        out.append({"direction": direction, "amount": amount, "due_date": due, "desc": desc, "raw_dt": raw_dt})
     return out
 
 def read_and_parse_bank_file(uploaded_file):
@@ -271,15 +273,21 @@ def read_and_parse_bank_file(uploaded_file):
         return None, "거래 데이터를 찾지 못했습니다. 파일 형식을 확인해주세요."
     return all_rows, " · ".join(sheet_info)
 
+def compute_dedup_hash(account_label, direction, amount, dt_str, desc):
+    """DB의 dedup_hash UNIQUE 제약과 동일한 규칙 — 계좌·구분·금액·거래시각(초 단위까지)·메모 기준.
+    시:분:초까지 같아야 '같은 거래'로 본다 (같은 날 같은 금액이 여러 번 오가는 것과는 구분됨)."""
+    raw = f"{account_label or ''}|{direction}|{amount}|{dt_str or ''}|{desc or ''}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
 def dedup_against_existing(rows, existing_bank_txns, account_label):
-    seen_existing = {(t.get("account_label") or "", t["direction"], t.get("amount") or 0, (t.get("txn_date") or "")[:10])
-                      for t in existing_bank_txns}
+    seen_existing = {t.get("dedup_hash") for t in existing_bank_txns if t.get("dedup_hash")}
     seen_batch = set()
     for r in rows:
-        key = (account_label, r["direction"], r["amount"], r["due_date"] or "")
-        r["_dup_existing"] = key in seen_existing
-        r["_dup_batch"] = key in seen_batch
-        seen_batch.add(key)
+        h = compute_dedup_hash(account_label, r["direction"], r["amount"], r.get("raw_dt") or r.get("due_date"), r["desc"])
+        r["_hash"] = h
+        r["_dup_existing"] = h in seen_existing
+        r["_dup_batch"] = h in seen_batch
+        seen_batch.add(h)
     return rows
 
 # ── 홈택스 세금계산서 파싱 (매출 목록 .xls/.csv) ──────────────
@@ -538,11 +546,22 @@ with act[2].popover("🏦 계좌 거래내역 업로드", use_container_width=Tr
                             continue
                         rows_to_add.append({
                             "direction": r["direction"], "amount": r["amount"],
-                            "txn_date": r["due_date"], "description": r["desc"] or None,
+                            "txn_date": r["due_date"], "txn_datetime": r.get("raw_dt"),
+                            "description": r["desc"] or None,
                             "account_label": account_label.strip(),
+                            "dedup_hash": r["_hash"],
                         })
-                    SUPA.table("bank_transactions").insert(rows_to_add).execute()
-                    st.toast(f"{len(rows_to_add)}건 등록됨 ✓ — 이제 '리스트'에서 매칭해주세요"); st.rerun()
+                    if rows_to_add:
+                        res = SUPA.table("bank_transactions").upsert(
+                            rows_to_add, on_conflict="dedup_hash", ignore_duplicates=True
+                        ).execute()
+                        actually_added = len(res.data) if res.data is not None else len(rows_to_add)
+                        skipped_dupe = len(rows_to_add) - actually_added
+                        msg = f"{actually_added}건 등록됨 ✓ — 이제 '리스트'에서 매칭해주세요"
+                        if skipped_dupe > 0:
+                            msg += f" (이미 있던 {skipped_dupe}건은 중복이라 자동으로 건너뜀)"
+                        st.toast(msg)
+                    st.rerun()
 
 # ── 기간/상태/프로젝트 필터 적용 ──────────────────────────────
 def _in_period(e):
