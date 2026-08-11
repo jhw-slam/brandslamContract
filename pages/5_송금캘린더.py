@@ -4,13 +4,26 @@ import re
 import calendar
 import hashlib
 import uuid
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 
 import pandas as pd
 import streamlit as st
 from supabase import create_client
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 st.set_page_config(page_title="송금 캘린더", layout="wide")
+
+# ── 잔금요청서 PDF용 한글 폰트 등록 (레포 루트의 fonts/ 폴더) ──────
+_FONT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fonts", "NotoSansKR-Regular.ttf")
+_FONT_NAME = "NotoSansKR"
+if _FONT_NAME not in pdfmetrics.getRegisteredFontNames() and os.path.exists(_FONT_PATH):
+    pdfmetrics.registerFont(TTFont(_FONT_NAME, _FONT_PATH))
 
 # ── 비밀번호 게이트 ───────────────────────────────────────────
 PW = os.environ.get("APP_PASSWORD")
@@ -62,7 +75,84 @@ def matched_txns_for(event_id, bank_txns):
 def matched_sum_for(event_id, bank_txns):
     return sum(t["amount"] or 0 for t in matched_txns_for(event_id, bank_txns))
 
-def suggest_txn_candidates(event, bank_txns, limit=15):
+def generate_balance_request_pdf(project_id, project_label, events_all, bank_txns_all):
+    """프로젝트의 '받을' 항목(선금/잔금 등)만 모아 계약금액·입금액·잔여·세금계산서 상태 현황표를 PDF로 만든다.
+    출금(나갈 돈) 항목은 절대 포함하지 않는다."""
+    receivables = [e for e in events_all if e.get("project_id") == project_id and e["direction"] == "in"]
+    receivables.sort(key=lambda e: e.get("due_date") or "")
+
+    styles = {
+        "title": ParagraphStyle("title", fontName=_FONT_NAME, fontSize=16, leading=20, spaceAfter=4),
+        "meta": ParagraphStyle("meta", fontName=_FONT_NAME, fontSize=9, textColor=colors.grey, spaceAfter=10),
+        "h2": ParagraphStyle("h2", fontName=_FONT_NAME, fontSize=11, leading=14, spaceAfter=6, spaceBefore=10),
+        "cell": ParagraphStyle("cell", fontName=_FONT_NAME, fontSize=8.5, leading=11),
+        "cellR": ParagraphStyle("cellR", fontName=_FONT_NAME, fontSize=8.5, leading=11, alignment=2),
+        "foot": ParagraphStyle("foot", fontName=_FONT_NAME, fontSize=8, textColor=colors.grey, spaceBefore=14),
+    }
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                             leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm, bottomMargin=16 * mm)
+    story = [
+        Paragraph("잔금 요청 현황", styles["title"]),
+        Paragraph(f"{project_label}  ·  생성일 {date.today().isoformat()}", styles["meta"]),
+    ]
+
+    header = ["구분", "제목", "계약금액", "입금액", "잔여", "세금계산서"]
+    rows = [[Paragraph(h, styles["cell"]) for h in header]]
+    total_amount, total_received = 0, 0
+    for e in receivables:
+        received = matched_sum_for(e["id"], bank_txns_all)  # 초과분(과납)도 그대로 보여줌
+        amount = e["amount"] or 0
+        remaining = amount - received
+        total_amount += amount
+        total_received += received
+        tax_status = "발행완료" if e.get("tax_issued") else "미발행"
+        rows.append([
+            Paragraph(e.get("category") or "-", styles["cell"]),
+            Paragraph((e.get("title") or "")[:60], styles["cell"]),
+            Paragraph(f"{amount:,.0f}", styles["cellR"]),
+            Paragraph(f"{received:,.0f}", styles["cellR"]),
+            Paragraph(f"{remaining:,.0f}", styles["cellR"]),
+            Paragraph(tax_status, styles["cell"]),
+        ])
+
+    if not receivables:
+        story.append(Paragraph("이 프로젝트에는 '받을' 항목이 없습니다.", styles["cell"]))
+    else:
+        tbl = Table(rows, colWidths=[18 * mm, 62 * mm, 26 * mm, 26 * mm, 26 * mm, 20 * mm])
+        tbl.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, -1), _FONT_NAME),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f4f5f7")),
+            ("LINEBELOW", (0, 0), (-1, 0), 0.8, colors.HexColor("#333333")),
+            ("LINEBELOW", (0, 1), (-1, -1), 0.4, colors.HexColor("#dddddd")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.append(tbl)
+
+        total_remaining = total_amount - total_received
+        story.append(Spacer(1, 10))
+        summary_rows = [
+            ["총 계약금액", f"{total_amount:,.0f} 원"],
+            ["총 입금액", f"{total_received:,.0f} 원"],
+            ["총 미수금", f"{total_remaining:,.0f} 원"],
+        ]
+        sumtbl = Table([[Paragraph(a, styles["h2"]), Paragraph(b, styles["cellR"])] for a, b in summary_rows],
+                       colWidths=[40 * mm, 40 * mm])
+        sumtbl.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), _FONT_NAME)]))
+        story.append(sumtbl)
+
+    story.append(Paragraph(
+        f"본 문서는 브랜드슬램 내부 시스템에서 {datetime.now().strftime('%Y-%m-%d %H:%M')} 기준으로 자동 생성되었습니다. "
+        "입금액은 계좌 거래내역과 매칭된 금액만 반영되며, 지출(출금) 내역은 포함되지 않습니다.",
+        styles["foot"]
+    ))
+    doc.build(story)
+    return buf.getvalue()
+
+
     """시점(예정일)·잔여금액 기준으로 후보 계좌거래를 추천 정렬한다."""
     try:
         due = date.fromisoformat((event.get("due_date") or "")[:10])
@@ -489,8 +579,8 @@ elif period == "직접 선택":
     if isinstance(dr, (list, tuple)) and len(dr) == 2:
         start, end = dr[0], dr[1]
 
-# ── 동작 버튼(팝오버): 일정 추가 · 지출 대량 업로드 · 세금계산서 ─
-act = st.columns([1.1, 1.8, 1.8, 2.2])
+# ── 동작 버튼(팝오버): 일정 추가 · 세금계산서 · 계좌거래 · 잔금요청서 ─
+act = st.columns([1.1, 1.8, 1.8, 1.6])
 with act[0].popover("➕ 일정 추가", use_container_width=True):
     with st.form("add_ev", clear_on_submit=True):
         popts = {"(프로젝트 없음)": None}
@@ -617,6 +707,22 @@ with act[2].popover("🏦 계좌 거래내역 업로드", use_container_width=Tr
                             msg += f" (이미 있던 {skipped_dupe}건은 중복이라 자동으로 건너뜀)"
                         st.toast(msg)
                     st.rerun()
+
+with act[3]:
+    if projsel not in ("전체 프로젝트", "(프로젝트 없음)"):
+        sel_project_id = label2id.get(projsel)
+        if st.button("📄 잔금요청 PDF", use_container_width=True):
+            pdf_bytes = generate_balance_request_pdf(sel_project_id, projsel, events_all, bank_txns_all)
+            st.session_state["_balance_pdf"] = pdf_bytes
+            st.session_state["_balance_pdf_name"] = f"잔금요청_{projsel.split('·')[0].strip()}_{date.today().isoformat()}.pdf"
+    else:
+        st.caption("프로젝트를 선택하면 잔금요청 PDF를 만들 수 있어요.")
+
+if st.session_state.get("_balance_pdf"):
+    st.download_button(
+        "⬇️ 잔금요청 PDF 다운로드", data=st.session_state["_balance_pdf"],
+        file_name=st.session_state.get("_balance_pdf_name", "잔금요청.pdf"), mime="application/pdf",
+    )
 
 # ── 기간/상태/프로젝트 필터 적용 ──────────────────────────────
 def _in_period(e):
