@@ -361,6 +361,24 @@ def _extract_rows_from_sheet(df, c_date, c_wd, c_dep, c_desc):
         out.append({"direction": direction, "amount": amount, "due_date": due, "desc": desc, "raw_dt": raw_dt})
     return out
 
+_ACCOUNT_NO_RE = re.compile(r"\d{2,4}-\d{1,3}-\d{4,8}")
+
+def _detect_account_no(raw_df, max_scan=30):
+    """계좌번호가 파일 안에 적혀있으면(예: '계좌번호 325-20-322490') 찾아서 반환 — 계좌명 잘못 고르는 실수를 줄이기 위함."""
+    for i in range(min(max_scan, len(raw_df))):
+        for cell in raw_df.iloc[i].tolist():
+            s = str(cell)
+            if "계좌" in s or "account" in s.lower():
+                m = _ACCOUNT_NO_RE.search(s)
+                if m:
+                    return m.group()
+        row_joined = " ".join(str(c) for c in raw_df.iloc[i].tolist())
+        if "계좌" in row_joined:
+            m = _ACCOUNT_NO_RE.search(row_joined)
+            if m:
+                return m.group()
+    return None
+
 def read_and_parse_bank_file(uploaded_file):
     """csv/xlsx를 읽어 거래 목록을 반환한다. xlsx는 시트가 여러 개로 나뉜 경우(은행이 페이지별로
     별도 시트에 저장하는 경우가 흔함) 전부 순회하며, 각 시트마다 헤더가 있으면 헤더로, 없으면
@@ -368,11 +386,14 @@ def read_and_parse_bank_file(uploaded_file):
     name = uploaded_file.name.lower()
     all_rows = []
     sheet_info = []
+    detected_account_no = None
     if name.endswith(".xlsx"):
         data = _fix_xlsx_style_bug(uploaded_file.getvalue())
         xls = pd.ExcelFile(io.BytesIO(data))
         for sheetname in xls.sheet_names:
             raw = pd.read_excel(xls, sheet_name=sheetname, header=None)
+            if detected_account_no is None:
+                detected_account_no = _detect_account_no(raw)
             hidx = _find_table_header_row(raw)
             if hidx is not None:
                 header = [str(x).strip() if str(x) != "nan" else f"col_{i}" for i, x in enumerate(raw.iloc[hidx].tolist())]
@@ -400,6 +421,7 @@ def read_and_parse_bank_file(uploaded_file):
                 sheet_info.append(f"{sheetname}({len(rows)}건)")
     else:
         raw = pd.read_csv(io.BytesIO(uploaded_file.getvalue()), encoding="utf-8-sig", header=None)
+        detected_account_no = _detect_account_no(raw)
         hidx = _find_table_header_row(raw)
         if hidx is not None:
             header = [str(x).strip() if str(x) != "nan" else f"col_{i}" for i, x in enumerate(raw.iloc[hidx].tolist())]
@@ -415,8 +437,8 @@ def read_and_parse_bank_file(uploaded_file):
             sheet_info = [f"CSV({len(all_rows)}건)"]
 
     if not all_rows:
-        return None, "거래 데이터를 찾지 못했습니다. 파일 형식을 확인해주세요."
-    return all_rows, " · ".join(sheet_info)
+        return None, "거래 데이터를 찾지 못했습니다. 파일 형식을 확인해주세요.", None
+    return all_rows, " · ".join(sheet_info), detected_account_no
 
 def compute_dedup_hash(account_label, direction, amount, dt_str, desc):
     """DB의 dedup_hash UNIQUE 제약과 동일한 규칙 — 계좌·구분·금액·거래시각(초 단위까지)·메모 기준.
@@ -434,6 +456,18 @@ def dedup_against_existing(rows, existing_bank_txns, account_label):
         r["_dup_batch"] = h in seen_batch
         seen_batch.add(h)
     return rows
+
+def find_legacy_match(row, account_label, existing_bank_txns):
+    """시각 정보가 생기기 전에 등록된 예전 거래(txn_datetime 없음)와 계좌·구분·금액·날짜가 같으면
+    같은 거래로 보고 반환한다 (있으면 새로 안 만들고 그 행에 시각 정보를 채워 '업그레이드'한다)."""
+    for t in existing_bank_txns:
+        if (t.get("txn_datetime") is None
+                and (t.get("account_label") or "") == account_label
+                and t["direction"] == row["direction"]
+                and (t.get("amount") or 0) == row["amount"]
+                and (t.get("txn_date") or "")[:10] == (row.get("due_date") or "")[:10]):
+            return t
+    return None
 
 # ── 홈택스 세금계산서 파싱 (매출 목록 .xls/.csv) ──────────────
 _APPROVAL = re.compile(r"\d{8}-\d{8}-\w+")
@@ -644,38 +678,51 @@ with act[2].popover("🏦 계좌 거래내역 업로드", use_container_width=Tr
     st.caption("은행에서 그냥 다운받은 거래내역 파일을 그대로 올리세요. 금액 크기는 필터링하지 않습니다 "
                "(소액 해외 송금도 그대로 들어와요). 사내 정책상 일부 거래와 중복 건은 자동으로 제외 체크됩니다. "
                "프로젝트 연결 없이 '은행거래' 항목으로 일괄 등록됩니다.")
-    existing_accounts = sorted({t.get("account_label") for t in bank_txns_all if t.get("account_label")})
-    acc_opts = existing_accounts + ["+ 새 계좌 이름 직접 입력"]
-    acc_pick = st.selectbox("이 파일은 어느 계좌 것인가요? (계좌별로 구분해야 중복 체크가 정확해요)", acc_opts)
-    account_label = st.text_input("계좌 이름 입력", placeholder="예: 국민은행 법인, 카카오뱅크") \
-        if acc_pick == "+ 새 계좌 이름 직접 입력" else acc_pick
     bank_up = st.file_uploader("계좌 거래내역 (.csv / .xlsx)", type=["csv", "xlsx"], key="bank_up")
-    if bank_up is not None and not account_label.strip():
-        st.warning("계좌 이름을 먼저 입력해주세요.")
-    elif bank_up is not None:
+    if bank_up is not None:
         try:
-            parsed, perr_or_info = read_and_parse_bank_file(bank_up)
+            parsed, perr_or_info, detected_acc = read_and_parse_bank_file(bank_up)
         except Exception as ex:
-            parsed, perr_or_info = None, f"파일을 읽지 못했습니다: {ex}"
+            parsed, perr_or_info, detected_acc = None, f"파일을 읽지 못했습니다: {ex}", None
         if parsed is None:
             st.error(perr_or_info)
         else:
+            existing_accounts = sorted({t.get("account_label") for t in bank_txns_all if t.get("account_label")})
+            default_label = None
+            if detected_acc:
+                matches = [a for a in existing_accounts if detected_acc in a]
+                default_label = matches[0] if matches else detected_acc
+                st.info(f"📎 파일에서 계좌번호를 찾았어요: **{detected_acc}**" +
+                        (f" — 예전에 등록했던 **'{default_label}'**과 같은 계좌로 보여요." if matches else
+                         " — 새 계좌인 것 같아요, 이름을 확인해주세요."))
+            acc_opts = existing_accounts + ["+ 새 계좌 이름 직접 입력"]
+            default_index = acc_opts.index(default_label) if default_label in acc_opts else len(acc_opts) - 1
+            acc_pick = st.selectbox("이 파일은 어느 계좌 것인가요? (자동 감지된 계좌와 다르면 직접 바꿔주세요)",
+                                     acc_opts, index=default_index)
+            account_label = st.text_input("계좌 이름 입력", value=(default_label or "" if acc_pick == "+ 새 계좌 이름 직접 입력" else ""),
+                                           placeholder="예: 국민은행 법인, 카카오뱅크") \
+                if acc_pick == "+ 새 계좌 이름 직접 입력" else acc_pick
             st.caption(f"시트별 인식 현황: {perr_or_info}")
             if not parsed:
                 st.warning("입금/출금 금액이 있는 행을 찾지 못했습니다.")
+            elif not account_label.strip():
+                st.warning("계좌 이름을 입력해주세요.")
             else:
                 parsed = dedup_against_existing(parsed, bank_txns_all, account_label.strip())
                 st.caption(f"**{account_label.strip()}** · 총 {len(parsed)}건 인식됨")
                 sel = []
                 for i, r in enumerate(parsed):
                     reasons = []
+                    legacy = find_legacy_match(r, account_label.strip(), bank_txns_all)
                     if looks_like_payroll(r["desc"]):
                         reasons.append("제외 대상")
                     if r["_dup_existing"]:
                         reasons.append("이미 등록된 것과 중복")
-                    if r["_dup_batch"]:
+                    elif r["_dup_batch"]:
                         reasons.append("이 파일 안에서 중복")
-                    default_check = len(reasons) == 0
+                    elif legacy:
+                        reasons.append("예전 기록에 시각정보만 채워넣음(업그레이드)")
+                    default_check = not (looks_like_payroll(r["desc"]) or r["_dup_existing"] or r["_dup_batch"])
                     c1, c2 = st.columns([0.5, 5.5])
                     checked = c1.checkbox("포함", value=default_check, key=f"bankrow_{i}", label_visibility="collapsed")
                     tag = "받을" if r["direction"] == "in" else "나갈"
@@ -685,27 +732,38 @@ with act[2].popover("🏦 계좌 거래내역 업로드", use_container_width=Tr
                 n_keep = sum(sel)
                 st.caption("등록 후 '리스트' 보기에서 미입금/미지급 항목을 열면 이 거래들을 매칭할 수 있어요.")
                 if st.button(f"✅ 체크된 {n_keep}건 등록", type="primary", disabled=n_keep == 0):
-                    rows_to_add = []
+                    rows_to_insert = []
+                    upgraded = 0
                     for keep, r in zip(sel, parsed):
                         if not keep:
                             continue
-                        rows_to_add.append({
-                            "direction": r["direction"], "amount": r["amount"],
-                            "txn_date": r["due_date"], "txn_datetime": r.get("raw_dt"),
-                            "description": r["desc"] or None,
-                            "account_label": account_label.strip(),
-                            "dedup_hash": r["_hash"],
-                        })
-                    if rows_to_add:
+                        legacy = None if r["_dup_existing"] else find_legacy_match(r, account_label.strip(), bank_txns_all)
+                        if legacy:
+                            SUPA.table("bank_transactions").update({
+                                "txn_datetime": r.get("raw_dt"), "dedup_hash": r["_hash"],
+                            }).eq("id", legacy["id"]).execute()
+                            upgraded += 1
+                        else:
+                            rows_to_insert.append({
+                                "direction": r["direction"], "amount": r["amount"],
+                                "txn_date": r["due_date"], "txn_datetime": r.get("raw_dt"),
+                                "description": r["desc"] or None,
+                                "account_label": account_label.strip(),
+                                "dedup_hash": r["_hash"],
+                            })
+                    actually_added = 0
+                    if rows_to_insert:
                         res = SUPA.table("bank_transactions").upsert(
-                            rows_to_add, on_conflict="dedup_hash", ignore_duplicates=True
+                            rows_to_insert, on_conflict="dedup_hash", ignore_duplicates=True
                         ).execute()
-                        actually_added = len(res.data) if res.data is not None else len(rows_to_add)
-                        skipped_dupe = len(rows_to_add) - actually_added
-                        msg = f"{actually_added}건 등록됨 ✓ — 이제 '리스트'에서 매칭해주세요"
-                        if skipped_dupe > 0:
-                            msg += f" (이미 있던 {skipped_dupe}건은 중복이라 자동으로 건너뜀)"
-                        st.toast(msg)
+                        actually_added = len(res.data) if res.data is not None else len(rows_to_insert)
+                    skipped_dupe = len(rows_to_insert) - actually_added
+                    msg = f"{actually_added}건 새로 등록됨 ✓"
+                    if upgraded:
+                        msg += f" · {upgraded}건은 예전 기록에 시각정보 업그레이드"
+                    if skipped_dupe > 0:
+                        msg += f" · 이미 있던 {skipped_dupe}건은 중복이라 건너뜀"
+                    st.toast(msg)
                     st.rerun()
 
 with act[3]:
