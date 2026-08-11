@@ -109,9 +109,10 @@ def _unescape_x(s):
         return s
     return re.sub(r"_x([0-9A-Fa-f]{4})_", lambda m: chr(int(m.group(1), 16)), s)
 
-# 일부 은행 엑셀은 파일 자체에 오타가 있어 openpyxl이 못 읾을 때가 있음
-# (예: SC제일은행 — styles.xml에 applyNumberFormat이 applyNumberForm으로 잘못 저장됨).
-# 통계/서식 정보는 필요 없고 값만 필요하므로, 문제되는 속성명을 고쳐서 재포장한 뒤 읽는다.
+# 일부 은행 엑셀은 파일 자체에 오타/비표준 속성이 있어 openpyxl이 못 읽을 때가 있음
+# (예: SC제일은행 — applyNumberFormat이 applyNumberForm으로 잘못 저장됨.
+#      기업은행 — 표준에 없는 styleId 속성이 붙어있고, xfId가 소문자 xfid로 잘못 저장됨).
+# 통계/서식 정보는 필요 없고 값만 필요하므로, 문제되는 속성을 고치거나 제거해 재포장한 뒤 읽는다.
 def _fix_xlsx_style_bug(data: bytes) -> bytes:
     try:
         import zipfile
@@ -121,9 +122,13 @@ def _fix_xlsx_style_bug(data: bytes) -> bytes:
         changed = False
         for item in zin.infolist():
             content = zin.read(item.filename)
-            if item.filename == "xl/styles.xml" and b"applyNumberForm=" in content:
+            if item.filename == "xl/styles.xml":
+                orig = content
                 content = content.replace(b"applyNumberForm=", b"applyNumberFormat=")
-                changed = True
+                content = re.sub(rb'\s+styleId="[^"]*"', b"", content)
+                content = content.replace(b"xfid=", b"xfId=")
+                if content != orig:
+                    changed = True
             zout.writestr(item, content)
         zout.close()
         return buf.getvalue() if changed else data
