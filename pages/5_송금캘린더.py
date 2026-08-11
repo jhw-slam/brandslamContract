@@ -65,14 +65,16 @@ def matched_sum_for(event_id, bank_txns):
 def generate_balance_request_html(project_id, project_label, events_all, bank_txns_all):
     """프로젝트의 '받을' 항목(선금/잔금 등)만 모아 계약금액·입금액·잔여·세금계산서 상태 현황표를 HTML로 만든다.
     PDF 라이브러리 없이, 브라우저 인쇄(Ctrl+P → PDF로 저장) 기능을 쓰도록 화면에 예쁘게 그려서 보여준다.
-    출금(나갈 돈) 항목은 절대 포함하지 않는다."""
+    출금(나갈 돈) 항목은 절대 포함하지 않는다. 각 항목에 실제로 매칭된 입금 내역(날짜·금액·메모)도 상세로 붙인다."""
     receivables = [e for e in events_all if e.get("project_id") == project_id and e["direction"] == "in"]
     receivables.sort(key=lambda e: e.get("due_date") or "")
 
     total_amount, total_received = 0, 0
     body_rows = ""
+    detail_sections = ""
     for e in receivables:
-        received = matched_sum_for(e["id"], bank_txns_all)  # 초과분(과납)도 그대로 보여줌
+        matched = sorted(matched_txns_for(e["id"], bank_txns_all), key=lambda t: t.get("txn_date") or "")
+        received = sum(t["amount"] or 0 for t in matched)
         amount = e["amount"] or 0
         remaining = amount - received
         total_amount += amount
@@ -89,8 +91,28 @@ def generate_balance_request_html(project_id, project_label, events_all, bank_tx
             f"<td>{tax_html}</td>"
             "</tr>"
         )
+        if matched:
+            dep_rows = "".join(
+                "<tr>"
+                f"<td>{(t.get('txn_datetime') or t.get('txn_date') or '-')[:19]}</td>"
+                f"<td class='num'>{(t['amount'] or 0):,.0f}</td>"
+                f"<td style='text-align:left'>{t.get('description') or ''}</td>"
+                f"<td>{t.get('account_label') or ''}</td>"
+                "</tr>"
+                for t in matched
+            )
+            detail_sections += (
+                f"<div class='brq-detail-block'>"
+                f"<div class='brq-detail-title'>📌 {e.get('category') or ''} · {(e.get('title') or '')[:40]} — 입금 {len(matched)}건</div>"
+                "<table class='brq-detail-table'>"
+                "<thead><tr><th>입금 시각</th><th>금액</th><th>메모(은행 표기)</th><th>계좌</th></tr></thead>"
+                f"<tbody>{dep_rows}</tbody>"
+                "</table></div>"
+            )
     if not receivables:
         body_rows = "<tr><td colspan='6' style='color:#888'>이 프로젝트에는 '받을' 항목이 없습니다.</td></tr>"
+    if not detail_sections:
+        detail_sections = "<div style='color:#888;font-size:12.5px'>매칭된 입금 내역이 없습니다.</div>"
     total_remaining = total_amount - total_received
 
     html = f"""
@@ -98,6 +120,7 @@ def generate_balance_request_html(project_id, project_label, events_all, bank_tx
       <style>
         .brq-wrap {{ font-family: -apple-system, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; }}
         .brq-wrap h2 {{ margin: 0 0 2px 0; font-size: 20px; }}
+        .brq-wrap h3 {{ margin: 22px 0 8px 0; font-size: 15px; }}
         .brq-wrap .meta {{ color: #888; font-size: 12px; margin-bottom: 14px; }}
         .brq-wrap table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
         .brq-wrap th {{ background: #f4f5f7; text-align: left; padding: 8px 6px; border-bottom: 1.5px solid #333; font-size: 11.5px; color: #555; }}
@@ -105,6 +128,11 @@ def generate_balance_request_html(project_id, project_label, events_all, bank_tx
         .brq-wrap td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
         .brq-summary {{ margin-top: 14px; font-size: 14px; }}
         .brq-summary div {{ display:flex; justify-content: space-between; max-width: 280px; padding: 3px 0; }}
+        .brq-detail-block {{ margin-bottom: 16px; }}
+        .brq-detail-title {{ font-size: 13px; font-weight: 700; margin-bottom: 4px; }}
+        .brq-detail-table {{ font-size: 12px; }}
+        .brq-detail-table th {{ font-size: 10.5px; padding: 5px 6px; }}
+        .brq-detail-table td {{ padding: 5px 6px; }}
         .brq-foot {{ margin-top: 18px; font-size: 11px; color: #888; }}
         @media print {{
           header, footer, [data-testid="stSidebar"], [data-testid="stHeader"], .brq-noprint {{ display: none !important; }}
@@ -121,6 +149,8 @@ def generate_balance_request_html(project_id, project_label, events_all, bank_tx
         <div><span>총 입금액</span><b>{total_received:,.0f} 원</b></div>
         <div><span>총 미수금</span><b>{total_remaining:,.0f} 원</b></div>
       </div>
+      <h3>📋 입금 내역 상세 (항목별로 실제 어느 입금이 매칭됐는지)</h3>
+      {detail_sections}
       <div class="brq-foot">
         본 문서는 브랜드슬램 내부 시스템에서 {datetime.now().strftime('%Y-%m-%d %H:%M')} 기준으로 자동 생성되었습니다.
         입금액은 계좌 거래내역과 매칭된 금액만 반영되며, 지출(출금) 내역은 포함되지 않습니다.
