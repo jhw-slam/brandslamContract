@@ -62,6 +62,25 @@ def matched_txns_for(event_id, bank_txns):
 def matched_sum_for(event_id, bank_txns):
     return sum(t["amount"] or 0 for t in matched_txns_for(event_id, bank_txns))
 
+def sync_paid_status(events_all, bank_txns_all):
+    """'완료' 여부는 오직 계좌거래 매칭 결과로만 정해진다 — 수동 체크로 생긴 괴리를 여기서 항상 바로잡는다.
+    (매칭 합계가 목표금액 이상이면 완료, 아니면 미완료로 매번 다시 계산해서 DB에 동기화)"""
+    fixed = 0
+    for e in events_all:
+        target = e.get("amount") or 0
+        if target <= 0:
+            continue
+        received = matched_sum_for(e["id"], bank_txns_all)
+        should_be_paid = received >= target
+        if bool(e.get("paid")) != should_be_paid:
+            last_dt = None
+            if should_be_paid:
+                dts = [t.get("txn_date") for t in matched_txns_for(e["id"], bank_txns_all) if t.get("txn_date")]
+                last_dt = max(dts) if dts else date.today().isoformat()
+            SUPA.table("cash_events").update({"paid": should_be_paid, "paid_date": last_dt}).eq("id", e["id"]).execute()
+            fixed += 1
+    return fixed
+
 def generate_balance_request_html(project_id, project_label, events_all, bank_txns_all):
     """프로젝트의 '받을' 항목(선금/잔금 등)만 모아 계약금액·입금액·잔여·세금계산서 상태 현황표를 HTML로 만든다.
     PDF 라이브러리 없이, 브라우저 인쇄(Ctrl+P → PDF로 저장) 기능을 쓰도록 화면에 예쁘게 그려서 보여준다.
@@ -597,6 +616,8 @@ pstage = {p["id"]: SLAB.get(p.get("stage"), p.get("stage") or "-") for p in proj
 label2id = {plabel[p["id"]]: p["id"] for p in projs}
 events_all = load_events()
 bank_txns_all = load_bank_txns()
+if sync_paid_status(events_all, bank_txns_all) > 0:
+    events_all = load_events()
 
 st.title("송금 캘린더")
 
@@ -636,13 +657,12 @@ with act[0].popover("➕ 일정 추가", use_container_width=True):
         amount = cc2[0].number_input("금액", min_value=0, step=100000)
         due = cc2[1].date_input("예정일", value=today)
         title = st.text_input("메모/제목", placeholder="예: OWM 선금 청구")
-        paid = st.checkbox("완료(입금/지급)")
+        st.caption("💡 '완료' 여부는 여기서 직접 정하지 않아요 — 계좌 거래내역을 매칭해야만 자동으로 완료 처리됩니다.")
         if st.form_submit_button("추가", type="primary") and amount:
             SUPA.table("cash_events").insert({
                 "project_id": popts[pj], "direction": "in" if direction.startswith("받을") else "out",
                 "category": category, "title": title, "amount": int(amount),
-                "due_date": due.isoformat(), "paid": paid,
-                "paid_date": due.isoformat() if paid else None}).execute()
+                "due_date": due.isoformat(), "paid": False, "paid_date": None}).execute()
             st.rerun()
 
 with act[1].popover("🧾 세금계산서 업로드", use_container_width=True):
@@ -830,7 +850,9 @@ def edit_dialog(e):
         dv = date.today()
     duev = c2[1].date_input("예정일", value=dv)
     titv = st.text_input("제목/메모", value=e.get("title") or "")
-    paidv = st.checkbox("입금/지급 완료", value=bool(e["paid"]))
+    received_now = matched_sum_for(e["id"], bank_txns_all)
+    status_txt = ("✅ 완료" if e["paid"] else f"⏳ 미완료 · 매칭 {won(received_now)} / 목표 {won(e['amount'])}")
+    st.caption(f"입금/지급 상태: **{status_txt}** — 이 상태는 직접 못 바꾸고, 아래 리스트의 '🔗 매칭'에서 계좌거래를 연결해야만 자동으로 바뀝니다.")
     taxv = e.get("tax_issued"); taxno = e.get("tax_invoice_no") or ""
     if e["direction"] == "in":
         taxv = st.checkbox("세금계산서 발행완료", value=bool(e.get("tax_issued")))
@@ -839,8 +861,7 @@ def edit_dialog(e):
     if b[0].button("저장", type="primary"):
         SUPA.table("cash_events").update({
             "direction": "in" if dirv.startswith("받을") else "out", "category": catv,
-            "amount": int(amtv), "due_date": duev.isoformat(), "title": titv, "paid": paidv,
-            "paid_date": duev.isoformat() if paidv else None,
+            "amount": int(amtv), "due_date": duev.isoformat(), "title": titv,
             "tax_issued": bool(taxv), "tax_invoice_no": (taxno or None)}).eq("id", e["id"]).execute()
         st.session_state.edit_target = None; st.rerun()
     if b[1].button("삭제"):
@@ -987,19 +1008,25 @@ elif view == "리스트":  # 리스트
     unmatched_txns = [t for t in bank_txns_all if not t.get("matched_cash_event_id")]
     if unmatched_txns:
         with st.expander(f"📎 어디에도 매칭 안 된 계좌거래 {len(unmatched_txns)}건 — 예정된 항목이 없던 거래"):
-            st.caption("위 '🔗 매칭'에 연결할 데가 없으면, 여기서 개별로 새 항목을 만들 수 있어요.")
+            st.caption("위 '🔗 매칭'에 연결할 데가 없으면, 여기서 프로젝트를 골라 개별로 새 항목을 만들 수 있어요. "
+                       "만들면 그 즉시 이 거래에 100% 매칭된 '완료' 상태로 등록됩니다.")
+            mk_popts = {"(프로젝트 없음)": None}
+            for p in projs:
+                mk_popts[plabel[p["id"]]] = p["id"]
             for t in sorted(unmatched_txns, key=lambda x: x.get("txn_date") or "", reverse=True):
-                uc = st.columns([4, 1])
+                uc = st.columns([3, 2, 1])
                 tag = "받을" if t["direction"] == "in" else "나갈"
                 uc[0].write(f"[{t.get('account_label') or '계좌미표시'}] {t.get('txn_date') or '-'} · {tag} · {won(t['amount'])} · {t.get('description') or ''}")
-                if uc[1].button("새 항목으로", key="mkce" + t["id"]):
+                mk_pj = uc[1].selectbox("프로젝트", list(mk_popts.keys()), key="mkpj" + t["id"], label_visibility="collapsed")
+                if uc[2].button("새 항목으로", key="mkce" + t["id"]):
                     new_ce = SUPA.table("cash_events").insert({
-                        "project_id": None, "direction": t["direction"], "category": "은행거래",
+                        "project_id": mk_popts[mk_pj], "direction": t["direction"], "category": "은행거래",
                         "title": t.get("description"), "amount": t["amount"], "due_date": t.get("txn_date"),
                         "paid": True, "paid_date": t.get("txn_date"),
                     }).execute().data[0]
                     SUPA.table("bank_transactions").update({"matched_cash_event_id": new_ce["id"]}).eq("id", t["id"]).execute()
-                    st.toast("새 항목으로 등록됨 ✓"); st.rerun()
+                    st.toast(f"'{mk_pj}'에 {won(t['amount'])} 새 항목으로 등록되고 완료 처리됐어요 ✓ — '리스트' 보기에서 확인 가능")
+                    st.rerun()
 
 elif view == "세금계산서":
     st.caption("홈택스에서 가져온 세금계산서를 '받을' 일정에 정확히 연결합니다. 금액·날짜가 가까운 후보가 위에 오게 정렬돼요.")
