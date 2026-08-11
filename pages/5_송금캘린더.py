@@ -9,20 +9,8 @@ from datetime import date, timedelta, datetime
 import pandas as pd
 import streamlit as st
 from supabase import create_client
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.units import mm
-from reportlab.pdfgen import canvas
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 
 st.set_page_config(page_title="송금 캘린더", layout="wide")
-
-# ── 잔금요청서 PDF용 한글 폰트 등록 (레포 루트의 fonts/ 폴더) ──────
-_FONT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fonts", "NotoSansKR-Regular.ttf")
-_FONT_NAME = "NotoSansKR"
-if _FONT_NAME not in pdfmetrics.getRegisteredFontNames() and os.path.exists(_FONT_PATH):
-    pdfmetrics.registerFont(TTFont(_FONT_NAME, _FONT_PATH))
 
 # ── 비밀번호 게이트 ───────────────────────────────────────────
 PW = os.environ.get("APP_PASSWORD")
@@ -74,144 +62,72 @@ def matched_txns_for(event_id, bank_txns):
 def matched_sum_for(event_id, bank_txns):
     return sum(t["amount"] or 0 for t in matched_txns_for(event_id, bank_txns))
 
-def _wrap_text(text, font, size, max_width):
-    """긴 텍스트를 주어진 너비에 맞게 여러 줄로 나눈다 (reportlab의 stringWidth로 실측)."""
-    words = re.findall(r"\S+|\s", text)  # 공백도 토큰으로 유지 (한글은 띄어쓰기 없이도 줄바꿈되도록 글자 단위 보강)
-    lines, cur = [], ""
-    for w in words:
-        candidate = cur + w
-        if pdfmetrics.stringWidth(candidate, font, size) <= max_width:
-            cur = candidate
-        else:
-            if cur.strip():
-                lines.append(cur.strip())
-            # 단어 자체가 너무 길면(한글 연속 등) 글자 단위로 강제 분할
-            cur = ""
-            for ch in w:
-                if pdfmetrics.stringWidth(cur + ch, font, size) <= max_width:
-                    cur += ch
-                else:
-                    if cur.strip():
-                        lines.append(cur.strip())
-                    cur = ch
-    if cur.strip():
-        lines.append(cur.strip())
-    return lines or [""]
-
-def generate_balance_request_pdf(project_id, project_label, events_all, bank_txns_all):
-    """프로젝트의 '받을' 항목(선금/잔금 등)만 모아 계약금액·입금액·잔여·세금계산서 상태 현황표를 PDF로 만든다.
-    출금(나갈 돈) 항목은 절대 포함하지 않는다. Platypus Paragraph는 이 환경에서 폰트 매핑 문제가 있어
-    쓰지 않고, 저수준 canvas API로 직접 좌표에 그린다."""
+def generate_balance_request_html(project_id, project_label, events_all, bank_txns_all):
+    """프로젝트의 '받을' 항목(선금/잔금 등)만 모아 계약금액·입금액·잔여·세금계산서 상태 현황표를 HTML로 만든다.
+    PDF 라이브러리 없이, 브라우저 인쇄(Ctrl+P → PDF로 저장) 기능을 쓰도록 화면에 예쁘게 그려서 보여준다.
+    출금(나갈 돈) 항목은 절대 포함하지 않는다."""
     receivables = [e for e in events_all if e.get("project_id") == project_id and e["direction"] == "in"]
     receivables.sort(key=lambda e: e.get("due_date") or "")
 
-    F = _FONT_NAME
-    page_w, page_h = A4
-    margin = 18 * mm
-    content_w = page_w - 2 * margin
-
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    y = page_h - margin
-
-    c.setFont(F, 16)
-    c.drawString(margin, y, "잔금 요청 현황")
-    y -= 16
-    c.setFont(F, 9)
-    c.setFillColor(colors.grey)
-    c.drawString(margin, y, f"{project_label}  ·  생성일 {date.today().isoformat()}")
-    c.setFillColor(colors.black)
-    y -= 14
-
-    col_labels = ["구분", "제목", "계약금액", "입금액", "잔여", "세금계산서"]
-    col_w = [18 * mm, 62 * mm, 26 * mm, 26 * mm, 26 * mm, 20 * mm]
-    col_x = [margin]
-    for w in col_w[:-1]:
-        col_x.append(col_x[-1] + w)
-
-    def draw_header_row(yy):
-        c.setFillColor(colors.HexColor("#f4f5f7"))
-        c.rect(margin, yy - 14, content_w, 16, stroke=0, fill=1)
-        c.setFillColor(colors.black)
-        c.setFont(F, 8.5)
-        for x, label in zip(col_x, col_labels):
-            c.drawString(x + 2, yy - 10, label)
-        c.setStrokeColor(colors.HexColor("#333333"))
-        c.line(margin, yy - 14, margin + content_w, yy - 14)
-        c.setStrokeColor(colors.black)
-        return yy - 20
-
     total_amount, total_received = 0, 0
-    rows_render = []
+    body_rows = ""
     for e in receivables:
         received = matched_sum_for(e["id"], bank_txns_all)  # 초과분(과납)도 그대로 보여줌
         amount = e["amount"] or 0
         remaining = amount - received
         total_amount += amount
         total_received += received
-        tax_status = "발행완료" if e.get("tax_issued") else "미발행"
-        title_lines = _wrap_text((e.get("title") or ""), F, 8.5, col_w[1] - 4)
-        rows_render.append({
-            "cat": e.get("category") or "-", "title_lines": title_lines,
-            "amount": f"{amount:,.0f}", "received": f"{received:,.0f}",
-            "remaining": f"{remaining:,.0f}", "tax": tax_status,
-        })
-
+        tax_html = ('<span style="color:#15803d">발행완료</span>' if e.get("tax_issued")
+                    else '<span style="color:#b45309">미발행</span>')
+        body_rows += (
+            "<tr>"
+            f"<td>{e.get('category') or '-'}</td>"
+            f"<td style='text-align:left'>{(e.get('title') or '')}</td>"
+            f"<td class='num'>{amount:,.0f}</td>"
+            f"<td class='num'>{received:,.0f}</td>"
+            f"<td class='num'>{remaining:,.0f}</td>"
+            f"<td>{tax_html}</td>"
+            "</tr>"
+        )
     if not receivables:
-        c.setFont(F, 9)
-        c.drawString(margin, y - 10, "이 프로젝트에는 '받을' 항목이 없습니다.")
-        y -= 24
-    else:
-        y = draw_header_row(y)
-        c.setFont(F, 8.5)
-        for r in rows_render:
-            row_h = max(11 * len(r["title_lines"]), 14) + 6
-            if y - row_h < margin + 40:  # 페이지 넘어가면 새 페이지
-                c.showPage()
-                y = page_h - margin
-                y = draw_header_row(y)
-                c.setFont(F, 8.5)
-            top_y = y
-            c.drawString(col_x[0] + 2, top_y - 9, r["cat"])
-            ty = top_y - 9
-            for line in r["title_lines"]:
-                c.drawString(col_x[1] + 2, ty, line)
-                ty -= 11
-            c.drawRightString(col_x[3] - 2, top_y - 9, r["amount"])
-            c.drawRightString(col_x[4] - 2, top_y - 9, r["received"])
-            c.drawRightString(col_x[5] - 2, top_y - 9, r["remaining"])
-            c.drawString(col_x[5] + 2, top_y - 9, r["tax"])
-            bottom_y = top_y - row_h
-            c.setStrokeColor(colors.HexColor("#dddddd"))
-            c.line(margin, bottom_y + 4, margin + content_w, bottom_y + 4)
-            c.setStrokeColor(colors.black)
-            y = bottom_y
+        body_rows = "<tr><td colspan='6' style='color:#888'>이 프로젝트에는 '받을' 항목이 없습니다.</td></tr>"
+    total_remaining = total_amount - total_received
 
-        total_remaining = total_amount - total_received
-        y -= 12
-        c.setFont(F, 11)
-        for label, value in [
-            ("총 계약금액", f"{total_amount:,.0f} 원"),
-            ("총 입금액", f"{total_received:,.0f} 원"),
-            ("총 미수금", f"{total_remaining:,.0f} 원"),
-        ]:
-            c.drawString(margin, y, label)
-            c.drawRightString(margin + 80 * mm, y, value)
-            y -= 15
-
-    y -= 14
-    c.setFont(F, 8)
-    c.setFillColor(colors.grey)
-    foot_text = (f"본 문서는 브랜드슬램 내부 시스템에서 {datetime.now().strftime('%Y-%m-%d %H:%M')} 기준으로 자동 생성되었습니다. "
-                 "입금액은 계좌 거래내역과 매칭된 금액만 반영되며, 지출(출금) 내역은 포함되지 않습니다.")
-    for line in _wrap_text(foot_text, F, 8, content_w):
-        c.drawString(margin, y, line)
-        y -= 10
-    c.setFillColor(colors.black)
-
-    c.showPage()
-    c.save()
-    return buf.getvalue()
+    html = f"""
+    <div class="brq-wrap">
+      <style>
+        .brq-wrap {{ font-family: -apple-system, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; }}
+        .brq-wrap h2 {{ margin: 0 0 2px 0; font-size: 20px; }}
+        .brq-wrap .meta {{ color: #888; font-size: 12px; margin-bottom: 14px; }}
+        .brq-wrap table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+        .brq-wrap th {{ background: #f4f5f7; text-align: left; padding: 8px 6px; border-bottom: 1.5px solid #333; font-size: 11.5px; color: #555; }}
+        .brq-wrap td {{ padding: 8px 6px; border-bottom: 1px solid #e5e5e5; vertical-align: top; }}
+        .brq-wrap td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+        .brq-summary {{ margin-top: 14px; font-size: 14px; }}
+        .brq-summary div {{ display:flex; justify-content: space-between; max-width: 280px; padding: 3px 0; }}
+        .brq-foot {{ margin-top: 18px; font-size: 11px; color: #888; }}
+        @media print {{
+          header, footer, [data-testid="stSidebar"], [data-testid="stHeader"], .brq-noprint {{ display: none !important; }}
+        }}
+      </style>
+      <h2>잔금 요청 현황</h2>
+      <div class="meta">{project_label} · 생성일 {date.today().isoformat()}</div>
+      <table>
+        <thead><tr><th>구분</th><th>제목</th><th>계약금액</th><th>입금액</th><th>잔여</th><th>세금계산서</th></tr></thead>
+        <tbody>{body_rows}</tbody>
+      </table>
+      <div class="brq-summary">
+        <div><span>총 계약금액</span><b>{total_amount:,.0f} 원</b></div>
+        <div><span>총 입금액</span><b>{total_received:,.0f} 원</b></div>
+        <div><span>총 미수금</span><b>{total_remaining:,.0f} 원</b></div>
+      </div>
+      <div class="brq-foot">
+        본 문서는 브랜드슬램 내부 시스템에서 {datetime.now().strftime('%Y-%m-%d %H:%M')} 기준으로 자동 생성되었습니다.
+        입금액은 계좌 거래내역과 매칭된 금액만 반영되며, 지출(출금) 내역은 포함되지 않습니다.
+      </div>
+    </div>
+    """
+    return html
 
 
 def suggest_txn_candidates(event, bank_txns, limit=15):
@@ -831,18 +747,15 @@ with act[2].popover("🏦 계좌 거래내역 업로드", use_container_width=Tr
 with act[3]:
     if projsel not in ("전체 프로젝트", "(프로젝트 없음)"):
         sel_project_id = label2id.get(projsel)
-        if st.button("📄 잔금요청 PDF", use_container_width=True):
-            pdf_bytes = generate_balance_request_pdf(sel_project_id, projsel, events_all, bank_txns_all)
-            st.session_state["_balance_pdf"] = pdf_bytes
-            st.session_state["_balance_pdf_name"] = f"잔금요청_{projsel.split('·')[0].strip()}_{date.today().isoformat()}.pdf"
+        if st.button("🖨️ 잔금요청 현황 보기", use_container_width=True):
+            st.session_state["_balance_html"] = generate_balance_request_html(sel_project_id, projsel, events_all, bank_txns_all)
     else:
-        st.caption("프로젝트를 선택하면 잔금요청 PDF를 만들 수 있어요.")
+        st.caption("프로젝트를 선택하면 잔금요청 현황을 볼 수 있어요.")
 
-if st.session_state.get("_balance_pdf"):
-    st.download_button(
-        "⬇️ 잔금요청 PDF 다운로드", data=st.session_state["_balance_pdf"],
-        file_name=st.session_state.get("_balance_pdf_name", "잔금요청.pdf"), mime="application/pdf",
-    )
+if st.session_state.get("_balance_html"):
+    st.info("💡 **PDF로 저장하려면**: 이 화면에서 `Ctrl+P`(Mac은 `Cmd+P`) → 대상(프린터)에서 **'PDF로 저장'** 선택 → 저장. "
+            "인쇄 미리보기에서는 아래 표만 나오고 사이트 메뉴는 안 보이게 처리해뒀어요.")
+    st.markdown(st.session_state["_balance_html"], unsafe_allow_html=True)
 
 # ── 기간/상태/프로젝트 필터 적용 ──────────────────────────────
 def _in_period(e):
