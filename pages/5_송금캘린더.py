@@ -12,8 +12,7 @@ from supabase import create_client
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import mm
-from reportlab.lib.styles import ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
@@ -24,9 +23,6 @@ _FONT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
 _FONT_NAME = "NotoSansKR"
 if _FONT_NAME not in pdfmetrics.getRegisteredFontNames() and os.path.exists(_FONT_PATH):
     pdfmetrics.registerFont(TTFont(_FONT_NAME, _FONT_PATH))
-    pdfmetrics.registerFontFamily(
-        _FONT_NAME, normal=_FONT_NAME, bold=_FONT_NAME, italic=_FONT_NAME, boldItalic=_FONT_NAME
-    )
 
 # ── 비밀번호 게이트 ───────────────────────────────────────────
 PW = os.environ.get("APP_PASSWORD")
@@ -78,32 +74,75 @@ def matched_txns_for(event_id, bank_txns):
 def matched_sum_for(event_id, bank_txns):
     return sum(t["amount"] or 0 for t in matched_txns_for(event_id, bank_txns))
 
+def _wrap_text(text, font, size, max_width):
+    """긴 텍스트를 주어진 너비에 맞게 여러 줄로 나눈다 (reportlab의 stringWidth로 실측)."""
+    words = re.findall(r"\S+|\s", text)  # 공백도 토큰으로 유지 (한글은 띄어쓰기 없이도 줄바꿈되도록 글자 단위 보강)
+    lines, cur = [], ""
+    for w in words:
+        candidate = cur + w
+        if pdfmetrics.stringWidth(candidate, font, size) <= max_width:
+            cur = candidate
+        else:
+            if cur.strip():
+                lines.append(cur.strip())
+            # 단어 자체가 너무 길면(한글 연속 등) 글자 단위로 강제 분할
+            cur = ""
+            for ch in w:
+                if pdfmetrics.stringWidth(cur + ch, font, size) <= max_width:
+                    cur += ch
+                else:
+                    if cur.strip():
+                        lines.append(cur.strip())
+                    cur = ch
+    if cur.strip():
+        lines.append(cur.strip())
+    return lines or [""]
+
 def generate_balance_request_pdf(project_id, project_label, events_all, bank_txns_all):
     """프로젝트의 '받을' 항목(선금/잔금 등)만 모아 계약금액·입금액·잔여·세금계산서 상태 현황표를 PDF로 만든다.
-    출금(나갈 돈) 항목은 절대 포함하지 않는다."""
+    출금(나갈 돈) 항목은 절대 포함하지 않는다. Platypus Paragraph는 이 환경에서 폰트 매핑 문제가 있어
+    쓰지 않고, 저수준 canvas API로 직접 좌표에 그린다."""
     receivables = [e for e in events_all if e.get("project_id") == project_id and e["direction"] == "in"]
     receivables.sort(key=lambda e: e.get("due_date") or "")
 
-    styles = {
-        "title": ParagraphStyle("title", fontName=_FONT_NAME, fontSize=16, leading=20, spaceAfter=4),
-        "meta": ParagraphStyle("meta", fontName=_FONT_NAME, fontSize=9, textColor=colors.grey, spaceAfter=10),
-        "h2": ParagraphStyle("h2", fontName=_FONT_NAME, fontSize=11, leading=14, spaceAfter=6, spaceBefore=10),
-        "cell": ParagraphStyle("cell", fontName=_FONT_NAME, fontSize=8.5, leading=11),
-        "cellR": ParagraphStyle("cellR", fontName=_FONT_NAME, fontSize=8.5, leading=11, alignment=2),
-        "foot": ParagraphStyle("foot", fontName=_FONT_NAME, fontSize=8, textColor=colors.grey, spaceBefore=14),
-    }
+    F = _FONT_NAME
+    page_w, page_h = A4
+    margin = 18 * mm
+    content_w = page_w - 2 * margin
 
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4,
-                             leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm, bottomMargin=16 * mm)
-    story = [
-        Paragraph("잔금 요청 현황", styles["title"]),
-        Paragraph(f"{project_label}  ·  생성일 {date.today().isoformat()}", styles["meta"]),
-    ]
+    c = canvas.Canvas(buf, pagesize=A4)
+    y = page_h - margin
 
-    header = ["구분", "제목", "계약금액", "입금액", "잔여", "세금계산서"]
-    rows = [[Paragraph(h, styles["cell"]) for h in header]]
+    c.setFont(F, 16)
+    c.drawString(margin, y, "잔금 요청 현황")
+    y -= 16
+    c.setFont(F, 9)
+    c.setFillColor(colors.grey)
+    c.drawString(margin, y, f"{project_label}  ·  생성일 {date.today().isoformat()}")
+    c.setFillColor(colors.black)
+    y -= 14
+
+    col_labels = ["구분", "제목", "계약금액", "입금액", "잔여", "세금계산서"]
+    col_w = [18 * mm, 62 * mm, 26 * mm, 26 * mm, 26 * mm, 20 * mm]
+    col_x = [margin]
+    for w in col_w[:-1]:
+        col_x.append(col_x[-1] + w)
+
+    def draw_header_row(yy):
+        c.setFillColor(colors.HexColor("#f4f5f7"))
+        c.rect(margin, yy - 14, content_w, 16, stroke=0, fill=1)
+        c.setFillColor(colors.black)
+        c.setFont(F, 8.5)
+        for x, label in zip(col_x, col_labels):
+            c.drawString(x + 2, yy - 10, label)
+        c.setStrokeColor(colors.HexColor("#333333"))
+        c.line(margin, yy - 14, margin + content_w, yy - 14)
+        c.setStrokeColor(colors.black)
+        return yy - 20
+
     total_amount, total_received = 0, 0
+    rows_render = []
     for e in receivables:
         received = matched_sum_for(e["id"], bank_txns_all)  # 초과분(과납)도 그대로 보여줌
         amount = e["amount"] or 0
@@ -111,51 +150,71 @@ def generate_balance_request_pdf(project_id, project_label, events_all, bank_txn
         total_amount += amount
         total_received += received
         tax_status = "발행완료" if e.get("tax_issued") else "미발행"
-        rows.append([
-            Paragraph(e.get("category") or "-", styles["cell"]),
-            Paragraph((e.get("title") or "")[:60], styles["cell"]),
-            Paragraph(f"{amount:,.0f}", styles["cellR"]),
-            Paragraph(f"{received:,.0f}", styles["cellR"]),
-            Paragraph(f"{remaining:,.0f}", styles["cellR"]),
-            Paragraph(tax_status, styles["cell"]),
-        ])
+        title_lines = _wrap_text((e.get("title") or ""), F, 8.5, col_w[1] - 4)
+        rows_render.append({
+            "cat": e.get("category") or "-", "title_lines": title_lines,
+            "amount": f"{amount:,.0f}", "received": f"{received:,.0f}",
+            "remaining": f"{remaining:,.0f}", "tax": tax_status,
+        })
 
     if not receivables:
-        story.append(Paragraph("이 프로젝트에는 '받을' 항목이 없습니다.", styles["cell"]))
+        c.setFont(F, 9)
+        c.drawString(margin, y - 10, "이 프로젝트에는 '받을' 항목이 없습니다.")
+        y -= 24
     else:
-        tbl = Table(rows, colWidths=[18 * mm, 62 * mm, 26 * mm, 26 * mm, 26 * mm, 20 * mm])
-        tbl.setStyle(TableStyle([
-            ("FONTNAME", (0, 0), (-1, -1), _FONT_NAME),
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f4f5f7")),
-            ("LINEBELOW", (0, 0), (-1, 0), 0.8, colors.HexColor("#333333")),
-            ("LINEBELOW", (0, 1), (-1, -1), 0.4, colors.HexColor("#dddddd")),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 5),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ]))
-        story.append(tbl)
+        y = draw_header_row(y)
+        c.setFont(F, 8.5)
+        for r in rows_render:
+            row_h = max(11 * len(r["title_lines"]), 14) + 6
+            if y - row_h < margin + 40:  # 페이지 넘어가면 새 페이지
+                c.showPage()
+                y = page_h - margin
+                y = draw_header_row(y)
+                c.setFont(F, 8.5)
+            top_y = y
+            c.drawString(col_x[0] + 2, top_y - 9, r["cat"])
+            ty = top_y - 9
+            for line in r["title_lines"]:
+                c.drawString(col_x[1] + 2, ty, line)
+                ty -= 11
+            c.drawRightString(col_x[3] - 2, top_y - 9, r["amount"])
+            c.drawRightString(col_x[4] - 2, top_y - 9, r["received"])
+            c.drawRightString(col_x[5] - 2, top_y - 9, r["remaining"])
+            c.drawString(col_x[5] + 2, top_y - 9, r["tax"])
+            bottom_y = top_y - row_h
+            c.setStrokeColor(colors.HexColor("#dddddd"))
+            c.line(margin, bottom_y + 4, margin + content_w, bottom_y + 4)
+            c.setStrokeColor(colors.black)
+            y = bottom_y
 
         total_remaining = total_amount - total_received
-        story.append(Spacer(1, 10))
-        summary_rows = [
-            ["총 계약금액", f"{total_amount:,.0f} 원"],
-            ["총 입금액", f"{total_received:,.0f} 원"],
-            ["총 미수금", f"{total_remaining:,.0f} 원"],
-        ]
-        sumtbl = Table([[Paragraph(a, styles["h2"]), Paragraph(b, styles["cellR"])] for a, b in summary_rows],
-                       colWidths=[40 * mm, 40 * mm])
-        sumtbl.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), _FONT_NAME)]))
-        story.append(sumtbl)
+        y -= 12
+        c.setFont(F, 11)
+        for label, value in [
+            ("총 계약금액", f"{total_amount:,.0f} 원"),
+            ("총 입금액", f"{total_received:,.0f} 원"),
+            ("총 미수금", f"{total_remaining:,.0f} 원"),
+        ]:
+            c.drawString(margin, y, label)
+            c.drawRightString(margin + 80 * mm, y, value)
+            y -= 15
 
-    story.append(Paragraph(
-        f"본 문서는 브랜드슬램 내부 시스템에서 {datetime.now().strftime('%Y-%m-%d %H:%M')} 기준으로 자동 생성되었습니다. "
-        "입금액은 계좌 거래내역과 매칭된 금액만 반영되며, 지출(출금) 내역은 포함되지 않습니다.",
-        styles["foot"]
-    ))
-    doc.build(story)
+    y -= 14
+    c.setFont(F, 8)
+    c.setFillColor(colors.grey)
+    foot_text = (f"본 문서는 브랜드슬램 내부 시스템에서 {datetime.now().strftime('%Y-%m-%d %H:%M')} 기준으로 자동 생성되었습니다. "
+                 "입금액은 계좌 거래내역과 매칭된 금액만 반영되며, 지출(출금) 내역은 포함되지 않습니다.")
+    for line in _wrap_text(foot_text, F, 8, content_w):
+        c.drawString(margin, y, line)
+        y -= 10
+    c.setFillColor(colors.black)
+
+    c.showPage()
+    c.save()
     return buf.getvalue()
 
 
+def suggest_txn_candidates(event, bank_txns, limit=15):
     """시점(예정일)·잔여금액 기준으로 후보 계좌거래를 추천 정렬한다."""
     try:
         due = date.fromisoformat((event.get("due_date") or "")[:10])
