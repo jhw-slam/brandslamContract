@@ -37,6 +37,11 @@ ADMIN_EMAIL = "jhw@slam-global.com"
 
 ATTACH_BUCKET = "okr-attachments"
 
+# ── 직무내역서 PDF용 한글 폰트 (repo 루트/assets 기준 절대경로) ──
+_JD_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_JD_FONT_REGULAR = os.path.join(_JD_BASE_DIR, "assets", "NanumGothic-Regular.ttf")
+_JD_FONT_BOLD = os.path.join(_JD_BASE_DIR, "assets", "NanumGothic-Bold.ttf")
+
 def upload_photo(file, person):
     """이미지를 Supabase Storage에 올리고 공개 URL을 반환한다."""
     ext = (file.name.rsplit(".", 1)[-1] if "." in file.name else "jpg").lower()
@@ -112,6 +117,76 @@ def send_via_resend(to_addr, subject, body_text, purpose="manual"):
     except Exception:
         pass
     return ok, err
+
+
+def build_jd_pdf(position_title, org_tag, objective, categorized_items):
+    """담당자 1명의 직무내역서를 PDF bytes로 만든다.
+    categorized_items: {카테고리: [(업무명, 주기라벨), ...]} — 심플하게 이 3가지 정보만 담는다
+    (수치·진행률·급여 등 민감/내부 정보는 절대 포함하지 않음 — 채용 후보자에게 그대로 전달되는 문서라서).
+    reportlab의 기본 CID 폰트 대신, repo에 포함된 TTF를 직접 등록해서 사용한다
+    (Railway 환경에서 CID 폰트 매핑 오류가 났던 과거 이슈를 우회하기 위함)."""
+    import io as _io
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors as rl_colors
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import ParagraphStyle
+
+    if "Nanum" not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(TTFont("Nanum", _JD_FONT_REGULAR))
+        pdfmetrics.registerFont(TTFont("Nanum-Bold", _JD_FONT_BOLD))
+
+    style_title = ParagraphStyle("jd_title", fontName="Nanum-Bold", fontSize=20, leading=26, textColor=rl_colors.HexColor("#16181d"))
+    style_sub = ParagraphStyle("jd_sub", fontName="Nanum", fontSize=10.5, leading=15, textColor=rl_colors.HexColor("#6b7280"))
+    style_h2 = ParagraphStyle("jd_h2", fontName="Nanum-Bold", fontSize=13, leading=18, textColor=rl_colors.HexColor("#16181d"), spaceBefore=14, spaceAfter=6)
+    style_body = ParagraphStyle("jd_body", fontName="Nanum", fontSize=10.5, leading=16, textColor=rl_colors.HexColor("#2b2f36"))
+    style_cat = ParagraphStyle("jd_cat", fontName="Nanum-Bold", fontSize=11, leading=15, textColor=rl_colors.HexColor("#16181d"), spaceBefore=10, spaceAfter=4)
+    style_foot = ParagraphStyle("jd_foot", fontName="Nanum", fontSize=8.5, leading=12, textColor=rl_colors.HexColor("#9aa0a8"))
+
+    buf = _io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4, topMargin=22 * mm, bottomMargin=18 * mm, leftMargin=20 * mm, rightMargin=20 * mm,
+        title=f"{position_title} 직무내역서",
+    )
+
+    header_line = "브랜드슬램 (Brandslam)" + (f" · {org_tag}" if org_tag else "") + f" · {position_title}"
+    story = [
+        Paragraph("직무내역서", style_title),
+        Paragraph(header_line, style_sub),
+        Paragraph(f"발행일 {date.today().isoformat()}", style_sub),
+        Spacer(1, 8 * mm),
+    ]
+    if objective:
+        story.append(Paragraph("직무개요", style_h2))
+        story.append(Paragraph(objective, style_body))
+
+    story.append(Paragraph("주요 업무", style_h2))
+    if not categorized_items:
+        story.append(Paragraph("포함된 업무가 없습니다.", style_body))
+    else:
+        for cat, tasks in categorized_items.items():
+            story.append(Paragraph(f"● {cat}", style_cat))
+            tbl_data = [["업무명", "수행 주기"]] + [[t, c] for t, c in tasks]
+            tbl = Table(tbl_data, colWidths=[110 * mm, 40 * mm])
+            tbl.setStyle(TableStyle([
+                ("FONTNAME", (0, 0), (-1, -1), "Nanum"),
+                ("FONTNAME", (0, 0), (-1, 0), "Nanum-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 10),
+                ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#f2f3f5")),
+                ("LINEBELOW", (0, 0), (-1, 0), 0.75, rl_colors.HexColor("#dfe2e8")),
+                ("LINEBELOW", (0, 1), (-1, -1), 0.5, rl_colors.HexColor("#eef0f3")),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]))
+            story.append(tbl)
+
+    story.append(Spacer(1, 14 * mm))
+    story.append(Paragraph("본 문서는 브랜드슬램 내부 OKR 관리 시스템에서 자동 생성되었습니다.", style_foot))
+
+    doc.build(story)
+    return buf.getvalue()
 
 
 # ── 리포트 업로드 → LLM 기반 KPI 자동 추출 ────────────────────
@@ -580,8 +655,8 @@ elif overdue_n:
     st.warning(f"⏰ 기간이 끝난 목표 {overdue_n}건이 상사 확인을 기다리고 있어요. '🗓 마감 PT' 탭에서 리포트를 제출해주세요.")
 
 # ── 탭 (탭마다 폼 key가 겹치지 않도록 ctx를 구분해서 넘김) ────
-tab_okr, tab_list, tab_cal, tab_late, tab_week, tab_confirmed, tab_achieved, tab_closing, tab_history, tab_upload, tab_gallery = st.tabs(
-    ["OKR표", "리스트로 보기", "캘린더 보기", "미달성 KPI 보기", "이번주 수량체크", "협의된 목표 보기", "🏆 달성한 KPI", "🗓 마감 PT", "📜 지난 기록", "📥 리포트 업로드", "🖼 첨부 모아보기"]
+tab_okr, tab_list, tab_cal, tab_late, tab_week, tab_confirmed, tab_achieved, tab_closing, tab_history, tab_upload, tab_gallery, tab_jd = st.tabs(
+    ["OKR표", "리스트로 보기", "캘린더 보기", "미달성 KPI 보기", "이번주 수량체크", "협의된 목표 보기", "🏆 달성한 KPI", "🗓 마감 PT", "📜 지난 기록", "📥 리포트 업로드", "🖼 첨부 모아보기", "📄 직무내역서"]
 )
 
 def build_payload_with_achievement(it, n_qty, n_progress):
@@ -1263,6 +1338,75 @@ with tab_gallery:
             st.markdown("#### 🔗 링크")
             for l in links:
                 st.markdown(f"- [{l.get('label') or l['url']}]({l['url']}) — *{l['person']} · {l['item_title']}*")
+
+# ── 📄 직무내역서 (채용 온보딩용 PDF 출력) ──────────────────────
+with tab_jd:
+    st.caption(
+        "채용 시 지원자에게 그대로 전달할 수 있는 직무내역서를 PDF로 만듭니다. "
+        "카테고리·업무명·수행주기만 담아 심플하게 구성되고, 목표 수량·진행률·급여 등은 포함되지 않습니다."
+    )
+    jd_person = st.selectbox(
+        "어떤 포지션(담당자)의 직무내역서를 만들까요?",
+        PEOPLE_ORDER,
+        index=(PEOPLE_ORDER.index(selected) if selected in PEOPLE_ORDER else 0),
+        key="jd_person_select",
+    )
+    jd_org = ORG.get(jd_person, {})
+    jd_items = items_of(jd_person)
+
+    if not jd_items:
+        st.info(f"{jd_person}님에게 등록된 업무가 아직 없습니다. 'OKR표' 탭에서 업무를 먼저 추가해주세요.")
+    else:
+        st.markdown(f"**{jd_person}** · {jd_org.get('tag','')}")
+        if jd_org.get("objective"):
+            st.caption(f"직무개요 미리보기 · {jd_org['objective']}")
+
+        st.write("")
+        st.markdown("**부분출력용 — 포함할 업무를 개별 체크하세요** (기본: 전체 선택)")
+
+        by_cat_for_ui = {}
+        for it in jd_items:
+            by_cat_for_ui.setdefault(it["category"] or "미분류", []).append(it)
+
+        jd_check_state = {}
+        for cat, tasks in by_cat_for_ui.items():
+            st.markdown(f"##### {cat}")
+            for it in tasks:
+                jd_check_state[it["id"]] = st.checkbox(
+                    f"{it['title']} · {CADENCE_LABEL[it['cadence']]}",
+                    value=True, key=f"jd_chk_{it['id']}",
+                )
+
+        def _jd_group(items_subset):
+            g = {}
+            for it in items_subset:
+                g.setdefault(it["category"] or "미분류", []).append((it["title"], CADENCE_LABEL[it["cadence"]]))
+            return g
+
+        st.divider()
+        jb1, jb2 = st.columns(2)
+
+        pdf_all = build_jd_pdf(jd_person, jd_org.get("tag", ""), jd_org.get("objective", ""), _jd_group(jd_items))
+        jb1.download_button(
+            "📄 직무내역서 전체 출력 (PDF)",
+            data=pdf_all,
+            file_name=f"브랜드슬램_직무내역서_{jd_person}_전체.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+
+        jd_selected_items = [it for it in jd_items if jd_check_state.get(it["id"])]
+        if jd_selected_items:
+            pdf_partial = build_jd_pdf(jd_person, jd_org.get("tag", ""), jd_org.get("objective", ""), _jd_group(jd_selected_items))
+            jb2.download_button(
+                f"📄 선택한 업무만 출력 ({len(jd_selected_items)}건, PDF)",
+                data=pdf_partial,
+                file_name=f"브랜드슬램_직무내역서_{jd_person}_부분.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+        else:
+            jb2.caption("체크된 업무가 없어 부분출력을 만들 수 없습니다.")
 
 st.divider()
 st.caption("브랜드슬램 내부 참고용 · Supabase(okr_org / okr_items) 실시간 연동 · 확정 목표는 관리자만 수정 가능")
