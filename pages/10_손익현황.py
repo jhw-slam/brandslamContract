@@ -1,3 +1,9 @@
+"""
+손익(P&L) 현황 페이지
+- brandslamContract 프로젝트의 pages/ 폴더에 넣으면 됩니다.
+- 파일명은 사이드바 표시 순서에 맞춰 조정하세요 (예: 5_손익현황.py)
+- 기존 streamlit_app.py 와 동일한 SUPA(supabase client) 패턴을 사용합니다.
+"""
 
 import os
 from datetime import date
@@ -10,21 +16,21 @@ st.set_page_config(page_title="손익 현황", layout="wide")
 
 # ── 접근 제어: jhw 전용 ────────────────────────────────────
 # 레일웨이 환경변수 이름이 다르면 아래 os.environ.get() 안의 문자열만 바꿔주세요.
-JHW_PASSWORD = os.environ.get("FINANCE_PASSWORD")
+FINANCE_PASSWORD = os.environ.get("FINANCE_PASSWORD")
 
 if not FINANCE_PASSWORD:
     st.error("❌ FINANCE_PASSWORD 환경변수가 설정되어 있지 않습니다. Railway 환경변수를 확인해주세요.")
     st.stop()
 
-if not st.session_state.get("jhw_authenticated"):
+if not st.session_state.get("finance_authenticated"):
     st.title("🔒 손익 현황 - 접근 제한")
     st.caption("이 페이지는 jhw 전용입니다.")
-    with st.form("jhw_login_form"):
+    with st.form("finance_login_form"):
         pw_input = st.text_input("비밀번호", type="password")
         submitted = st.form_submit_button("입장")
     if submitted:
-        if pw_input == JHW_PASSWORD:
-            st.session_state["jhw_authenticated"] = True
+        if pw_input == FINANCE_PASSWORD:
+            st.session_state["finance_authenticated"] = True
             st.rerun()
         else:
             st.error("비밀번호가 올바르지 않습니다.")
