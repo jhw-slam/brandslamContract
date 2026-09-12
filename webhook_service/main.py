@@ -111,15 +111,22 @@ def process_tiro_event(event: dict):
     resource_type = data.get("resourceType")
     resource_id = data.get("resourceId")
     event_type = event.get("type", "")
+    resource = data.get("resource") or {}
 
-    # Note/NoteSummary 관련 이벤트만 처리 (VoiceFileJob 진행상황 등은 무시)
+    # note.deleted, voicefilejob 진행상황 등은 무시 — 실제 콘텐츠가 없거나 지워진 이벤트
+    if "deleted" in event_type.lower():
+        logger.info(f"무시된 이벤트(삭제됨): type={event_type}, resourceId={resource_id}")
+        return
     if resource_type not in ("Note", "NoteSummary") or not resource_id:
         logger.info(f"무시된 이벤트: type={event_type}, resourceType={resource_type}")
         return
+    # 0초짜리 테스트/빈 녹음은 저장할 내용이 없으므로 건너뜀
+    if isinstance(resource, dict) and resource.get("recordingDurationSeconds") == 0:
+        logger.info(f"무시된 이벤트(녹음 0초): resourceId={resource_id}")
+        return
 
     title = f"Tiro 회의록 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    resource = data.get("resource") or {}
-    if isinstance(resource, dict) and resource.get("title"):
+    if isinstance(resource, dict) and resource.get("title") and resource["title"] != "Untitled":
         title = resource["title"]
 
     raw_text, tiro_summary = "", ""
