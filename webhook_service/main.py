@@ -18,37 +18,32 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")  # service_role 키 (RLS 우회, 서버 전용)
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
-TIRO_API_KEY = os.environ.get("TIRO_API_KEY")  # platform.tiro.ooo/me/api-keys 에서 발급 (점 포함 전체 키)
+TIRO_API_KEY = os.environ.get("TIRO_API_KEY")  # platform.tiro.ooo/me/api-keys 에서 발급 (점 포함 전체 키). 전사 원문(paragraphs)까지 가져오고 싶을 때만 필요.
 TIRO_WEBHOOK_SECRET = os.environ.get("TIRO_WEBHOOK_SECRET")
 
 TIRO_API_BASE = "https://api.tiro.ooo"
 
 if not (SUPABASE_URL and SUPABASE_KEY and ANTHROPIC_API_KEY):
     logger.warning("SUPABASE_URL / SUPABASE_KEY / ANTHROPIC_API_KEY 중 누락된 값이 있습니다.")
-if not TIRO_API_KEY:
-    logger.warning("TIRO_API_KEY가 없습니다 — 웹훅만으로는 실제 전사/요약 본문을 받을 수 없어 API로 재조회해야 합니다.")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
-# ── Tiro REST API 조회 ──────────────────────────────────────
-# 중요: Tiro 웹훅은 "무슨 일이 일어났다"는 이벤트(메타데이터)만 보내고,
-# 실제 전사(paragraphs)·요약(summaries) 본문은 웹훅 payload에 들어있지 않습니다.
-# (Tiro 공식 문서: "Webhook events carry metadata only ... Retrieve large content
-#  such as transcripts and scripts from the separate APIs.")
-# 그래서 webhook을 "트리거"로만 쓰고, 실제 내용은 noteGuid로 API를 다시 호출해서 가져와야 합니다.
-def fetch_tiro_note_content(note_guid: str):
+# ── (선택) Tiro REST API로 전사 원문 조회 ───────────────────────
+# note_summary.generated 이벤트에는 Tiro가 만든 요약문이 이미 들어있어서 이 호출 없이도
+# 동작한다. 원문 전사(발화 그대로)까지 DB에 남기고 싶을 때만 노트 guid로 재조회한다.
+# 반드시 진짜 노트 guid(resource.noteGuid / resource.note.guid)를 넣어야 하며,
+# NoteSummary 이벤트의 data.resourceId(요약 자체의 id)를 넣으면 404가 난다.
+def fetch_tiro_paragraphs(note_guid: str) -> str:
+    if not TIRO_API_KEY or not note_guid:
+        return ""
     headers = {"Authorization": f"Bearer {TIRO_API_KEY}"}
-    transcript_text = ""
-    tiro_summary_text = ""
-
-    with httpx.Client(timeout=15) as client:
-        try:
+    try:
+        with httpx.Client(timeout=15) as client:
             r = client.get(f"{TIRO_API_BASE}/v1/external/notes/{note_guid}/paragraphs", headers=headers)
             r.raise_for_status()
             paragraphs = r.json()
-            # 응답 형태가 리스트인지 {items:[...]}인지는 실제 응답을 raw_payload로 확인 후 맞춰야 함.
             items = paragraphs if isinstance(paragraphs, list) else paragraphs.get("items", paragraphs.get("data", []))
             texts = []
             for p in items or []:
@@ -56,41 +51,24 @@ def fetch_tiro_note_content(note_guid: str):
                     texts.append(p.get("text") or p.get("content") or "")
                 else:
                     texts.append(str(p))
-            transcript_text = "\n".join(t for t in texts if t)
-        except Exception:
-            logger.exception(f"paragraphs 조회 실패 (note_guid={note_guid})")
-
-        try:
-            r = client.get(f"{TIRO_API_BASE}/v1/external/notes/{note_guid}/summaries", headers=headers)
-            r.raise_for_status()
-            summaries = r.json()
-            items = summaries if isinstance(summaries, list) else summaries.get("items", summaries.get("data", []))
-            if items:
-                first = items[0]
-                tiro_summary_text = first.get("text") or first.get("content") or str(first)
-        except Exception:
-            logger.exception(f"summaries 조회 실패 (note_guid={note_guid})")
-
-    return transcript_text, tiro_summary_text
+            return "\n".join(t for t in texts if t)
+    except Exception:
+        logger.exception(f"paragraphs 조회 실패 (note_guid={note_guid}) — 실패해도 Tiro 요약은 그대로 저장됨")
+        return ""
 
 
-def split_summary(claude_text: str):
-    match = re.search(r"(?:^|\n)\s*3\.\s*Action Items?(.*)", claude_text, re.IGNORECASE | re.DOTALL)
-    if match:
-        return claude_text[: match.start()].strip(), match.group(1).strip()
-    return claude_text.strip(), None
+def summarize_with_claude(tiro_summary_md: str):
+    """Tiro가 만든 요약(마크다운)을 우리 포맷(요약/결정사항/Action Items)으로 재정리."""
+    prompt = f"""다음은 Tiro가 회의 녹음을 보고 만든 요약문이야. 이걸 보고 핵심 내용과 Action Item을 정리해줘.
 
-
-def summarize_with_claude(raw_text: str):
-    prompt = f"""다음 회의 녹음 텍스트를 보고 핵심 내용과 Action Item을 정리해줘.
-
-[회의 내용]
-{raw_text}
+[Tiro 요약]
+{tiro_summary_md}
 
 [출력 형식]
+제목: (10자 내외 짧은 제목)
 1. 회의 요약 (3~5줄 이내)
 2. 주요 결정사항
-3. Action Items (담당자 및 할 일)
+3. Action Items (담당자 및 할 일 — 담당자를 알 수 없으면 "미정"이라고 표기)
 """
     response = anthropic.messages.create(
         model=CLAUDE_MODEL,
@@ -100,56 +78,68 @@ def summarize_with_claude(raw_text: str):
     return response.content[0].text
 
 
+def parse_claude_output(claude_text: str):
+    title = None
+    title_match = re.search(r"제목:\s*(.+)", claude_text)
+    if title_match:
+        title = title_match.group(1).strip()
+        claude_text = claude_text[: title_match.start()] + claude_text[title_match.end():]
+
+    action_match = re.search(r"(?:^|\n)\s*3\.\s*Action Items?(.*)", claude_text, re.IGNORECASE | re.DOTALL)
+    if action_match:
+        summary = claude_text[: action_match.start()].strip()
+        action_items = action_match.group(1).strip()
+    else:
+        summary, action_items = claude_text.strip(), None
+    return title, summary, action_items
+
+
 def process_tiro_event(event: dict):
     """
     Tiro 웹훅 이벤트 처리.
-    event 구조 (Tiro 공식 문서 기준):
-      { "id", "type", "createdAt", "workspaceGuid",
-        "data": { "resourceType", "resourceId", "resource": {...} } }
+
+    실제로 확인된 사실:
+    - note.created / note.ended / note.recording.completed / note.participants.updated
+      등은 메타데이터 이벤트일 뿐, 회의 내용이 없다. → 무시.
+    - note_summary.generated 이벤트에만 실제 요약 콘텐츠가 들어있다:
+        data.resource.content.content   → Tiro가 만든 요약 원문(마크다운)
+        data.resource.noteGuid / data.resource.note.guid → 진짜 노트 ID
+      (data.resourceId는 요약 자체의 id이지 노트 id가 아니므로 API 조회에 쓰면 안 됨)
     """
     data = event.get("data", {}) or {}
-    resource_type = data.get("resourceType")
-    resource_id = data.get("resourceId")
     event_type = event.get("type", "")
     resource = data.get("resource") or {}
 
-    # note.deleted, voicefilejob 진행상황 등은 무시 — 실제 콘텐츠가 없거나 지워진 이벤트
-    if "deleted" in event_type.lower():
-        logger.info(f"무시된 이벤트(삭제됨): type={event_type}, resourceId={resource_id}")
+    if event_type != "note_summary.generated":
+        logger.info(f"무시된 이벤트(콘텐츠 없음): type={event_type}")
         return
-    if resource_type not in ("Note", "NoteSummary") or not resource_id:
-        logger.info(f"무시된 이벤트: type={event_type}, resourceType={resource_type}")
+
+    tiro_summary_md = ((resource.get("content") or {}).get("content") or "").strip()
+    note_guid = resource.get("noteGuid") or (resource.get("note") or {}).get("guid")
+
+    if not tiro_summary_md:
+        logger.warning(f"note_summary.generated인데 content가 비어있음: note_guid={note_guid}")
         return
-    # 0초짜리 테스트/빈 녹음은 저장할 내용이 없으므로 건너뜀
-    if isinstance(resource, dict) and resource.get("recordingDurationSeconds") == 0:
-        logger.info(f"무시된 이벤트(녹음 0초): resourceId={resource_id}")
-        return
+
+    # 전사 원문은 선택 사항 (TIRO_API_KEY 있을 때만 시도, 실패해도 무시하고 계속 진행)
+    raw_transcript = fetch_tiro_paragraphs(note_guid)
 
     title = f"Tiro 회의록 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    if isinstance(resource, dict) and resource.get("title") and resource["title"] != "Untitled":
-        title = resource["title"]
-
-    raw_text, tiro_summary = "", ""
-    if TIRO_API_KEY:
-        raw_text, tiro_summary = fetch_tiro_note_content(resource_id)
-
-    summary, action_items = "", None
-    if raw_text:
-        try:
-            claude_text = summarize_with_claude(raw_text)
-            summary, action_items = split_summary(claude_text)
-        except Exception:
-            logger.exception("Claude 요약 실패 — Tiro 자체 요약으로 대체")
-            summary = tiro_summary or ""
-    else:
-        # 본문을 못 가져온 경우에도, 나중에 원인 분석이 가능하도록 이벤트 자체는 저장해둔다.
-        summary = tiro_summary or "(전사 본문을 가져오지 못했습니다 — raw_payload로 원본 이벤트를 확인하세요)"
+    summary, action_items = tiro_summary_md, None
+    try:
+        claude_text = summarize_with_claude(tiro_summary_md)
+        parsed_title, parsed_summary, parsed_action_items = parse_claude_output(claude_text)
+        if parsed_title:
+            title = parsed_title
+        summary, action_items = parsed_summary, parsed_action_items
+    except Exception:
+        logger.exception("Claude 재정리 실패 — Tiro 원본 요약을 그대로 저장")
 
     try:
         supabase.table("meetings").insert(
             {
                 "title": title,
-                "raw_transcript": raw_text or str(event),
+                "raw_transcript": raw_transcript or tiro_summary_md,
                 "summary": summary,
                 "action_items": action_items,
                 "meeting_date": datetime.now(timezone.utc).isoformat(),
@@ -157,7 +147,7 @@ def process_tiro_event(event: dict):
                 "raw_payload": event,
             }
         ).execute()
-        logger.info(f"Saved meeting: {title}")
+        logger.info(f"Saved meeting: {title} (note_guid={note_guid})")
     except Exception:
         logger.exception(f"Supabase 저장 실패 (title={title})")
 
