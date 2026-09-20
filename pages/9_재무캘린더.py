@@ -866,34 +866,32 @@ elif menu == "🏦 뱅크다 연동":
                     r["_dup"] = h in existing_hashes_hist
                     r["_payroll"] = _looks_like_payroll_hist(r["desc"])
 
-                st.caption(f"**{account_label_hist.strip()}** · 총 {len(parsed)}건 인식됨")
-                sel_hist = []
-                for i, r in enumerate(parsed):
-                    reasons = []
-                    if r["_payroll"]:
-                        reasons.append("제외 대상(급여)")
-                    if r["_dup"]:
-                        reasons.append("이미 등록된 것과 중복")
-                    default_check = not (r["_payroll"] or r["_dup"])
-                    c1, c2 = st.columns([0.5, 5.5])
-                    checked = c1.checkbox("포함", value=default_check, key=f"histrow_{i}", label_visibility="collapsed")
-                    tag = "받을" if r["direction"] == "in" else "나갈"
-                    reason_txt = f" — {' · '.join(reasons)}" if reasons else ""
-                    c2.write(f"{r['due_date'] or '날짜불명'} · {tag} · ₩{r['amount']:,.0f} · {r['desc']}{reason_txt}")
-                    sel_hist.append(checked)
+                n_total = len(parsed)
+                n_payroll = sum(1 for r in parsed if r["_payroll"])
+                n_dup = sum(1 for r in parsed if r["_dup"] and not r["_payroll"])
+                n_target = n_total - n_payroll
 
-                n_keep_hist = sum(sel_hist)
-                if st.button(f"✅ 체크된 {n_keep_hist}건 등록", type="primary", key="hist_confirm_btn", disabled=n_keep_hist == 0):
-                    rows_to_insert_hist = []
-                    for keep, r in zip(sel_hist, parsed):
-                        if not keep:
-                            continue
-                        rows_to_insert_hist.append({
-                            "direction": r["direction"], "amount": r["amount"],
-                            "txn_date": r["due_date"], "txn_datetime": r.get("raw_dt"),
-                            "description": r["desc"] or None, "account_label": account_label_hist.strip(),
-                            "dedup_hash": r["_hash"], "source": "manual_upload",
-                        })
+                sc1, sc2, sc3, sc4 = st.columns(4)
+                sc1.metric("인식된 거래", f"{n_total:,}건")
+                sc2.metric("급여 제외", f"{n_payroll:,}건")
+                sc3.metric("중복 예상(자동 skip)", f"{n_dup:,}건")
+                sc4.metric("등록 시도", f"{n_target:,}건")
+
+                st.caption(f"**{account_label_hist.strip()}** · 아래는 확인용 샘플 15건입니다 (날짜·금액·적요가 제대로 읽혔는지만 확인하세요).")
+                sample_df = pd.DataFrame([{
+                    "날짜": r["due_date"] or "-", "구분": "받을" if r["direction"] == "in" else "나갈",
+                    "금액": f"₩{r['amount']:,.0f}", "적요": r["desc"],
+                    "비고": "급여제외" if r["_payroll"] else ("중복예상" if r["_dup"] else ""),
+                } for r in parsed[:15]])
+                st.dataframe(sample_df, hide_index=True, use_container_width=True)
+
+                if st.button(f"✅ 급여 제외하고 {n_target:,}건 한 번에 등록", type="primary", key="hist_confirm_btn", disabled=n_target == 0):
+                    rows_to_insert_hist = [{
+                        "direction": r["direction"], "amount": r["amount"],
+                        "txn_date": r["due_date"], "txn_datetime": r.get("raw_dt"),
+                        "description": r["desc"] or None, "account_label": account_label_hist.strip(),
+                        "dedup_hash": r["_hash"], "source": "manual_upload",
+                    } for r in parsed if not r["_payroll"]]
                     actually_added_hist = 0
                     if rows_to_insert_hist:
                         res_hist = SUPA.table("bank_transactions").upsert(
