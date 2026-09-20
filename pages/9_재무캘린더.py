@@ -1,7 +1,10 @@
 import os
+import io
+import re
 import json
 import base64
 import hashlib
+import zipfile
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -462,6 +465,21 @@ elif menu == "🏦 뱅크다 연동":
         )
         st.stop()
 
+    # ── 최근 동기화 결과 (버튼 누른 뒤 바로 여기서 확인) ──────
+    recent_logs = SUPA.table("bankda_sync_log").select("*").order("called_at", desc=True).limit(5).execute().data
+    if recent_logs:
+        st.markdown("**📋 최근 동기화 결과**")
+        for lg in recent_logs:
+            ok = not lg.get("error_code")
+            when = lg["called_at"][:16].replace("T", " ")
+            period = f"{lg.get('datefrom','?')}~{lg.get('dateto','?')}"
+            if ok:
+                st.success(f"{when} · 조회기간 {period} · 조회 {lg.get('record_count',0)}건 · 신규저장 {lg.get('new_count',0)}건")
+            else:
+                st.error(f"{when} · 조회기간 {period} · 오류[{lg.get('error_code')}]: {lg.get('error_message')}")
+        st.caption("결과가 '조회 O건 · 신규저장 0건'이면 실패가 아니라, 이미 저장된 거래라 중복을 걸러낸 것입니다. 실제 데이터는 '📊 대시보드' · '🔗 전체 매칭 현황' 탭에서 확인하세요.")
+        st.divider()
+
     # ── 계좌 라벨 매핑 관리 ──────────────────────────────────
     # 뱅크다가 돌려주는 accountnum마다, 기존에 수동 업로드에서 쓰던 계좌 이름(account_label)을
     # 매핑해둬야 대시보드 표시·dedup이 기존 데이터와 어긋나지 않는다.
@@ -599,6 +617,295 @@ elif menu == "🏦 뱅크다 연동":
             msg += f" · 이미 있던 {skipped}건은 중복이라 건너뜀"
         st.success(msg)
         refresh()
+
+    # ════════════════════════════════════════════════════════
+    # 📥 과거 거래내역 일괄 업로드 (뱅크다가 못 가져오는 기간을 은행 파일로 보충)
+    # ════════════════════════════════════════════════════════
+    st.divider()
+    st.markdown("### 📥 과거 거래내역 일괄 업로드")
+    st.caption(
+        "뱅크다는 최근 데이터만 가져올 수 있어서, 예전 내역은 은행에서 받은 엑셀/CSV 파일을 직접 올려야 합니다. "
+        "SC제일은행·기업은행처럼 은행마다 파일 형식이 달라도 자동으로 인식합니다. 위 계좌 라벨과 이름을 맞춰서 올리면 "
+        "뱅크다로 가져온 데이터와 한 화면에서 같이 보이고, 20만원 미만 자동분류도 동일하게 적용됩니다."
+    )
+
+    STAFF_PAYROLL_NAMES_HIST = ["김선재", "정다영", "양혜준", "구정회", "박솔", "장현우"]
+    _COLKEY_HIST = {
+        "date": ["거래일시", "거래일자", "거래일", "일자", "날짜", "이용일자", "승인일자"],
+        "deposit": ["입금액", "입금", "맡기신금액", "들어온금액"],
+        "withdraw": ["출금액", "출금", "찾으신금액", "나간금액", "이용금액"],
+        "desc": ["거래내용", "내용", "적요", "거래구분", "받으신분", "보내신분", "가맹점명", "메모", "비고"],
+    }
+
+    def _find_col_hist(columns, keys):
+        for col in columns:
+            c = re.sub(r"\s+", "", str(col).strip())
+            for k in keys:
+                if k in c:
+                    return col
+        return None
+
+    def _looks_like_payroll_hist(desc):
+        s = re.sub(r"\s+", "", (desc or ""))
+        return any(name in s for name in STAFF_PAYROLL_NAMES_HIST)
+
+    def _unescape_x_hist(s):
+        if not isinstance(s, str):
+            return s
+        return re.sub(r"_x([0-9A-Fa-f]{4})_", lambda m: chr(int(m.group(1), 16)), s)
+
+    # SC제일은행: applyNumberForm 오타 / 기업은행: styleId, xfid 소문자 — 둘 다 styles.xml 패치로 해결
+    def _fix_xlsx_style_bug_hist(data: bytes) -> bytes:
+        try:
+            zin = zipfile.ZipFile(io.BytesIO(data))
+            buf = io.BytesIO()
+            zout = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+            changed = False
+            for item in zin.infolist():
+                content = zin.read(item.filename)
+                if item.filename == "xl/styles.xml":
+                    orig = content
+                    content = content.replace(b"applyNumberForm=", b"applyNumberFormat=")
+                    content = re.sub(rb'\s+styleId="[^"]*"', b"", content)
+                    content = content.replace(b"xfid=", b"xfId=")
+                    if content != orig:
+                        changed = True
+                zout.writestr(item, content)
+            zout.close()
+            return buf.getvalue() if changed else data
+        except Exception:
+            return data
+
+    _HEADER_DATE_KW_HIST = ("거래일시", "거래일자", "거래일", "일자", "날짜")
+    _HEADER_AMT_KW_HIST = ("찾으신", "맡기신", "출금", "입금")
+
+    def _find_table_header_row_hist(raw_df, max_scan=60):
+        for i in range(min(max_scan, len(raw_df))):
+            cells = [str(x) for x in raw_df.iloc[i].tolist() if str(x) != "nan"]
+            joined = "".join(cells)
+            if any(k in joined for k in _HEADER_DATE_KW_HIST) and any(k in joined for k in _HEADER_AMT_KW_HIST):
+                return i
+        return None
+
+    def _date_ok_hist(v):
+        try:
+            return pd.notna(pd.to_datetime(str(v)[:19], errors="coerce"))
+        except Exception:
+            return False
+
+    def _date_count_hist(series):
+        return sum(1 for v in series.dropna() if _date_ok_hist(v))
+
+    def _numeric_count_hist(series):
+        n = 0
+        for v in series.dropna():
+            try:
+                float(str(v).replace(",", "")); n += 1
+            except Exception:
+                pass
+        return n
+
+    def _hangul_total_hist(series):
+        return sum(len(re.findall(r"[가-힣]", str(v))) for v in series.dropna())
+
+    def _guess_headerless_columns_hist(raw_df):
+        cols = list(raw_df.columns)
+        if not cols:
+            return None
+        dcounts = {c: _date_count_hist(raw_df[c]) for c in cols}
+        c_date = max(dcounts, key=dcounts.get)
+        if dcounts[c_date] < 3:
+            return None
+        numeric_cols = [c for c in cols if c != c_date and _numeric_count_hist(raw_df[c]) >= max(3, len(raw_df) // 4)]
+        numeric_cols = sorted(numeric_cols, key=lambda c: cols.index(c))
+        if len(numeric_cols) < 2:
+            return None
+        c_wd, c_dep = numeric_cols[0], numeric_cols[1]
+        text_cols = [c for c in cols if c not in (c_date, c_wd, c_dep)]
+        text_cols_scored = sorted(text_cols, key=lambda c: -_hangul_total_hist(raw_df[c]))
+        c_desc = text_cols_scored[0] if text_cols_scored else None
+        return c_date, c_wd, c_dep, c_desc
+
+    def _extract_rows_from_sheet_hist(df, c_date, c_wd, c_dep, c_desc):
+        out = []
+        for _, r in df.iterrows():
+            dv = r.get(c_date)
+            if not _date_ok_hist(dv):
+                continue
+            wd, dep = 0.0, 0.0
+            try:
+                wd = float(str(r.get(c_wd, 0)).replace(",", "")) if c_wd is not None else 0.0
+            except Exception:
+                pass
+            try:
+                dep = float(str(r.get(c_dep, 0)).replace(",", "")) if c_dep is not None else 0.0
+            except Exception:
+                pass
+            if wd == 0 and dep == 0:
+                continue
+            direction, amount = ("out", int(abs(wd))) if wd > dep else ("in", int(abs(dep)))
+            d = pd.to_datetime(str(dv)[:19], errors="coerce")
+            due = d.date().isoformat() if pd.notna(d) else None
+            desc = _unescape_x_hist(str(r.get(c_desc, "")).strip()) if c_desc is not None else ""
+            raw_dt = str(dv).strip()
+            out.append({"direction": direction, "amount": amount, "due_date": due, "desc": desc, "raw_dt": raw_dt})
+        return out
+
+    _ACCOUNT_NO_RE_HIST = re.compile(r"\d{2,4}-\d{1,3}-\d{4,8}")
+
+    def _detect_account_no_hist(raw_df, max_scan=30):
+        for i in range(min(max_scan, len(raw_df))):
+            for cell in raw_df.iloc[i].tolist():
+                s = str(cell)
+                if "계좌" in s or "account" in s.lower():
+                    m = _ACCOUNT_NO_RE_HIST.search(s)
+                    if m:
+                        return m.group()
+            row_joined = " ".join(str(c) for c in raw_df.iloc[i].tolist())
+            if "계좌" in row_joined:
+                m = _ACCOUNT_NO_RE_HIST.search(row_joined)
+                if m:
+                    return m.group()
+        return None
+
+    def read_and_parse_bank_file_hist(uploaded_file):
+        name = uploaded_file.name.lower()
+        all_rows, sheet_info, detected_account_no = [], [], None
+        if name.endswith(".xlsx"):
+            data = _fix_xlsx_style_bug_hist(uploaded_file.getvalue())
+            xls = pd.ExcelFile(io.BytesIO(data))
+            for sheetname in xls.sheet_names:
+                raw = pd.read_excel(xls, sheet_name=sheetname, header=None)
+                if detected_account_no is None:
+                    detected_account_no = _detect_account_no_hist(raw)
+                hidx = _find_table_header_row_hist(raw)
+                if hidx is not None:
+                    header = [str(x).strip() if str(x) != "nan" else f"col_{i}" for i, x in enumerate(raw.iloc[hidx].tolist())]
+                    df = raw.iloc[hidx + 1:].copy()
+                    df.columns = header
+                    c_date = _find_col_hist(df.columns, _COLKEY_HIST["date"])
+                    c_dep = _find_col_hist(df.columns, _COLKEY_HIST["deposit"])
+                    c_wd = _find_col_hist(df.columns, _COLKEY_HIST["withdraw"])
+                    c_desc = _find_col_hist(df.columns, _COLKEY_HIST["desc"])
+                    if c_date is None or (c_dep is None and c_wd is None):
+                        guess = _guess_headerless_columns_hist(df)
+                        if guess:
+                            c_date, c_wd, c_dep, c_desc = guess
+                else:
+                    guess = _guess_headerless_columns_hist(raw)
+                    if not guess:
+                        continue
+                    c_date, c_wd, c_dep, c_desc = guess
+                    df = raw
+                if c_date is None or (c_wd is None and c_dep is None):
+                    continue
+                rows = _extract_rows_from_sheet_hist(df, c_date, c_wd, c_dep, c_desc)
+                if rows:
+                    all_rows.extend(rows)
+                    sheet_info.append(f"{sheetname}({len(rows)}건)")
+        else:
+            raw = pd.read_csv(io.BytesIO(uploaded_file.getvalue()), encoding="utf-8-sig", header=None)
+            detected_account_no = _detect_account_no_hist(raw)
+            hidx = _find_table_header_row_hist(raw)
+            if hidx is not None:
+                header = [str(x).strip() if str(x) != "nan" else f"col_{i}" for i, x in enumerate(raw.iloc[hidx].tolist())]
+                df = raw.iloc[hidx + 1:].copy(); df.columns = header
+            else:
+                df = raw.copy(); df.columns = [str(c).strip() for c in raw.iloc[0].tolist()]; df = df.iloc[1:]
+            c_date = _find_col_hist(df.columns, _COLKEY_HIST["date"])
+            c_dep = _find_col_hist(df.columns, _COLKEY_HIST["deposit"])
+            c_wd = _find_col_hist(df.columns, _COLKEY_HIST["withdraw"])
+            c_desc = _find_col_hist(df.columns, _COLKEY_HIST["desc"])
+            if c_date is not None and (c_dep is not None or c_wd is not None):
+                all_rows = _extract_rows_from_sheet_hist(df, c_date, c_wd, c_dep, c_desc)
+                sheet_info = [f"CSV({len(all_rows)}건)"]
+
+        if not all_rows:
+            return None, "거래 데이터를 찾지 못했습니다. 파일 형식을 확인해주세요.", None
+        return all_rows, " · ".join(sheet_info), detected_account_no
+
+    def compute_dedup_hash_hist(account_label, direction, amount, dt_str, desc):
+        raw = f"{account_label or ''}|{direction}|{amount}|{dt_str or ''}|{desc or ''}"
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+    hist_up = st.file_uploader("과거 계좌 거래내역 (.csv / .xlsx)", type=["csv", "xlsx"], key="hist_bank_up")
+    if hist_up is not None:
+        try:
+            parsed, info_or_err, detected_acc = read_and_parse_bank_file_hist(hist_up)
+        except Exception as ex:
+            parsed, info_or_err, detected_acc = None, f"파일을 읽지 못했습니다: {ex}", None
+
+        if parsed is None:
+            st.error(info_or_err)
+        else:
+            existing_accounts = sorted(set(label_map.values()) | {t.get("account_label") for t in bank_txns if t.get("account_label")})
+            default_label = None
+            if detected_acc:
+                matches = [a for a in existing_accounts if detected_acc in a]
+                default_label = matches[0] if matches else None
+                st.info(f"📎 파일에서 계좌번호를 찾았어요: **{detected_acc}**" +
+                        (f" — 기존 '{default_label}'과 같은 계좌로 보여요." if default_label else " — 새 계좌인 것 같아요, 이름을 확인해주세요."))
+            acc_opts = existing_accounts + ["+ 새 계좌 이름 직접 입력"]
+            default_index = acc_opts.index(default_label) if default_label in acc_opts else len(acc_opts) - 1
+            acc_pick = st.selectbox("이 파일은 어느 계좌 것인가요?", acc_opts, index=default_index, key="hist_acc_pick")
+            account_label_hist = (
+                st.text_input("계좌 이름 입력", value=(detected_acc or ""), placeholder="예: SC제일은행, 기업은행", key="hist_acc_text")
+                if acc_pick == "+ 새 계좌 이름 직접 입력" else acc_pick
+            )
+
+            st.caption(f"시트별 인식 현황: {info_or_err}")
+            if not parsed:
+                st.warning("입금/출금 금액이 있는 행을 찾지 못했습니다.")
+            elif not account_label_hist.strip():
+                st.warning("계좌 이름을 입력해주세요.")
+            else:
+                existing_hashes_hist = {t.get("dedup_hash") for t in bank_txns if t.get("dedup_hash")}
+                for r in parsed:
+                    h = compute_dedup_hash_hist(account_label_hist.strip(), r["direction"], r["amount"], r.get("raw_dt") or r.get("due_date"), r["desc"])
+                    r["_hash"] = h
+                    r["_dup"] = h in existing_hashes_hist
+                    r["_payroll"] = _looks_like_payroll_hist(r["desc"])
+
+                st.caption(f"**{account_label_hist.strip()}** · 총 {len(parsed)}건 인식됨")
+                sel_hist = []
+                for i, r in enumerate(parsed):
+                    reasons = []
+                    if r["_payroll"]:
+                        reasons.append("제외 대상(급여)")
+                    if r["_dup"]:
+                        reasons.append("이미 등록된 것과 중복")
+                    default_check = not (r["_payroll"] or r["_dup"])
+                    c1, c2 = st.columns([0.5, 5.5])
+                    checked = c1.checkbox("포함", value=default_check, key=f"histrow_{i}", label_visibility="collapsed")
+                    tag = "받을" if r["direction"] == "in" else "나갈"
+                    reason_txt = f" — {' · '.join(reasons)}" if reasons else ""
+                    c2.write(f"{r['due_date'] or '날짜불명'} · {tag} · ₩{r['amount']:,.0f} · {r['desc']}{reason_txt}")
+                    sel_hist.append(checked)
+
+                n_keep_hist = sum(sel_hist)
+                if st.button(f"✅ 체크된 {n_keep_hist}건 등록", type="primary", key="hist_confirm_btn", disabled=n_keep_hist == 0):
+                    rows_to_insert_hist = []
+                    for keep, r in zip(sel_hist, parsed):
+                        if not keep:
+                            continue
+                        rows_to_insert_hist.append({
+                            "direction": r["direction"], "amount": r["amount"],
+                            "txn_date": r["due_date"], "txn_datetime": r.get("raw_dt"),
+                            "description": r["desc"] or None, "account_label": account_label_hist.strip(),
+                            "dedup_hash": r["_hash"], "source": "manual_upload",
+                        })
+                    actually_added_hist = 0
+                    if rows_to_insert_hist:
+                        res_hist = SUPA.table("bank_transactions").upsert(
+                            rows_to_insert_hist, on_conflict="dedup_hash", ignore_duplicates=True
+                        ).execute()
+                        actually_added_hist = len(res_hist.data) if res_hist.data is not None else len(rows_to_insert_hist)
+                    skipped_hist = len(rows_to_insert_hist) - actually_added_hist
+                    msg = f"{actually_added_hist}건 새로 등록됨 ✓"
+                    if skipped_hist > 0:
+                        msg += f" · 이미 있던 {skipped_hist}건은 중복이라 건너뜀"
+                    st.success(msg)
+                    refresh()
 
 
 # ════════════════════════════════════════════════════════════
