@@ -27,15 +27,13 @@ FINANCE_PASSWORD = os.environ.get("FINANCE_PASSWORD")
 st.title("💹 재무캘린더")
 st.caption("계정과목별 현금흐름 · 전체 매칭 관리자 모드 · 실시간 손익계산서 — 접근 제한 페이지")
 
-if not st.session_state.get("finance_ok"):
+if FINANCE_PASSWORD and not st.session_state.get("finance_ok"):
     st.warning("🔒 이 페이지는 장현우 전용입니다. 이메일과 비밀번호를 입력해주세요.")
     fc1, fc2 = st.columns(2)
     email_in = fc1.text_input("이메일", placeholder=FINANCE_ADMIN_EMAIL)
     pw_in = fc2.text_input("비밀번호", type="password")
     if st.button("재무캘린더 입장"):
-        if not FINANCE_PASSWORD:
-            st.error("서버에 FINANCE_PASSWORD 환경변수가 설정되어 있지 않습니다. Railway 환경변수를 추가해주세요.")
-        elif email_in.strip().lower() == FINANCE_ADMIN_EMAIL and pw_in == FINANCE_PASSWORD:
+        if email_in.strip().lower() == FINANCE_ADMIN_EMAIL and pw_in == FINANCE_PASSWORD:
             st.session_state.finance_ok = True
             st.rerun()
         else:
