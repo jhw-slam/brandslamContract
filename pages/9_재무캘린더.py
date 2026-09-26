@@ -60,8 +60,10 @@ SUPA = sb()
 TYPE_LABELS = {
     "revenue": "매출", "cost_cogs": "매출원가", "cost_sga": "판관비",
     "labor": "인건비", "tax": "세금", "other": "영업외/기타",
+    "transfer": "계좌간 이동(내부이체, 손익계산서 제외)",
 }
 TYPE_ORDER = ["revenue", "cost_cogs", "cost_sga", "labor", "tax", "other"]
+SETTINGS_TYPE_OPTIONS = TYPE_ORDER + ["transfer"]
 
 
 @st.cache_data(ttl=45)
@@ -247,6 +249,10 @@ if menu == "📊 대시보드":
     if not unclassified.empty:
         st.markdown(f"**미분류** — 합계 ₩{unclassified['amount'].sum():,.0f} ({len(unclassified)}건)")
 
+    internal_transfer = b_view[b_view["cat_type"] == "transfer"]
+    if not internal_transfer.empty:
+        st.caption(f"🔁 계좌간 자금이동(내부이체) {len(internal_transfer)}건, 합계 ₩{internal_transfer['amount'].sum():,.0f} — 매출/매입 아니므로 위 집계와 손익계산서에서 항상 제외됨")
+
     st.divider()
     st.subheader("📌 미수금 / 미지급금 (송금캘린더 cash_events 기준)")
     tab_ar, tab_ap = st.tabs(["미수금 (받을 돈)", "미지급금 (줄 돈)"])
@@ -371,8 +377,9 @@ elif menu == "🔗 전체 매칭 현황":
                     mt = row["matched_title"] if pd.notna(row["matched_title"]) else ""
                     match_info = f"🔗 매칭됨: {mb} · {mt}"
                 sus = " · ⚠️중복의심" if row["is_dup_suspect"] else ""
+                xfer = " · 🔁내부이체" if row["cat_type"] == "transfer" else ""
                 d = row["txn_date"].strftime("%Y-%m-%d") if pd.notna(row["txn_date"]) else "-"
-                rc1.markdown(f"**{'입금' if row['direction']=='in' else '출금'}** · {d} · ₩{row['amount']:,.0f}\n\n{row['description'] or ''}  {match_info}{sus}")
+                rc1.markdown(f"**{'입금' if row['direction']=='in' else '출금'}** · {d} · ₩{row['amount']:,.0f}\n\n{row['description'] or ''}  {match_info}{sus}{xfer}")
                 cur_idx = cat_opts.index(row["cat_name"]) if row["cat_name"] in cat_opts else 0
                 chosen = rc2.selectbox("계정과목", options=cat_opts, index=cur_idx, key=f"bankcat_{row['id']}", label_visibility="collapsed")
                 if rc3.button("저장", key=f"bankassign_{row['id']}"):
@@ -627,7 +634,7 @@ elif menu == "⚙️ 계정과목 설정":
         num_rows="dynamic",
         column_config={
             "id": None,
-            "type": st.column_config.SelectboxColumn(options=TYPE_ORDER),
+            "type": st.column_config.SelectboxColumn(options=SETTINGS_TYPE_OPTIONS),
             "is_active": st.column_config.CheckboxColumn("사용"),
             "sort_order": st.column_config.NumberColumn(),
         },
