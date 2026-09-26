@@ -70,6 +70,48 @@ TYPE_ORDER = ["revenue", "cost_cogs", "cost_sga", "labor", "tax", "other"]
 SETTINGS_TYPE_OPTIONS = TYPE_ORDER + ["transfer", "balance_sheet"]
 
 
+def compute_pl(pl_df):
+    """기간별 bank_df(계정과목 매핑 완료본)를 받아 손익계산서 수치를 계산한다.
+    📄 손익계산서 탭과 📝 CFO 인사이트 탭이 공용으로 사용."""
+    def line_items(t, expense_side=True):
+        sub = pl_df[pl_df["cat_type"] == t]
+        grp = sub.groupby(["direction", "cat_name"])["amount"].sum().reset_index()
+        result = {}
+        for _, r in grp.iterrows():
+            sign = 1 if (r["direction"] == "out") == expense_side else -1
+            result[r["cat_name"]] = result.get(r["cat_name"], 0) + sign * r["amount"]
+        return result
+
+    rev_items = line_items("revenue", expense_side=False)
+    cogs_items = line_items("cost_cogs", expense_side=True)
+    sga_items = line_items("cost_sga", expense_side=True)
+    labor_items = line_items("labor", expense_side=True)
+    other_items_raw = pl_df[pl_df["cat_type"] == "other"]
+
+    total_rev = sum(rev_items.values())
+    total_cogs = sum(cogs_items.values())
+    gross_profit = total_rev - total_cogs
+    total_sga = sum(sga_items.values()) + sum(labor_items.values())
+    op_profit = gross_profit - total_sga
+    other_income = other_items_raw[other_items_raw["direction"] == "in"]["amount"].sum()
+    other_expense = other_items_raw[other_items_raw["direction"] == "out"]["amount"].sum()
+    pretax = op_profit + other_income - other_expense
+    corp_tax = pl_df[(pl_df["cat_name"] == "법인세") & (pl_df["direction"] == "out")]["amount"].sum()
+    net_profit = pretax - corp_tax
+
+    combined_sga = {**sga_items}
+    for k, v in labor_items.items():
+        combined_sga[k] = combined_sga.get(k, 0) + v
+
+    return {
+        "rev_items": rev_items, "cogs_items": cogs_items, "combined_sga": combined_sga,
+        "total_rev": total_rev, "total_cogs": total_cogs, "gross_profit": gross_profit,
+        "total_sga": total_sga, "op_profit": op_profit,
+        "other_income": other_income, "other_expense": other_expense,
+        "pretax": pretax, "corp_tax": corp_tax, "net_profit": net_profit,
+    }
+
+
 @st.cache_data(ttl=45)
 def load_all():
     categories = SUPA.table("fin_account_categories").select("*").order("sort_order").execute().data
@@ -78,7 +120,7 @@ def load_all():
     ).execute().data
     projects = SUPA.table("projects").select("id,brand,campaign").execute().data
     bank_txns = SUPA.table("bank_transactions").select(
-        "id,direction,amount,txn_date,txn_datetime,description,matched_cash_event_id,account_label,account_category_id,created_at"
+        "id,direction,amount,txn_date,txn_datetime,description,matched_cash_event_id,account_label,account_category_id,created_at,dedup_hash"
     ).order("txn_date", desc=True).execute().data
     tax_invs = SUPA.table("tax_invoices").select(
         "approval_no,write_date,issue_date,buyer_biz_no,buyer_name,total_amount,supply_amount,vat,kind,"
@@ -90,6 +132,24 @@ def load_all():
 def refresh():
     load_all.clear()
     st.rerun()
+
+
+@st.cache_data(ttl=45)
+def load_business_notes(active_only=True):
+    q = SUPA.table("fin_business_notes").select("*").order("created_at", desc=True)
+    if active_only:
+        q = q.eq("is_active", True)
+    return q.execute().data
+
+
+def notes_as_prompt_text(notes):
+    if not notes:
+        return ""
+    lines = "\n".join(f"- {n['note']}" + (f" [{n['tag']}]" if n.get("tag") else "") for n in notes)
+    return (
+        "\n\n참고: 아래는 이 회사의 사업 담당자(대표)가 직접 남겨둔 패턴/맥락 메모다. "
+        "다른 어떤 추론보다 이 메모를 우선해서 반영해라:\n" + lines
+    )
 
 
 categories, events, projects, bank_txns, tax_invs = load_all()
@@ -199,7 +259,7 @@ if n_dup_certain or n_dup_suspect:
     st.info(f"🧹 은행거래 중복 의심 — 확실한 중복 {n_dup_certain}건(집계에서 자동 제외됨) · 애매한 중복 {n_dup_suspect}건(표시만, 집계엔 포함) → **'전체 매칭 현황 > 은행거래내역'**의 '중복 거래 정리'에서 확인하세요.")
 
 menu = st.radio(
-    "메뉴", ["📊 대시보드", "🔗 전체 매칭 현황", "🤖 AI 계정과목 추천", "🏦 뱅크다 연동", "📎 스마트 업로드", "⚙️ 계정과목 설정", "📄 손익계산서"],
+    "메뉴", ["📊 대시보드", "🔗 전체 매칭 현황", "🤖 AI 계정과목 추천", "🏦 뱅크다 연동", "⚙️ 계정과목 설정", "📄 손익계산서", "📝 CFO 인사이트"],
     horizontal=True, label_visibility="collapsed",
 )
 st.divider()
@@ -502,7 +562,7 @@ elif menu == "🤖 AI 계정과목 추천":
             })
         return examples
 
-    def call_claude_suggest(rows, cats, examples=None):
+    def call_claude_suggest(rows, cats, examples=None, notes=None):
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             return None, "ANTHROPIC_API_KEY 환경변수가 설정되어 있지 않습니다."
@@ -520,6 +580,7 @@ elif menu == "🤖 AI 계정과목 추천":
                 "\n\n참고: 아래는 이 회사가 과거에 실제로 직접 분류해둔 사례들이다. "
                 "적요(문구) 패턴이 비슷한 새 거래가 있으면 최대한 이 사례들과 같은 계정과목으로 맞춰라 (특히 인물/거래처 이름이 겹치면 같은 분류일 가능성이 매우 높다):\n" + ex_lines
             )
+        notes_text = notes_as_prompt_text(notes)
         txn_list = [
             {"id": r["id"], "direction": r["direction"], "amount": float(r["amount"]),
              "date": r["txn_date"].strftime("%Y-%m-%d") if pd.notna(r["txn_date"]) else None,
@@ -532,7 +593,7 @@ elif menu == "🤖 AI 계정과목 추천":
             "대부분 인플루언서 리워드/지급비(COGS_INFLUENCER)일 가능성이 높다. direction이 'in'이고 회사명이 적요에 있으면 매출 계열일 가능성이 높다. "
             "각 거래에 대해 confidence(high/medium/low)와 아주 짧은 reason(15자 이내, 한 문장이 아니라 키워드 수준)을 반드시 포함해라. "
             "출력은 오직 JSON 배열만: [{\"id\":\"...\", \"suggested_code\":\"...\", \"confidence\":\"high|medium|low\", \"reason\":\"...\"}]. "
-            "설명 문장, 코드블록(```), 그 외 어떤 텍스트도 절대 포함하지 마라. JSON 배열 하나만 출력해라.\n\n계정과목 목록:\n" + cat_list_text + examples_text
+            "설명 문장, 코드블록(```), 그 외 어떤 텍스트도 절대 포함하지 마라. JSON 배열 하나만 출력해라.\n\n계정과목 목록:\n" + cat_list_text + examples_text + notes_text
         )
         try:
             res = requests.post(
@@ -576,7 +637,8 @@ elif menu == "🤖 AI 계정과목 추천":
     if st.button("🤖 AI 추천 실행", type="primary"):
         with st.spinner("Claude가 거래 내역을 분석 중입니다..."):
             fewshot_examples = build_fewshot_examples(bank_df_clean, cat_by_id)
-            items, err = call_claude_suggest(batch, categories, fewshot_examples)
+            biz_notes = load_business_notes()
+            items, err = call_claude_suggest(batch, categories, fewshot_examples, biz_notes)
         if err:
             st.error(f"AI 추천 실패: {err}")
         else:
@@ -777,7 +839,7 @@ elif menu == "🏦 뱅크다 연동":
             if r.get("bketc"):
                 desc = f"{desc} ({r['bketc']})".strip()
             dedup_hash = hashlib.md5(
-                f"{account_label or ''}|{direction}|{amount}|{dt_str or ''}|{desc or ''}".encode("utf-8")
+                f"{account_label or ''}|{direction}|{amount}|{dt_str or ''}".encode("utf-8")
             ).hexdigest()
             rows_to_insert.append({
                 "direction": direction, "amount": amount, "txn_date": txn_date, "txn_datetime": dt_str,
@@ -932,9 +994,10 @@ elif menu == "🏦 뱅크다 연동":
             direction, amount = ("out", int(abs(wd))) if wd > dep else ("in", int(abs(dep)))
             d = pd.to_datetime(str(dv)[:19], errors="coerce")
             due = d.date().isoformat() if pd.notna(d) else None
+            norm_dt = d.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(d) else None
             desc = _unescape_x_hist(str(r.get(c_desc, "")).strip()) if c_desc is not None else ""
             raw_dt = str(dv).strip()
-            out.append({"direction": direction, "amount": amount, "due_date": due, "desc": desc, "raw_dt": raw_dt})
+            out.append({"direction": direction, "amount": amount, "due_date": due, "desc": desc, "raw_dt": raw_dt, "norm_dt": norm_dt})
         return out
 
     _ACCOUNT_NO_RE_HIST = re.compile(r"\d{2,4}-\d{1,3}-\d{4,8}")
@@ -1010,8 +1073,8 @@ elif menu == "🏦 뱅크다 연동":
             return None, "거래 데이터를 찾지 못했습니다. 파일 형식을 확인해주세요.", None
         return all_rows, " · ".join(sheet_info), detected_account_no
 
-    def compute_dedup_hash_hist(account_label, direction, amount, dt_str, desc):
-        raw = f"{account_label or ''}|{direction}|{amount}|{dt_str or ''}|{desc or ''}"
+    def compute_dedup_hash_hist(account_label, direction, amount, dt_str):
+        raw = f"{account_label or ''}|{direction}|{amount}|{dt_str or ''}"
         return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
     hist_up = st.file_uploader("과거 계좌 거래내역 (.csv / .xlsx)", type=["csv", "xlsx"], key="hist_bank_up")
@@ -1047,7 +1110,7 @@ elif menu == "🏦 뱅크다 연동":
             else:
                 existing_hashes_hist = {t.get("dedup_hash") for t in bank_txns if t.get("dedup_hash")}
                 for r in parsed:
-                    h = compute_dedup_hash_hist(account_label_hist.strip(), r["direction"], r["amount"], r.get("raw_dt") or r.get("due_date"), r["desc"])
+                    h = compute_dedup_hash_hist(account_label_hist.strip(), r["direction"], r["amount"], r.get("norm_dt") or r.get("due_date"))
                     r["_hash"] = h
                     r["_dup"] = h in existing_hashes_hist
                     r["_payroll"] = _looks_like_payroll_hist(r["desc"])
@@ -1074,7 +1137,7 @@ elif menu == "🏦 뱅크다 연동":
                 if st.button(f"✅ 급여 제외하고 {n_target:,}건 한 번에 등록", type="primary", key="hist_confirm_btn", disabled=n_target == 0):
                     rows_to_insert_hist = [{
                         "direction": r["direction"], "amount": r["amount"],
-                        "txn_date": r["due_date"], "txn_datetime": r.get("raw_dt"),
+                        "txn_date": r["due_date"], "txn_datetime": r.get("norm_dt"),
                         "description": r["desc"] or None, "account_label": account_label_hist.strip(),
                         "dedup_hash": r["_hash"], "source": "manual_upload",
                     } for r in parsed if not r["_payroll"]]
@@ -1090,157 +1153,6 @@ elif menu == "🏦 뱅크다 연동":
                         msg += f" · 이미 있던 {skipped_hist}건은 중복이라 건너뜀"
                     st.success(msg)
                     refresh()
-
-
-# ════════════════════════════════════════════════════════════
-# 📎 스마트 업로드 (PDF·이미지 → AI가 자동으로 거래내역화)
-# ════════════════════════════════════════════════════════════
-elif menu == "📎 스마트 업로드":
-    st.subheader("📎 은행내역 스마트 업로드")
-    st.caption(
-        "뱅크다가 못 가져오는 과거 내역이나, 형식이 특이한 은행 파일(PDF·캡처 이미지)을 올리면 "
-        "Claude가 내용을 읽어 거래 목록으로 자동 변환합니다. 정형 엑셀/CSV는 '송금캘린더'의 "
-        "'🏦 계좌 거래내역 업로드'를 이용해도 됩니다. 급여 지급 대상자 이름이 적요에 있는 거래는 "
-        "안전을 위해 기본적으로 제외 처리됩니다."
-    )
-
-    STAFF_PAYROLL_NAMES_SMART = ["김선재", "정다영", "양혜준", "구정회", "박솔", "장현우"]
-
-    def _looks_like_payroll_smart(desc):
-        s = (desc or "").replace(" ", "")
-        return any(name in s for name in STAFF_PAYROLL_NAMES_SMART)
-
-    def _compute_dedup_hash_smart(account_label, direction, amount, dt_str, desc):
-        raw = f"{account_label or ''}|{direction}|{amount}|{dt_str or ''}|{desc or ''}"
-        return hashlib.md5(raw.encode("utf-8")).hexdigest()
-
-    smart_up = st.file_uploader(
-        "은행 거래내역 파일 (PDF, PNG, JPG)", type=["pdf", "png", "jpg", "jpeg"], key="smart_bank_up"
-    )
-    account_label_smart = st.text_input("이 파일은 어느 계좌인가요?", placeholder="예: 국민은행 법인", key="smart_acc")
-
-    def extract_via_ai(file_bytes, filename, mime):
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            return None, "ANTHROPIC_API_KEY 환경변수가 없습니다."
-        b64 = base64.b64encode(file_bytes).decode()
-        if mime == "application/pdf":
-            content_block = {"type": "document", "source": {"type": "base64", "media_type": mime, "data": b64}}
-        else:
-            content_block = {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}}
-        system = (
-            "너는 은행 거래내역 파일(PDF 또는 이미지)을 읽어 거래 목록을 추출하는 보조원이다. "
-            "각 거래마다 direction(in 또는 out), amount(정수, 원화, 절대값), date(YYYY-MM-DD), "
-            "datetime(시:분:초까지 있으면 'YYYY-MM-DD HH:MM:SS', 없으면 null), description(적요·거래내용)을 뽑아라. "
-            "합계·잔액·안내문 같은 거래가 아닌 줄은 제외해라. "
-            "출력은 오직 JSON 배열만 — 예: "
-            "[{\"direction\":\"in\",\"amount\":100000,\"date\":\"2026-01-05\",\"datetime\":null,\"description\":\"...\"}]. "
-            "다른 설명 텍스트는 절대 포함하지 마라."
-        )
-        try:
-            res = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={
-                    "model": "claude-sonnet-5",
-                    "max_tokens": 8000,
-                    "system": system,
-                    "messages": [{
-                        "role": "user",
-                        "content": [content_block, {"type": "text", "text": f"파일명: {filename}. 이 파일의 모든 거래를 추출해줘."}],
-                    }],
-                },
-                timeout=120,
-            )
-            if res.status_code >= 300:
-                return None, f"{res.status_code} {res.text[:300]}"
-            data = res.json()
-            text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
-            if text.startswith("```"):
-                text = text.strip("`")
-                if text.startswith("json"):
-                    text = text[4:]
-            items = json.loads(text)
-            return items, None
-        except Exception as e:
-            return None, str(e)
-
-    if smart_up is not None and account_label_smart.strip():
-        mime_map = {"pdf": "application/pdf", "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}
-        ext = smart_up.name.lower().rsplit(".", 1)[-1]
-        mime = mime_map.get(ext, "application/octet-stream")
-
-        if st.button("🤖 AI로 거래내역 추출", type="primary"):
-            with st.spinner("Claude가 파일을 읽고 거래 목록을 만드는 중입니다..."):
-                items, err = extract_via_ai(smart_up.getvalue(), smart_up.name, mime)
-            if err:
-                st.error(f"추출 실패: {err}")
-            else:
-                st.session_state["smart_extracted"] = items
-                st.success(f"{len(items)}건 추출 완료. 아래에서 확인 후 등록하세요.")
-
-    extracted = st.session_state.get("smart_extracted")
-    if extracted:
-        existing_hashes = {t.get("dedup_hash") for t in bank_txns if t.get("dedup_hash")}
-        rows_preview = []
-        for it in extracted:
-            direction = it.get("direction")
-            amount = int(abs(it.get("amount") or 0))
-            desc = it.get("description") or ""
-            dt_str = it.get("datetime") or it.get("date")
-            h = _compute_dedup_hash_smart(account_label_smart.strip(), direction, amount, dt_str, desc)
-            is_dup = h in existing_hashes
-            is_payroll = _looks_like_payroll_smart(desc)
-            rows_preview.append({
-                "_hash": h, "direction": direction, "amount": amount,
-                "date": it.get("date"), "datetime": it.get("datetime"), "desc": desc,
-                "_dup": is_dup, "_payroll": is_payroll,
-            })
-
-        st.caption(f"**{account_label_smart.strip()}** · 총 {len(rows_preview)}건 추출됨 (급여 대상자·중복 건은 기본 제외 체크)")
-        sel = []
-        for i, r in enumerate(rows_preview):
-            reasons = []
-            if r["_payroll"]:
-                reasons.append("제외 대상(급여)")
-            if r["_dup"]:
-                reasons.append("이미 등록된 것과 중복")
-            default_check = not (r["_payroll"] or r["_dup"])
-            c1, c2 = st.columns([0.5, 5.5])
-            checked = c1.checkbox("포함", value=default_check, key=f"smartrow_{i}", label_visibility="collapsed")
-            tag = "받을" if r["direction"] == "in" else "나갈"
-            reason_txt = f" — {' · '.join(reasons)}" if reasons else ""
-            c2.write(f"{r['date'] or '날짜불명'} · {tag} · ₩{r['amount']:,.0f} · {r['desc']}{reason_txt}")
-            sel.append(checked)
-
-        n_keep = sum(sel)
-        if st.button(f"✅ 체크된 {n_keep}건 등록", type="primary", disabled=n_keep == 0):
-            rows_to_insert = []
-            for keep, r in zip(sel, rows_preview):
-                if not keep:
-                    continue
-                rows_to_insert.append({
-                    "direction": r["direction"], "amount": r["amount"],
-                    "txn_date": r["date"], "txn_datetime": r["datetime"],
-                    "description": r["desc"] or None,
-                    "account_label": account_label_smart.strip(),
-                    "dedup_hash": r["_hash"], "source": "manual_upload_smart",
-                })
-            actually_added = 0
-            if rows_to_insert:
-                res = SUPA.table("bank_transactions").upsert(
-                    rows_to_insert, on_conflict="dedup_hash", ignore_duplicates=True
-                ).execute()
-                actually_added = len(res.data) if res.data is not None else len(rows_to_insert)
-            skipped = len(rows_to_insert) - actually_added
-            msg = f"{actually_added}건 새로 등록됨 ✓"
-            if skipped > 0:
-                msg += f" · 중복이라 건너뛴 {skipped}건"
-            st.session_state.pop("smart_extracted", None)
-            st.toast(msg)
-            refresh()
-    elif smart_up is not None and not account_label_smart.strip():
-        st.warning("계좌 이름을 입력해주세요.")
 
 
 # ════════════════════════════════════════════════════════════
@@ -1307,38 +1219,12 @@ elif menu == "📄 손익계산서":
 
     mask = (bank_df_clean["txn_date"] >= pd.Timestamp(start_d)) & (bank_df_clean["txn_date"] <= pd.Timestamp(end_d))
     pl_df = bank_df_clean[mask]
-
-    def type_net(t, expense_side=True):
-        sub = pl_df[pl_df["cat_type"] == t]
-        inflow = sub[sub["direction"] == "in"]["amount"].sum()
-        outflow = sub[sub["direction"] == "out"]["amount"].sum()
-        return (outflow - inflow) if expense_side else (inflow - outflow)
-
-    def line_items(t, expense_side=True):
-        sub = pl_df[pl_df["cat_type"] == t]
-        grp = sub.groupby(["direction", "cat_name"])["amount"].sum().reset_index()
-        result = {}
-        for _, r in grp.iterrows():
-            sign = 1 if (r["direction"] == "out") == expense_side else -1
-            result[r["cat_name"]] = result.get(r["cat_name"], 0) + sign * r["amount"]
-        return result
-
-    rev_items = line_items("revenue", expense_side=False)
-    cogs_items = line_items("cost_cogs", expense_side=True)
-    sga_items = line_items("cost_sga", expense_side=True)
-    labor_items = line_items("labor", expense_side=True)
-    other_items_raw = pl_df[pl_df["cat_type"] == "other"]
-
-    total_rev = sum(rev_items.values())
-    total_cogs = sum(cogs_items.values())
-    gross_profit = total_rev - total_cogs
-    total_sga = sum(sga_items.values()) + sum(labor_items.values())
-    op_profit = gross_profit - total_sga
-    other_income = other_items_raw[other_items_raw["direction"] == "in"]["amount"].sum()
-    other_expense = other_items_raw[other_items_raw["direction"] == "out"]["amount"].sum()
-    pretax = op_profit + other_income - other_expense
-    corp_tax = pl_df[(pl_df["cat_name"] == "법인세") & (pl_df["direction"] == "out")]["amount"].sum()
-    net_profit = pretax - corp_tax
+    pl = compute_pl(pl_df)
+    rev_items, cogs_items, combined_sga = pl["rev_items"], pl["cogs_items"], pl["combined_sga"]
+    total_rev, total_cogs, gross_profit = pl["total_rev"], pl["total_cogs"], pl["gross_profit"]
+    total_sga, op_profit = pl["total_sga"], pl["op_profit"]
+    other_income, other_expense = pl["other_income"], pl["other_expense"]
+    pretax, corp_tax, net_profit = pl["pretax"], pl["corp_tax"], pl["net_profit"]
 
     def render_section(title, items, total, color="#1F3864"):
         st.markdown(f"<span style='color:{color};font-weight:700'>{title}</span>", unsafe_allow_html=True)
@@ -1352,9 +1238,6 @@ elif menu == "📄 손익계산서":
     render_section("Ⅱ. 매출원가", cogs_items, total_cogs)
     st.markdown(f"### Ⅲ. 매출총이익 : ₩{gross_profit:,.0f}")
     st.markdown("")
-    combined_sga = {**sga_items}
-    for k, v in labor_items.items():
-        combined_sga[k] = combined_sga.get(k, 0) + v
     render_section("Ⅳ. 판매비와관리비", combined_sga, total_sga)
     st.markdown(f"### Ⅴ. 영업손익 : ₩{op_profit:,.0f}")
     st.markdown("")
@@ -1367,3 +1250,139 @@ elif menu == "📄 손익계산서":
     uncategorized_in_period = pl_df[pl_df["account_category_id"].isna()]
     if not uncategorized_in_period.empty:
         st.warning(f"⚠️ 이 기간 내 미분류 은행거래 {len(uncategorized_in_period)}건(₩{uncategorized_in_period['amount'].sum():,.0f})은 위 손익계산서에서 빠져 있습니다 — '전체 매칭 현황' 또는 'AI 계정과목 추천'에서 분류해주세요.")
+
+
+# ════════════════════════════════════════════════════════════
+# 📝 CFO 인사이트
+# ════════════════════════════════════════════════════════════
+elif menu == "📝 CFO 인사이트":
+    st.subheader("📝 CFO 인사이트")
+    st.caption("숫자만 나열하는 손익계산서 대신, Claude가 CFO 관점에서 이번 기간에 무슨 일이 있었고 왜 그런지, 리스크와 다음 액션까지 스토리로 풀어드립니다.")
+
+    # ── 패턴/맥락 메모 관리 (여기서 바로 관리, AI 추천 탭에서도 항상 참고됨) ──
+    with st.expander("🧠 기억해둘 패턴/맥락 메모 관리", expanded=False):
+        st.caption("계정과목 규칙, 매출·매입 연관성, 계절성, 주요 고객사 특징 등을 짧은 메모로 남겨두세요. AI 계정과목 추천과 이 CFO 인사이트 둘 다 항상 참고합니다.")
+        notes_all = SUPA.table("fin_business_notes").select("*").order("created_at", desc=True).execute().data
+        notes_df = pd.DataFrame(notes_all) if notes_all else pd.DataFrame(columns=["id", "note", "tag", "is_active"])
+        if "id" not in notes_df.columns:
+            notes_df["id"] = None
+        edited_notes = st.data_editor(
+            notes_df[["id", "note", "tag", "is_active"]] if not notes_df.empty else pd.DataFrame(columns=["id", "note", "tag", "is_active"]),
+            num_rows="dynamic",
+            column_config={
+                "id": None,
+                "note": st.column_config.TextColumn("메모", width="large"),
+                "tag": st.column_config.TextColumn("태그(선택)", help="예: 계정과목규칙 / 계절성 / 고객사 / 리스크"),
+                "is_active": st.column_config.CheckboxColumn("사용"),
+            },
+            column_order=["note", "tag", "is_active"],
+            hide_index=True, use_container_width=True, key="notes_editor",
+        )
+        if st.button("💾 메모 저장", key="save_notes"):
+            orig_by_id = {n["id"]: n for n in notes_all}
+            saved = 0
+            for _, row in edited_notes.iterrows():
+                if not str(row.get("note") or "").strip():
+                    continue
+                payload = {
+                    "note": row["note"], "tag": row.get("tag") if pd.notna(row.get("tag")) else None,
+                    "is_active": bool(row["is_active"]) if pd.notna(row.get("is_active")) else True,
+                }
+                row_id = row.get("id")
+                if pd.isna(row_id) or not row_id:
+                    SUPA.table("fin_business_notes").insert(payload).execute(); saved += 1
+                else:
+                    orig = orig_by_id.get(row_id)
+                    if orig and any(orig.get(k) != payload[k] for k in payload):
+                        SUPA.table("fin_business_notes").update(payload).eq("id", row_id).execute(); saved += 1
+            st.success(f"{saved}건 저장 완료"); load_business_notes.clear(); st.rerun()
+
+    st.divider()
+
+    # ── 기간 선택 (이번 기간 vs 직전 동일길이 기간 자동 비교) ──
+    p1, p2 = st.columns(2)
+    ci_start = p1.date_input("분석 시작일", value=date(today.year, today.month, 1), key="cfo_start")
+    ci_end = p2.date_input("분석 종료일", value=date.today(), key="cfo_end")
+
+    if bank_df.empty:
+        st.info("데이터 없음"); st.stop()
+
+    period_len = (pd.Timestamp(ci_end) - pd.Timestamp(ci_start)).days + 1
+    prev_end = pd.Timestamp(ci_start) - pd.Timedelta(days=1)
+    prev_start = prev_end - pd.Timedelta(days=period_len - 1)
+
+    cur_mask = (bank_df_clean["txn_date"] >= pd.Timestamp(ci_start)) & (bank_df_clean["txn_date"] <= pd.Timestamp(ci_end))
+    prev_mask = (bank_df_clean["txn_date"] >= prev_start) & (bank_df_clean["txn_date"] <= prev_end)
+    pl_cur = compute_pl(bank_df_clean[cur_mask])
+    pl_prev = compute_pl(bank_df_clean[prev_mask])
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("이번 기간 매출", f"₩{pl_cur['total_rev']:,.0f}", delta=f"₩{pl_cur['total_rev']-pl_prev['total_rev']:,.0f}")
+    m2.metric("이번 기간 영업이익", f"₩{pl_cur['op_profit']:,.0f}", delta=f"₩{pl_cur['op_profit']-pl_prev['op_profit']:,.0f}")
+    m3.metric("이번 기간 당기순손익", f"₩{pl_cur['net_profit']:,.0f}", delta=f"₩{pl_cur['net_profit']-pl_prev['net_profit']:,.0f}")
+
+    def call_claude_cfo_insight(pl_cur, pl_prev, period_text, prev_period_text, notes):
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            return None, "ANTHROPIC_API_KEY 환경변수가 설정되어 있지 않습니다."
+        notes_text = notes_as_prompt_text(notes)
+        system = (
+            "너는 한국의 인플루언서 마케팅 대행사(브랜드슬램)를 위해 일하는 CFO다. "
+            "아래 손익 데이터를 바탕으로, 대표에게 보고하는 CFO 코멘터리를 한국어로 작성해라. "
+            "말투는 사업계획서/이사회 보고서에 어울리는 신중하고 분석적인 톤이되, 딱딱한 보고서가 아니라 스토리로 풀어써라. "
+            "다음 구조를 따르되 마크다운 헤더(###)로 구분해라: "
+            "1) 이번 기간 한 줄 요약, 2) 전기간 대비 무엇이 바뀌었고 왜 그런지 (반드시 숫자를 인용), "
+            "3) 눈여겨봐야 할 리스크나 이상 신호, 4) 다음 기간에 대표가 취하면 좋을 구체적 액션 2~3가지. "
+            "확정적으로 단정하지 말고, 데이터가 시사하는 바를 짚어주는 정도로 신중하게 서술해라. "
+            "재무 지식이 부족한 대표도 이해할 수 있게 쉬운 말로 써라." + notes_text
+        )
+        user_content = (
+            f"[이번 기간: {period_text}]\n{json.dumps(pl_cur, ensure_ascii=False)}\n\n"
+            f"[직전 비교 기간: {prev_period_text}]\n{json.dumps(pl_prev, ensure_ascii=False)}"
+        )
+        try:
+            res = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": "claude-sonnet-5", "max_tokens": 3000, "system": system,
+                      "messages": [{"role": "user", "content": user_content}]},
+                timeout=90,
+            )
+            if res.status_code >= 300:
+                return None, f"{res.status_code} {res.text[:300]}"
+            data = res.json()
+            text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+            return text.strip(), None
+        except Exception as e:
+            return None, str(e)
+
+    if st.button("📝 CFO 인사이트 생성", type="primary"):
+        with st.spinner("Claude가 재무 스토리를 작성하는 중입니다..."):
+            notes = load_business_notes()
+            narrative, err = call_claude_cfo_insight(
+                pl_cur, pl_prev,
+                f"{ci_start} ~ {ci_end}", f"{prev_start.date()} ~ {prev_end.date()}",
+                notes,
+            )
+        if err:
+            st.error(f"생성 실패: {err}")
+        else:
+            st.session_state["cfo_narrative"] = narrative
+            SUPA.table("fin_cfo_narratives").insert({
+                "period_start": str(ci_start), "period_end": str(ci_end), "content": narrative,
+            }).execute()
+            st.success("생성 완료 (자동 저장됨)")
+
+    if st.session_state.get("cfo_narrative"):
+        st.markdown("---")
+        st.markdown(st.session_state["cfo_narrative"])
+
+    st.divider()
+    with st.expander("🗂️ 지난 CFO 인사이트 기록 보기"):
+        past = SUPA.table("fin_cfo_narratives").select("*").order("created_at", desc=True).limit(10).execute().data
+        if not past:
+            st.caption("저장된 기록이 없습니다.")
+        for p in past:
+            with st.container(border=True):
+                st.caption(f"{p['period_start']} ~ {p['period_end']} · 생성일 {p['created_at'][:16].replace('T',' ')}")
+                st.markdown(p["content"])
