@@ -735,7 +735,11 @@ elif menu == "🏦 뱅크다 연동":
     label_map = {r["accountnum"]: r["account_label"] for r in label_rows}
 
     with st.expander(f"⚙️ 계좌 라벨 매핑 ({len(label_rows)}건 등록됨)"):
-        st.caption("뱅크다 계좌번호별로 화면에 표시할 이름을 정해두세요. 처음 보는 계좌번호는 은행명으로 자동 등록되고, 여기서 이름을 바꿀 수 있습니다.")
+        st.caption(
+            "뱅크다 계좌번호별로 화면에 표시할 이름을 정해두세요. 처음 보는 계좌번호는 은행명으로 자동 등록되고, 여기서 이름을 바꿀 수 있습니다. "
+            "⚠️ 같은 은행에 계좌가 여러 개 있으면(예: SC제일은행 7705/2490) 기본값(은행명)이 서로 겹칠 수 있으니, 반드시 계좌번호 끝자리를 붙여 "
+            "'SC제일은행(7705)' / 'SC제일은행(2490)' 식으로 구분해주세요 — 이름이 같으면 서로 다른 계좌인데도 하나로 취급되어 중복탐지가 정상 거래를 잘못 지울 수 있습니다."
+        )
         if label_rows:
             lbl_df = pd.DataFrame(label_rows)[["accountnum", "account_label", "bank_name"]]
             edited_lbl = st.data_editor(
@@ -1098,7 +1102,12 @@ elif menu == "🏦 뱅크다 연동":
             default_index = acc_opts.index(default_label) if default_label in acc_opts else len(acc_opts) - 1
             acc_pick = st.selectbox("이 파일은 어느 계좌 것인가요?", acc_opts, index=default_index, key="hist_acc_pick")
             account_label_hist = (
-                st.text_input("계좌 이름 입력", value=(detected_acc or ""), placeholder="예: SC제일은행, 기업은행", key="hist_acc_text")
+                st.text_input(
+                    "계좌 이름 입력", value=(detected_acc or ""),
+                    placeholder="예: SC제일은행(7705), SC제일은행(2490), 기업은행",
+                    key="hist_acc_text",
+                    help="⚠️ 같은 은행에 계좌가 여러 개면(예: SC제일은행 7705/2490) 반드시 계좌번호 끝자리까지 구분해서 이름을 붙여주세요 — 이름이 같으면 서로 다른 계좌인데도 중복탐지가 하나의 계좌로 착각해 정상 거래를 잘못 지울 수 있습니다.",
+                )
                 if acc_pick == "+ 새 계좌 이름 직접 입력" else acc_pick
             )
 
