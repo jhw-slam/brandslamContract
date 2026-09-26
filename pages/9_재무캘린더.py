@@ -456,7 +456,7 @@ elif menu == "🔗 전체 매칭 현황":
 # ════════════════════════════════════════════════════════════
 elif menu == "🤖 AI 계정과목 추천":
     st.subheader("🤖 AI 계정과목 추천")
-    st.caption("미분류 은행거래 내역을 Claude가 분석해서 계정과목을 추천합니다. 검토 후 원하는 항목만 선택해서 일괄 등록하세요.")
+    st.caption("미분류 은행거래 내역을 Claude가 분석해서 계정과목을 추천합니다. 과거에 직접 분류해둔 사례도 함께 참고해서 추천해요. 검토 후 원하는 항목만 선택해서 일괄 등록하세요.")
 
     unclassified_bank = bank_df_clean[bank_df_clean["account_category_id"].isna()].sort_values("txn_date", ascending=False) if not bank_df.empty else pd.DataFrame()
 
@@ -468,7 +468,25 @@ elif menu == "🤖 AI 계정과목 추천":
     st.info(f"미분류 은행거래 {len(unclassified_bank)}건 중 최대 {BATCH_SIZE}건을 한 번에 분석합니다. (한 번에 더 많이 하면 응답이 잘릴 수 있어 배치를 나눴습니다)")
     batch = unclassified_bank.head(BATCH_SIZE)
 
-    def call_claude_suggest(rows, cats):
+    def build_fewshot_examples(bdf, cats_by_id, max_examples=25):
+        """이미 계정과목이 지정된(=사람이 직접 분류했거나 확정한) 은행거래를 몇 건 뽑아
+        AI에게 '우리 회사는 실제로 이렇게 분류한다'는 사례로 함께 보여준다."""
+        done = bdf[bdf["account_category_id"].notna()].copy()
+        if done.empty:
+            return []
+        done = done.sort_values("txn_date", ascending=False).head(max_examples)
+        examples = []
+        for _, r in done.iterrows():
+            cat = cats_by_id.get(r["account_category_id"])
+            if not cat:
+                continue
+            examples.append({
+                "description": r["description"] or "", "direction": r["direction"],
+                "amount": float(r["amount"]), "assigned_code": cat["code"],
+            })
+        return examples
+
+    def call_claude_suggest(rows, cats, examples=None):
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             return None, "ANTHROPIC_API_KEY 환경변수가 설정되어 있지 않습니다."
@@ -476,6 +494,16 @@ elif menu == "🤖 AI 계정과목 추천":
             f"- {c['code']} ({c['name']}, 유형:{TYPE_LABELS.get(c['type'], c['type'])}): {c.get('description') or ''}"
             for c in cats if c["is_active"]
         )
+        examples_text = ""
+        if examples:
+            ex_lines = "\n".join(
+                f"- [{e['direction']}] {e['amount']:,.0f}원 · \"{e['description']}\" → {e['assigned_code']}"
+                for e in examples
+            )
+            examples_text = (
+                "\n\n참고: 아래는 이 회사가 과거에 실제로 직접 분류해둔 사례들이다. "
+                "적요(문구) 패턴이 비슷한 새 거래가 있으면 최대한 이 사례들과 같은 계정과목으로 맞춰라 (특히 인물/거래처 이름이 겹치면 같은 분류일 가능성이 매우 높다):\n" + ex_lines
+            )
         txn_list = [
             {"id": r["id"], "direction": r["direction"], "amount": float(r["amount"]),
              "date": r["txn_date"].strftime("%Y-%m-%d") if pd.notna(r["txn_date"]) else None,
@@ -488,7 +516,7 @@ elif menu == "🤖 AI 계정과목 추천":
             "대부분 인플루언서 리워드/지급비(COGS_INFLUENCER)일 가능성이 높다. direction이 'in'이고 회사명이 적요에 있으면 매출 계열일 가능성이 높다. "
             "각 거래에 대해 confidence(high/medium/low)와 아주 짧은 reason(15자 이내, 한 문장이 아니라 키워드 수준)을 반드시 포함해라. "
             "출력은 오직 JSON 배열만: [{\"id\":\"...\", \"suggested_code\":\"...\", \"confidence\":\"high|medium|low\", \"reason\":\"...\"}]. "
-            "설명 문장, 코드블록(```), 그 외 어떤 텍스트도 절대 포함하지 마라. JSON 배열 하나만 출력해라.\n\n계정과목 목록:\n" + cat_list_text
+            "설명 문장, 코드블록(```), 그 외 어떤 텍스트도 절대 포함하지 마라. JSON 배열 하나만 출력해라.\n\n계정과목 목록:\n" + cat_list_text + examples_text
         )
         try:
             res = requests.post(
@@ -531,7 +559,8 @@ elif menu == "🤖 AI 계정과목 추천":
 
     if st.button("🤖 AI 추천 실행", type="primary"):
         with st.spinner("Claude가 거래 내역을 분석 중입니다..."):
-            items, err = call_claude_suggest(batch, categories)
+            fewshot_examples = build_fewshot_examples(bank_df_clean, cat_by_id)
+            items, err = call_claude_suggest(batch, categories, fewshot_examples)
         if err:
             st.error(f"AI 추천 실패: {err}")
         else:
