@@ -20,7 +20,7 @@ if PW and not st.session_state.get("ok"):
 st.title("📢 예정입출금 등록")
 st.caption("\"이런 돈이 곧 나갈/들어올 것 같다\" 싶은 게 있으면 짧게 남겨주세요. 계약서 작성 없이도 예측용으로 가볍게 쓰는 화면입니다. 재무캘린더 대시보드에 바로 반영돼요.")
 
-STAFF_NAMES = ["김선재", "이단우", "구정회","장현우"]
+STAFF_NAMES = ["김선재", "이단우", "구정회","곽재선","sanubari"]
 
 
 @st.cache_resource
