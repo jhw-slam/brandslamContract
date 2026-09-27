@@ -47,8 +47,14 @@ def load_placements():
     return SUPA.table("influencer_placements").select("*").order("created_at", desc=True).execute().data
 
 
+@st.cache_data(ttl=20)
+def load_activity_log(limit=15):
+    return SUPA.table("daily_activity_log").select("*").order("created_at", desc=True).limit(limit).execute().data
+
+
 def refresh():
     load_placements.clear()
+    load_activity_log.clear()
     st.rerun()
 
 
@@ -56,8 +62,32 @@ my_name = st.selectbox("내 이름", STAFF_NAMES, key="my_name")
 
 st.divider()
 
+# ── 오늘 빠른 기록 (카드 안 만들어도 됨 — OKR 위클리 보고가 실패한 지점을 메꾸는 용도) ──
+st.subheader("🖊️ 오늘 빠른 기록")
+st.caption("특정 브랜드/인플루언서 카드를 안 만들어도, 그냥 오늘 뭐 했는지 한 줄만 남기면 됩니다.")
+with st.form("quick_log_form", clear_on_submit=True):
+    qc1, qc2 = st.columns([4, 1])
+    quick_note = qc1.text_input("오늘 한 일", placeholder="예: 사누바리한테 왕홍 5명 섭외 지시함", label_visibility="collapsed")
+    quick_submitted = qc2.form_submit_button("기록", type="primary", use_container_width=True)
+if quick_submitted:
+    if quick_note.strip():
+        SUPA.table("daily_activity_log").insert({"staff_name": my_name, "note": quick_note.strip()}).execute()
+        st.success("기록 완료!")
+        refresh()
+    else:
+        st.error("한 줄이라도 적어주세요.")
+
+recent_logs = load_activity_log()
+if recent_logs:
+    with st.expander(f"최근 기록 {len(recent_logs)}건 보기"):
+        for lg in recent_logs:
+            when = lg["created_at"][:16].replace("T", " ")
+            st.caption(f"{when} · **{lg['staff_name']}** · {lg['note']}")
+
+st.divider()
+
 # ── 새 배치 등록 ──────────────────────────────────────────
-with st.expander("➕ 새 배치 등록", expanded=True):
+with st.expander("➕ 새 배치 등록 (업체·인플루언서가 정해졌을 때)"):
     with st.form("new_placement_form", clear_on_submit=True):
         c1, c2 = st.columns(2)
         brand_name = c1.text_input("브랜드명 *")
@@ -144,7 +174,7 @@ for brand in brands:
                     key=f"guideline_{p['id']}", label_visibility="collapsed",
                 )
                 new_link = cc3.text_input(
-                    "콘텐츠 링크", value=p.get("content_link") or "", placeholder="업로드된 콘텐츠 링크",
+                    "콘텐츠 링크", value=p.get("content_link") or "", placeholder="업로드된 콘텐츠 링크(=성과보고 링크)",
                     key=f"link_{p['id']}", label_visibility="collapsed",
                 )
                 if st.button("저장", key=f"save_{p['id']}", use_container_width=True):
