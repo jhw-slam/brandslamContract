@@ -152,6 +152,11 @@ def notes_as_prompt_text(notes):
     )
 
 
+@st.cache_data(ttl=30)
+def load_cash_forecasts():
+    return SUPA.table("fin_cash_forecasts").select("*").order("expected_date").execute().data
+
+
 categories, events, projects, bank_txns, tax_invs = load_all()
 cat_by_id = {c["id"]: c for c in categories}
 cat_name_to_id = {c["name"]: c["id"] for c in categories if c["is_active"]}
@@ -273,18 +278,21 @@ if menu == "📊 대시보드":
         st.info("은행거래 데이터가 없습니다.")
         st.stop()
 
+    forecasts_top = load_cash_forecasts()
+    open_fc = [f for f in forecasts_top if f["status"] == "open"]
+    fc_in_total = sum(float(f["amount"]) for f in open_fc if f["direction"] == "in")
+    fc_out_total = sum(float(f["amount"]) for f in open_fc if f["direction"] == "out")
+    fc_overdue_cnt = sum(1 for f in open_fc if pd.Timestamp(f["expected_date"]) < today)
+
     m1, m2, m3, m4, m5 = st.columns(5)
     paid_in_month = bank_df_clean[(bank_df_clean["direction"] == "in") & (bank_df_clean["txn_date"].dt.strftime("%Y-%m") == this_month)]["amount"].sum()
     paid_out_month = bank_df_clean[(bank_df_clean["direction"] == "out") & (bank_df_clean["txn_date"].dt.strftime("%Y-%m") == this_month)]["amount"].sum()
-    unpaid_in = ev_df[(ev_df["direction"] == "in") & (ev_df["paid"] == False)]["amount"].sum() if not ev_df.empty else 0
-    unpaid_out = ev_df[(ev_df["direction"] == "out") & (ev_df["paid"] == False)]["amount"].sum() if not ev_df.empty else 0
-    overdue_in_cnt = ev_df[(ev_df["direction"] == "in") & (ev_df["paid"] == False) & (ev_df["due_date"] < today)].shape[0] if not ev_df.empty else 0
 
     m1.metric("이번달 입금(실제)", f"₩{paid_in_month:,.0f}")
     m2.metric("이번달 출금(실제)", f"₩{paid_out_month:,.0f}")
     m3.metric("이번달 순현금흐름", f"₩{paid_in_month - paid_out_month:,.0f}")
-    m4.metric("미수금 총액", f"₩{unpaid_in:,.0f}", delta=f"연체 {overdue_in_cnt}건" if overdue_in_cnt else None, delta_color="inverse")
-    m5.metric("미지급금 총액", f"₩{unpaid_out:,.0f}")
+    m4.metric("예상 입금(직원신고, 미해결)", f"₩{fc_in_total:,.0f}", delta=f"기한지남 {fc_overdue_cnt}건" if fc_overdue_cnt else None, delta_color="inverse")
+    m5.metric("예상 출금(직원신고, 미해결)", f"₩{fc_out_total:,.0f}")
 
     st.divider()
     st.subheader("📊 계정과목별 현황 (은행거래 실제 기준, 확실한 중복 제외)")
@@ -322,28 +330,30 @@ if menu == "📊 대시보드":
         st.caption(f"🏦 재무상태표 항목(보증금·대여금·유형자산 등) {len(bs_items)}건, 합계 ₩{bs_items['amount'].sum():,.0f} — 자산/부채성 항목이라 위 집계와 손익계산서에서 항상 제외됨")
 
     st.divider()
-    st.subheader("📌 미수금 / 미지급금 (송금캘린더 cash_events 기준)")
-    tab_ar, tab_ap = st.tabs(["미수금 (받을 돈)", "미지급금 (줄 돈)"])
-    with tab_ar:
-        ar = ev_df[(ev_df["direction"] == "in") & (ev_df["paid"] == False)].sort_values("due_date") if not ev_df.empty else pd.DataFrame()
-        if ar.empty:
-            st.caption("미수금 없음")
-        else:
-            show = ar[["due_date", "brand", "cat_name", "title", "amount"]].copy()
-            show["연체"] = ar["due_date"].apply(lambda d: "⚠️ 연체" if pd.notna(d) and d < today else "")
-            show["amount"] = show["amount"].map(lambda v: f"₩{v:,.0f}")
-            show["due_date"] = show["due_date"].dt.strftime("%Y-%m-%d")
-            st.dataframe(show, use_container_width=True, hide_index=True)
-    with tab_ap:
-        ap = ev_df[(ev_df["direction"] == "out") & (ev_df["paid"] == False)].sort_values("due_date") if not ev_df.empty else pd.DataFrame()
-        if ap.empty:
-            st.caption("미지급금 없음")
-        else:
-            show = ap[["due_date", "brand", "cat_name", "title", "amount"]].copy()
-            show["연체"] = ap["due_date"].apply(lambda d: "⚠️ 기한초과" if pd.notna(d) and d < today else "")
-            show["amount"] = show["amount"].map(lambda v: f"₩{v:,.0f}")
-            show["due_date"] = show["due_date"].dt.strftime("%Y-%m-%d")
-            st.dataframe(show, use_container_width=True, hide_index=True)
+    st.subheader("📢 직원 예상 입출금 신고")
+    st.caption("직원 누구나 '예정입출금 등록' 페이지에서 남긴 예상 입출금입니다. 실제로 처리됐거나 취소된 건은 아래에서 상태를 바꿔주세요.")
+    forecasts = load_cash_forecasts()
+    fc_open = [f for f in forecasts if f["status"] == "open"]
+    if not fc_open:
+        st.caption("등록된 예상 입출금 신고가 없습니다.")
+    else:
+        tab_fin, tab_fout = st.tabs(["예상 입금", "예상 출금"])
+        for tab, direction in [(tab_fin, "in"), (tab_fout, "out")]:
+            with tab:
+                items = sorted([f for f in fc_open if f["direction"] == direction], key=lambda f: f["expected_date"])
+                if not items:
+                    st.caption("없음")
+                for f in items:
+                    overdue = "⚠️ 기한지남 · " if pd.Timestamp(f["expected_date"]) < today else ""
+                    with st.container(border=True):
+                        c1, c2, c3 = st.columns([3, 1, 1])
+                        c1.markdown(f"**{f['expected_date']}** · ₩{float(f['amount']):,.0f} · {overdue}{f.get('submitted_by') or ''}\n\n{f.get('reason') or ''}")
+                        if c2.button("✅ 처리완료", key=f"fc_resolve_{f['id']}"):
+                            SUPA.table("fin_cash_forecasts").update({"status": "resolved"}).eq("id", f["id"]).execute()
+                            load_cash_forecasts.clear(); st.rerun()
+                        if c3.button("🗑️ 취소", key=f"fc_dismiss_{f['id']}"):
+                            SUPA.table("fin_cash_forecasts").update({"status": "dismissed"}).eq("id", f["id"]).execute()
+                            load_cash_forecasts.clear(); st.rerun()
 
     st.divider()
     st.subheader("🗓️ 월별 요약 (은행거래 실제 기준, 확실한 중복 제외)")
