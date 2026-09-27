@@ -18,11 +18,7 @@ st.set_page_config(page_title="손익 현황", layout="wide")
 # 레일웨이 환경변수 이름이 다르면 아래 os.environ.get() 안의 문자열만 바꿔주세요.
 FINANCE_PASSWORD = os.environ.get("FINANCE_PASSWORD")
 
-if not FINANCE_PASSWORD:
-    st.error("❌ FINANCE_PASSWORD 환경변수가 설정되어 있지 않습니다. Railway 환경변수를 확인해주세요.")
-    st.stop()
-
-if not st.session_state.get("finance_authenticated"):
+if FINANCE_PASSWORD and not st.session_state.get("finance_authenticated"):
     st.title("🔒 손익 현황 - 접근 제한")
     st.caption("이 페이지는 jhw 전용입니다.")
     with st.form("finance_login_form"):
