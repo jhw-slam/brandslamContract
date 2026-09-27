@@ -1235,9 +1235,45 @@ elif menu == "📄 손익계산서":
     st.subheader("📄 실시간 손익계산서 (은행거래 기준, 현금주의)")
     st.caption("부가세 예수금/대급금은 손익이 아닌 재무상태표 항목이라 이 표에서 제외했습니다. 법인세는 발생분이 있을 때만 표시됩니다.")
 
-    p1, p2 = st.columns(2)
-    start_d = p1.date_input("시작일", value=date(today.year, today.month, 1))
-    end_d = p2.date_input("종료일", value=date.today())
+    def _quarter_bounds(y, q):
+        start_month = 3 * (q - 1) + 1
+        start = date(y, start_month, 1)
+        end_month = start_month + 2
+        if end_month == 12:
+            end = date(y, 12, 31)
+        else:
+            end = date(y, end_month + 1, 1) - pd.Timedelta(days=1)
+            end = end if isinstance(end, date) else end.date()
+        return start, end
+
+    this_q = (today.month - 1) // 3 + 1
+    last_q_year, last_q = (today.year, this_q - 1) if this_q > 1 else (today.year - 1, 4)
+    last_month_end = date(today.year, today.month, 1) - pd.Timedelta(days=1)
+    last_month_end = last_month_end if isinstance(last_month_end, date) else last_month_end.date()
+    last_month_start = date(last_month_end.year, last_month_end.month, 1)
+    this_q_start, _ = _quarter_bounds(today.year, this_q)
+    last_q_start, last_q_end = _quarter_bounds(last_q_year, last_q)
+
+    presets = {
+        "이번달": (date(today.year, today.month, 1), date.today()),
+        "지난달": (last_month_start, last_month_end),
+        "이번분기": (this_q_start, date.today()),
+        "지난분기": (last_q_start, last_q_end),
+        "올해": (date(today.year, 1, 1), date.today()),
+        "작년": (date(today.year - 1, 1, 1), date(today.year - 1, 12, 31)),
+        "🗓️ 직접 설정": None,
+    }
+    preset_choice = st.radio("기간 선택", list(presets.keys()), horizontal=True, key="pl_preset")
+
+    if presets[preset_choice] is None:
+        p1, p2 = st.columns(2)
+        start_d = p1.date_input("시작일", value=date(today.year, today.month, 1), key="pl_start_manual")
+        end_d = p2.date_input("종료일", value=date.today(), key="pl_end_manual")
+    else:
+        start_d, end_d = presets[preset_choice]
+        p1, p2 = st.columns(2)
+        p1.caption(f"시작일: {start_d}")
+        p2.caption(f"종료일: {end_d}")
 
     if bank_df.empty:
         st.info("데이터 없음"); st.stop()
