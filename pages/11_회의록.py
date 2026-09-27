@@ -15,10 +15,10 @@ from supabase import create_client, Client
 st.set_page_config(page_title="회의록", page_icon="📝", layout="wide")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
 if not (SUPABASE_URL and SUPABASE_KEY):
-    st.error("SUPABASE_URL / SUPABASE_KEY 환경변수가 설정되어 있지 않습니다.")
+    st.error("SUPABASE_URL / SUPABASE_SERVICE_KEY 환경변수가 설정되어 있지 않습니다.")
     st.stop()
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
