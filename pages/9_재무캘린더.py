@@ -540,7 +540,7 @@ elif menu == "🤖 AI 계정과목 추천":
         st.success("미분류 은행거래가 없습니다 👍")
         st.stop()
 
-    BATCH_SIZE = 20
+    BATCH_SIZE = 10
     st.info(f"미분류 은행거래 {len(unclassified_bank)}건 중 최대 {BATCH_SIZE}건을 한 번에 분석합니다. (한 번에 더 많이 하면 응답이 잘릴 수 있어 배치를 나눴습니다)")
     batch = unclassified_bank.head(BATCH_SIZE)
 
@@ -648,6 +648,7 @@ elif menu == "🤖 AI 계정과목 추천":
     suggestions = st.session_state.get("ai_suggestions", {})
     if suggestions:
         code_to_name = {c["code"]: c["name"] for c in categories}
+        cat_name_list = list(cat_name_to_id.keys())
         rows_for_edit = []
         for _, r in batch.iterrows():
             sug = suggestions.get(r["id"])
@@ -655,38 +656,43 @@ elif menu == "🤖 AI 계정과목 추천":
                 continue
             rows_for_edit.append({
                 "id": r["id"],
-                "적용": sug.get("confidence") == "high",
+                "적용_기본": sug.get("confidence") == "high",
                 "날짜": r["txn_date"].strftime("%Y-%m-%d") if pd.notna(r["txn_date"]) else "-",
                 "적요": r["description"] or "",
                 "방향": "입금" if r["direction"] == "in" else "출금",
                 "금액": float(r["amount"]),
-                "추천 계정과목": code_to_name.get(sug.get("suggested_code"), sug.get("suggested_code")),
+                "추천계정": code_to_name.get(sug.get("suggested_code"), sug.get("suggested_code")),
                 "확신도": sug.get("confidence"),
                 "근거": sug.get("reason"),
             })
-        edit_df = pd.DataFrame(rows_for_edit)
-        st.caption("체크된 항목만 '선택 항목 일괄 등록'으로 반영됩니다. 추천이 틀렸으면 직접 계정과목을 바꾸세요.")
-        edited = st.data_editor(
-            edit_df,
-            column_config={
-                "id": None,
-                "적용": st.column_config.CheckboxColumn(),
-                "추천 계정과목": st.column_config.SelectboxColumn(options=list(cat_name_to_id.keys())),
-                "금액": st.column_config.NumberColumn(format="₩%d"),
-            },
-            column_order=["적용", "날짜", "적요", "방향", "금액", "추천 계정과목", "확신도", "근거"],
-            hide_index=True, use_container_width=True, key="ai_edit_table",
-        )
 
-        if st.button("✅ 선택 항목 일괄 등록", type="primary"):
+        st.caption(f"총 {len(rows_for_edit)}건 · 체크된 항목만 한 번에 등록됩니다. 카드 하나하나 눌러도 화면이 안 넘어가고, 맨 아래 '일괄 등록'을 눌러야만 서버에 반영돼요 (모바일에서 빠르게 쓰시라고 이렇게 만들었어요).")
+
+        with st.form("ai_review_form", border=False):
+            for row in rows_for_edit:
+                with st.container(border=True):
+                    conf_emoji = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(row["확신도"], "⚪")
+                    st.markdown(f"**{row['날짜']}** · {row['방향']} · ₩{row['금액']:,.0f}  {conf_emoji}{row['확신도'] or ''}")
+                    st.caption(f"{row['적요']}  ·  근거: {row['근거'] or '-'}")
+                    cc1, cc2 = st.columns([1, 3])
+                    cc1.checkbox("적용", value=row["적용_기본"], key=f"apply_{row['id']}")
+                    default_idx = cat_name_list.index(row["추천계정"]) if row["추천계정"] in cat_name_list else 0
+                    cc2.selectbox(
+                        "계정과목", options=cat_name_list, index=default_idx,
+                        key=f"sel_{row['id']}", label_visibility="collapsed",
+                    )
+            submitted = st.form_submit_button("✅ 체크된 항목 일괄 등록", type="primary", use_container_width=True)
+
+        if submitted:
             applied = 0
-            for i, row in edited.iterrows():
-                if row["적용"] and row["추천 계정과목"] in cat_name_to_id:
-                    txn_id = rows_for_edit[i]["id"]
-                    SUPA.table("bank_transactions").update(
-                        {"account_category_id": cat_name_to_id[row["추천 계정과목"]]}
-                    ).eq("id", txn_id).execute()
-                    applied += 1
+            for row in rows_for_edit:
+                if st.session_state.get(f"apply_{row['id']}"):
+                    chosen_name = st.session_state.get(f"sel_{row['id']}")
+                    if chosen_name in cat_name_to_id:
+                        SUPA.table("bank_transactions").update(
+                            {"account_category_id": cat_name_to_id[chosen_name]}
+                        ).eq("id", row["id"]).execute()
+                        applied += 1
             st.session_state.pop("ai_suggestions", None)
             st.success(f"{applied}건 일괄 등록 완료")
             refresh()
