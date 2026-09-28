@@ -38,13 +38,21 @@ BOOL_TO_GUIDELINE = {None: "미확인", True: "가이드라인 준수", False: "
 # 구글시트 열 이름 ↔ DB 컬럼 매핑 (실제 직원들이 쓰던 작업시트 헤더 기준)
 # 열 이름은 아래 별칭 중 아무거나 써도 인식됨 (대소문자 구분 없음)
 SHEET_COL_MAP = {
-    "influencer_name": ["Name", "이름", "인플루언서명", "인플루언서"],
+    "influencer_name": ["Name", "이름", "인플루언서명", "인플루언서", "아이디 이름", "아이디이름", "SNS_ID"],
     "sns_id": ["SNS_ID", "SNS_아이디"],
-    "sns_url": ["SNS_URL", "SNS_링크"],
+    "sns_url": ["SNS_URL", "SNS_링크", "인스타링크", "틱톡링크", "프로필링크"],
+    "followers": ["팔로워", "팔로워수", "팔로워 수"],
+    "email": ["이메일", "이메일주소"],
+    "address": ["주소"],
+    "shipping_address": ["발송주소", "발송 주소"],
+    "phone": ["전화번호", "연락처"],
     "visit_location": ["방문지점", "지점"],
     "visit_date": ["방문날짜", "방문일"],
     "product_name": ["상품", "제품명", "상품명"],
-    "content_link": ["Upload_URL", "업로드URL", "업로드_URL", "콘텐츠링크", "콘텐츠 링크"],
+    "content_link": [
+        "Upload_URL", "업로드URL", "업로드_URL", "콘텐츠링크", "콘텐츠 링크",
+        "업로드 인스타 링크", "업로드 틱톡 링크", "업로드인스타링크", "업로드틱톡링크",
+    ],
     "views": ["조회수"],
     "likes": ["좋아요수", "좋아요"],
     "saves": ["저장수"],
@@ -53,7 +61,7 @@ SHEET_COL_MAP = {
     "content_type": ["콘텐츠유형", "콘텐츠 유형", "유형"],
     "agency_name": ["대행사", "대행사명"],
     "scheduled_date": ["예정일", "예정 날짜"],
-    "unit_price": ["단가", "인플루언서단가"],
+    "unit_price": ["단가", "인플루언서단가", "금액"],
     "casting_assigned_to": ["섭외지시대상", "섭외 지시 대상", "섭외담당"],
     "guideline_link": ["가이드라인링크", "가이드라인 링크"],
     "notes": ["메모", "비고"],
@@ -84,6 +92,46 @@ def _clean_date(val):
         return pd.to_datetime(s).date().isoformat()
     except Exception:
         return None
+
+
+_ALL_ALIASES_NORM = set()
+for _aliases in SHEET_COL_MAP_NORM.values():
+    _ALL_ALIASES_NORM.update(_aliases)
+
+
+def _find_header_rows(raw_df, min_matches=2):
+    """시트 안에 섹션이 여러 개 있어서 헤더가 1행이 아닐 수도 있으니,
+    알려진 헤더 이름이 2개 이상 매치되는 행을 전부 헤더 후보로 찾는다."""
+    header_rows = []
+    for i in range(len(raw_df)):
+        cells_norm = [str(c).strip().lower() for c in raw_df.iloc[i].tolist() if str(c).strip() and str(c) != "nan"]
+        if sum(1 for c in cells_norm if c in _ALL_ALIASES_NORM) >= min_matches:
+            header_rows.append(i)
+    return header_rows
+
+
+def _parse_multi_section_sheet(raw_df):
+    """찾은 헤더 행들을 기준으로 시트를 여러 섹션으로 나눠서, 섹션마다 각자의 헤더로 파싱한다."""
+    header_rows = _find_header_rows(raw_df)
+    if not header_rows:
+        # 헤더 후보를 하나도 못 찾으면, 그냥 1행을 헤더로 보고 기존 방식대로 시도
+        raw_df.columns = [str(c).strip() for c in raw_df.iloc[0].tolist()]
+        return [_map_sheet_row(r) for _, r in raw_df.iloc[1:].iterrows()]
+
+    all_rows = []
+    for idx, hidx in enumerate(header_rows):
+        end = header_rows[idx + 1] if idx + 1 < len(header_rows) else len(raw_df)
+        header = [str(x).strip() for x in raw_df.iloc[hidx].tolist()]
+        section_df = raw_df.iloc[hidx + 1: end].copy()
+        section_df.columns = header
+        for _, r in section_df.iterrows():
+            non_empty = sum(1 for v in r if pd.notna(v) and str(v).strip())
+            if non_empty < 2:
+                continue  # 구분줄/섹션 제목줄처럼 내용이 거의 없는 행은 건너뜀
+            mapped = _map_sheet_row(r)
+            if mapped.get("influencer_name"):
+                all_rows.append(mapped)
+    return all_rows
 
 
 @st.cache_resource
@@ -186,6 +234,10 @@ def _map_sheet_row(row):
 gc1, gc2 = st.columns([4, 1])
 sheet_url = gc1.text_input("구글시트 링크", placeholder="https://docs.google.com/spreadsheets/d/...", label_visibility="collapsed")
 load_clicked = gc2.button("불러오기", use_container_width=True)
+default_brand = st.text_input(
+    "이 시트 전체에 적용할 기본 브랜드명 (행에 브랜드사 칸이 없으면 이걸로 채워요, 예: 기자단 섹션)",
+    placeholder="예: OWM",
+)
 
 if load_clicked:
     if not sheet_url.strip():
@@ -199,24 +251,29 @@ if load_clicked:
                 res = requests.get(csv_url, timeout=15)
                 if res.status_code != 200:
                     raise ValueError(f"응답 코드 {res.status_code}")
-                df = pd.read_csv(io.StringIO(res.text))
-                if df.empty:
+                raw_df = pd.read_csv(io.StringIO(res.text), header=None, dtype=str)
+                if raw_df.empty:
                     st.warning("시트에서 데이터를 찾지 못했습니다.")
                 else:
-                    raw_rows = [_map_sheet_row(r) for _, r in df.iterrows()]
-                    raw_rows = [r for r in raw_rows if r.get("brand_name") and r.get("influencer_name")]
+                    raw_rows = _parse_multi_section_sheet(raw_df)
+                    if not raw_rows:
+                        st.warning("인플루언서명(이름/Name/아이디 이름 등)을 인식하지 못했습니다. 시트 헤더 이름을 확인해주세요.")
+                    # 브랜드사가 없는 행(예: 기자단 섹션)은 기본 브랜드명으로 채움
+                    for r in raw_rows:
+                        if not r.get("brand_name"):
+                            r["brand_name"] = default_brand.strip() or "미지정"
                     # 브랜드사 칸에 "닥터리엔장,텔로엑트,옵티팜" 처럼 여러 브랜드가 콤마로 같이 들어있으면
                     # 브랜드별로 한 건씩 쪼개서 저장한다 (업체별 배치 현황을 정확히 보기 위함)
                     rows = []
                     for r in raw_rows:
                         brand_field = r["brand_name"]
-                        brand_list = [b.strip() for b in brand_field.replace("、", ",").split(",") if b.strip()]
+                        brand_list = [b.strip("() ") for b in brand_field.replace("、", ",").split(",") if b.strip("() ")]
                         for b in (brand_list or [brand_field]):
                             row_copy = dict(r)
                             row_copy["brand_name"] = b
                             rows.append(row_copy)
                     st.session_state["sheet_rows_preview"] = rows
-                    st.success(f"{len(rows)}건 인식됨. 아래에서 확인 후 등록하세요.")
+                    st.success(f"{len(rows)}건 인식됨 (섹션 {len(_find_header_rows(raw_df))}개 감지). 아래에서 확인 후 등록하세요.")
             except Exception as e:
                 st.error(
                     f"시트를 못 읽었어요 ({e}). 구글시트가 '링크가 있는 모든 사용자 - 뷰어'로 공유되어 있는지 확인해주세요."
@@ -239,7 +296,9 @@ if preview_rows:
                 "scheduled_date": _clean_date(r.get("scheduled_date")),
                 "unit_price": _clean_number(r.get("unit_price")),
                 "views": _clean_number(r.get("views")), "likes": _clean_number(r.get("likes")),
-                "saves": _clean_number(r.get("saves")),
+                "saves": _clean_number(r.get("saves")), "followers": _clean_number(r.get("followers")),
+                "email": r.get("email"), "address": r.get("address"),
+                "shipping_address": r.get("shipping_address"), "phone": r.get("phone"),
                 "casting_assigned_to": r.get("casting_assigned_to"),
                 "guideline_link": r.get("guideline_link"),
                 "content_link": content_link,
@@ -355,6 +414,10 @@ for brand in brands:
                     st.caption(" · ".join(meta))
                 if any(p.get(k) for k in ("views", "likes", "saves")):
                     st.caption(f"📈 조회수 {p.get('views') or 0:,} · 좋아요 {p.get('likes') or 0:,} · 저장 {p.get('saves') or 0:,}")
+                if p.get("followers"):
+                    st.caption(f"👥 팔로워 {p['followers']:,}")
+                if p.get("shipping_address") or p.get("phone"):
+                    st.caption(f"📦 발송: {p.get('shipping_address') or ''} {p.get('phone') or ''}")
                 if p.get("sns_url"):
                     st.caption(f"🔗 SNS: {p['sns_url']}")
                 if p.get("guideline_link"):
