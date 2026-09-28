@@ -115,13 +115,19 @@ def _parse_multi_section_sheet(raw_df):
     header_rows = _find_header_rows(raw_df)
     if not header_rows:
         # 헤더 후보를 하나도 못 찾으면, 그냥 1행을 헤더로 보고 기존 방식대로 시도
-        raw_df.columns = [str(c).strip() for c in raw_df.iloc[0].tolist()]
+        raw_df.columns = [
+            (str(c).strip() if pd.notna(c) and str(c).strip() else f"_blank_{i}")
+            for i, c in enumerate(raw_df.iloc[0].tolist())
+        ]
         return [_map_sheet_row(r) for _, r in raw_df.iloc[1:].iterrows()]
 
     all_rows = []
     for idx, hidx in enumerate(header_rows):
         end = header_rows[idx + 1] if idx + 1 < len(header_rows) else len(raw_df)
-        header = [str(x).strip() for x in raw_df.iloc[hidx].tolist()]
+        header = [
+            (str(x).strip() if pd.notna(x) and str(x).strip() else f"_blank_{i}")
+            for i, x in enumerate(raw_df.iloc[hidx].tolist())
+        ]
         section_df = raw_df.iloc[hidx + 1: end].copy()
         section_df.columns = header
         for _, r in section_df.iterrows():
@@ -216,12 +222,15 @@ def _sheet_xlsx_url(sheet_url):
 
 def _map_sheet_row(row):
     mapped = {}
-    row_index_norm = {str(c).strip().lower(): c for c in row.index}
+    row_index_norm = {}
+    for pos, c in enumerate(row.index):
+        key = str(c).strip().lower()
+        if key not in row_index_norm:  # 같은 이름의 열이 여러 개면 첫 번째 것만 사용
+            row_index_norm[key] = pos
     for db_col, aliases_norm in SHEET_COL_MAP_NORM.items():
         for alias_norm in aliases_norm:
             if alias_norm in row_index_norm:
-                real_col = row_index_norm[alias_norm]
-                val = row[real_col]
+                val = row.iloc[row_index_norm[alias_norm]]  # 위치 기반 조회라 항상 스칼라값 하나만 나옴
                 if pd.notna(val) and str(val).strip():
                     mapped[db_col] = str(val).strip()
                     break
