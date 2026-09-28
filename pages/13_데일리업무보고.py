@@ -85,11 +85,17 @@ def _clean_number(val):
 
 
 def _clean_date(val):
-    if val is None or str(val).strip() == "":
+    if val is None:
         return None
-    s = str(val).strip().replace(".", "-").rstrip("-")
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "nat", "none", "-", "n/a", "null"):
+        return None
+    s = s.replace(".", "-").rstrip("-")
     try:
-        return pd.to_datetime(s).date().isoformat()
+        d = pd.to_datetime(s)
+        if pd.isna(d):  # pd.to_datetime("nan") 등은 예외 없이 NaT를 반환하므로 반드시 별도 체크 필요
+            return None
+        return d.date().isoformat()
     except Exception:
         return None
 
