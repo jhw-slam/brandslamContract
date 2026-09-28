@@ -325,7 +325,14 @@ if preview_rows:
                 "notes": r.get("notes"),
                 "assigned_to": my_name,
             }
-            SUPA.table("influencer_placements").insert(payload).execute()
+            # 콘텐츠 링크는 진짜 고유값이라, 같은 링크+브랜드 조합이 이미 있으면 새로 만들지 않고 덮어씀
+            # (담당자가 구글시트에서 계속 작업하다 몇 번을 다시 업로드해도 안전하게 최신 값으로 갱신됨)
+            if payload.get("content_link"):
+                SUPA.table("influencer_placements").upsert(
+                    payload, on_conflict="content_link,brand_name"
+                ).execute()
+            else:
+                SUPA.table("influencer_placements").insert(payload).execute()
         st.session_state.pop("sheet_rows_preview", None)
         st.success(f"{len(preview_rows)}건 등록 완료!")
         refresh()
@@ -404,71 +411,119 @@ if not show_done:
 
 st.caption(f"{len(items)}건")
 
-brands = sorted(set(p["brand_name"] for p in items))
-for brand in brands:
-    brand_items = [p for p in items if p["brand_name"] == brand]
-    with st.expander(f"🏢 **{brand}** ({len(brand_items)}건)", expanded=True):
-        for p in brand_items:
-            with st.container(border=True):
-                emoji = STATUS_EMOJI.get(p["status"], "⚪")
-                sns = f" (@{p['sns_id']})" if p.get("sns_id") else ""
-                st.markdown(f"**{p['influencer_name']}**{sns} · {p.get('category') or ''} · {p.get('content_type') or ''}  {emoji} {p['status']}")
-                meta = []
-                if p.get("product_name"):
-                    meta.append(f"상품: {p['product_name']}")
-                if p.get("visit_location"):
-                    meta.append(f"방문지점: {p['visit_location']}")
-                if p.get("visit_date"):
-                    meta.append(f"방문일: {p['visit_date']}")
-                if p.get("agency_name"):
-                    meta.append(f"대행사: {p['agency_name']}")
-                if p.get("assigned_to"):
-                    meta.append(f"담당: {p['assigned_to']}")
-                if p.get("casting_assigned_to"):
-                    meta.append(f"섭외지시: {p['casting_assigned_to']}")
-                if p.get("scheduled_date"):
-                    meta.append(f"예정일: {p['scheduled_date']}")
-                if meta:
-                    st.caption(" · ".join(meta))
-                if any(p.get(k) for k in ("views", "likes", "saves")):
-                    st.caption(f"📈 조회수 {p.get('views') or 0:,} · 좋아요 {p.get('likes') or 0:,} · 저장 {p.get('saves') or 0:,}")
-                if p.get("followers"):
-                    st.caption(f"👥 팔로워 {p['followers']:,}")
-                if p.get("shipping_address") or p.get("phone"):
-                    st.caption(f"📦 발송: {p.get('shipping_address') or ''} {p.get('phone') or ''}")
-                if p.get("sns_url"):
-                    st.caption(f"🔗 SNS: {p['sns_url']}")
-                if p.get("guideline_link"):
-                    st.caption(f"📎 가이드라인: {p['guideline_link']}")
-                if p.get("contract_file_url"):
-                    st.caption(f"📄 계약서: {p['contract_file_url']}")
-                if p.get("notes"):
-                    st.caption(f"메모: {p['notes']}")
+view_mode = st.radio("보기 방식", ["📊 표로 한눈에 보기", "🗂️ 카드로 자세히 보기"], horizontal=True, key="placements_view_mode")
 
-                cc1, cc2, cc3 = st.columns([1.1, 1.1, 2.3])
-                new_status = cc1.selectbox(
-                    "상태", STATUS_OPTS, index=STATUS_OPTS.index(p["status"]) if p["status"] in STATUS_OPTS else 0,
-                    key=f"status_{p['id']}", label_visibility="collapsed",
-                )
-                cur_guideline_label = BOOL_TO_GUIDELINE.get(p.get("guideline_ok"), "미확인")
-                new_guideline_label = cc2.selectbox(
-                    "가이드라인", GUIDELINE_OPTS, index=GUIDELINE_OPTS.index(cur_guideline_label),
-                    key=f"guideline_{p['id']}", label_visibility="collapsed",
-                )
-                new_link = cc3.text_input(
-                    "콘텐츠 링크", value=p.get("content_link") or "", placeholder="업로드된 콘텐츠 링크(=성과보고 링크)",
-                    key=f"link_{p['id']}", label_visibility="collapsed",
-                )
-                if st.button("저장", key=f"save_{p['id']}", use_container_width=True):
-                    update_payload = {
-                        "status": new_status, "content_link": new_link or None,
-                        "guideline_ok": GUIDELINE_TO_BOOL[new_guideline_label],
-                    }
-                    if new_status == "업로드완료" and not p.get("actual_upload_date"):
+if view_mode == "📊 표로 한눈에 보기":
+    if not items:
+        st.caption("표시할 항목이 없습니다.")
+    else:
+        table_df = pd.DataFrame([{
+            "id": p["id"], "브랜드": p["brand_name"], "인플루언서": p["influencer_name"],
+            "카테고리": p.get("category") or "", "유형": p.get("content_type") or "",
+            "상태": p["status"], "콘텐츠 링크": p.get("content_link") or "",
+            "담당": p.get("assigned_to") or "", "예정일": p.get("scheduled_date") or "",
+        } for p in items])
+        edited_table = st.data_editor(
+            table_df,
+            column_config={
+                "id": None,
+                "상태": st.column_config.SelectboxColumn(options=STATUS_OPTS, width="small"),
+                "콘텐츠 링크": st.column_config.TextColumn(width="medium"),
+                "브랜드": st.column_config.TextColumn(disabled=True),
+                "인플루언서": st.column_config.TextColumn(disabled=True),
+                "카테고리": st.column_config.TextColumn(disabled=True, width="small"),
+                "유형": st.column_config.TextColumn(disabled=True, width="small"),
+                "담당": st.column_config.TextColumn(disabled=True, width="small"),
+                "예정일": st.column_config.TextColumn(disabled=True, width="small"),
+            },
+            hide_index=True, use_container_width=True, key="placements_table_editor",
+        )
+        if st.button("💾 표에서 바뀐 상태/링크 저장", type="primary"):
+            by_id = {p["id"]: p for p in items}
+            changed = 0
+            for _, row in edited_table.iterrows():
+                orig = by_id.get(row["id"])
+                if not orig:
+                    continue
+                new_status = row["상태"]
+                new_link = row["콘텐츠 링크"] or None
+                if new_status != orig["status"] or new_link != (orig.get("content_link") or None):
+                    update_payload = {"status": new_status, "content_link": new_link}
+                    if new_status == "업로드완료" and not orig.get("actual_upload_date"):
                         update_payload["actual_upload_date"] = date.today().isoformat()
-                    SUPA.table("influencer_placements").update(update_payload).eq("id", p["id"]).execute()
-                    st.success("저장 완료")
-                    refresh()
+                    SUPA.table("influencer_placements").update(update_payload).eq("id", row["id"]).execute()
+                    changed += 1
+            st.success(f"{changed}건 저장 완료" if changed else "바뀐 내용이 없습니다.")
+            if changed:
+                refresh()
+        st.caption("자세한 정보(가이드라인/성과지표/발송정보 등)를 보거나 고치려면 '카드로 자세히 보기'를 사용하세요.")
+
+else:
+    brands = sorted(set(p["brand_name"] for p in items))
+    for brand in brands:
+        brand_items = [p for p in items if p["brand_name"] == brand]
+        with st.expander(f"🏢 **{brand}** ({len(brand_items)}건)", expanded=False):
+            for p in brand_items:
+                with st.container(border=True):
+                    emoji = STATUS_EMOJI.get(p["status"], "⚪")
+                    sns = f" (@{p['sns_id']})" if p.get("sns_id") else ""
+                    st.markdown(f"**{p['influencer_name']}**{sns} · {p.get('category') or ''} · {p.get('content_type') or ''}  {emoji} {p['status']}")
+                    meta = []
+                    if p.get("product_name"):
+                        meta.append(f"상품: {p['product_name']}")
+                    if p.get("visit_location"):
+                        meta.append(f"방문지점: {p['visit_location']}")
+                    if p.get("visit_date"):
+                        meta.append(f"방문일: {p['visit_date']}")
+                    if p.get("agency_name"):
+                        meta.append(f"대행사: {p['agency_name']}")
+                    if p.get("assigned_to"):
+                        meta.append(f"담당: {p['assigned_to']}")
+                    if p.get("casting_assigned_to"):
+                        meta.append(f"섭외지시: {p['casting_assigned_to']}")
+                    if p.get("scheduled_date"):
+                        meta.append(f"예정일: {p['scheduled_date']}")
+                    if meta:
+                        st.caption(" · ".join(meta))
+                    if any(p.get(k) for k in ("views", "likes", "saves")):
+                        st.caption(f"📈 조회수 {p.get('views') or 0:,} · 좋아요 {p.get('likes') or 0:,} · 저장 {p.get('saves') or 0:,}")
+                    if p.get("followers"):
+                        st.caption(f"👥 팔로워 {p['followers']:,}")
+                    if p.get("shipping_address") or p.get("phone"):
+                        st.caption(f"📦 발송: {p.get('shipping_address') or ''} {p.get('phone') or ''}")
+                    if p.get("sns_url"):
+                        st.caption(f"🔗 SNS: {p['sns_url']}")
+                    if p.get("guideline_link"):
+                        st.caption(f"📎 가이드라인: {p['guideline_link']}")
+                    if p.get("contract_file_url"):
+                        st.caption(f"📄 계약서: {p['contract_file_url']}")
+                    if p.get("notes"):
+                        st.caption(f"메모: {p['notes']}")
+
+                    cc1, cc2, cc3 = st.columns([1.1, 1.1, 2.3])
+                    new_status = cc1.selectbox(
+                        "상태", STATUS_OPTS, index=STATUS_OPTS.index(p["status"]) if p["status"] in STATUS_OPTS else 0,
+                        key=f"status_{p['id']}", label_visibility="collapsed",
+                    )
+                    cur_guideline_label = BOOL_TO_GUIDELINE.get(p.get("guideline_ok"), "미확인")
+                    new_guideline_label = cc2.selectbox(
+                        "가이드라인", GUIDELINE_OPTS, index=GUIDELINE_OPTS.index(cur_guideline_label),
+                        key=f"guideline_{p['id']}", label_visibility="collapsed",
+                    )
+                    new_link = cc3.text_input(
+                        "콘텐츠 링크", value=p.get("content_link") or "", placeholder="업로드된 콘텐츠 링크(=성과보고 링크)",
+                        key=f"link_{p['id']}", label_visibility="collapsed",
+                    )
+                    if st.button("저장", key=f"save_{p['id']}", use_container_width=True):
+                        update_payload = {
+                            "status": new_status, "content_link": new_link or None,
+                            "guideline_ok": GUIDELINE_TO_BOOL[new_guideline_label],
+                        }
+                        if new_status == "업로드완료" and not p.get("actual_upload_date"):
+                            update_payload["actual_upload_date"] = date.today().isoformat()
+                        SUPA.table("influencer_placements").update(update_payload).eq("id", p["id"]).execute()
+                        st.success("저장 완료")
+                        refresh()
 
 st.divider()
 
@@ -516,6 +571,17 @@ st.divider()
 st.subheader("📊 내 요약 카드")
 st.caption("직접 채우는 표가 아니라, 위에서 남긴 기록들이 자동으로 정리되는 카드예요. 관리자와 소통할 때 참고용으로 쓰세요.")
 
+def _naive_ts(val):
+    """created_at 등은 시간대 정보(tz-aware)가 있고 week_ago는 없어서(tz-naive) 그냥 비교하면
+    'Cannot compare tz-naive and tz-aware timestamps' 에러가 남 — 항상 tz 정보를 떼고 비교한다."""
+    if val is None:
+        return None
+    ts = pd.Timestamp(val)
+    if ts.tzinfo is not None:
+        ts = ts.tz_localize(None)
+    return ts
+
+
 week_ago = pd.Timestamp.now() - timedelta(days=7)
 my_placements = [p for p in placements if p["assigned_to"] == my_name]
 my_logs_all = SUPA.table("daily_activity_log").select("*").eq("staff_name", my_name).order("created_at", desc=True).limit(50).execute().data
@@ -524,12 +590,12 @@ status_counts = {s: 0 for s in STATUS_OPTS}
 for p in my_placements:
     status_counts[p["status"]] = status_counts.get(p["status"], 0) + 1
 
-new_this_week = sum(1 for p in my_placements if pd.Timestamp(p["created_at"]) >= week_ago)
+new_this_week = sum(1 for p in my_placements if _naive_ts(p["created_at"]) >= week_ago)
 done_this_week = sum(
     1 for p in my_placements
-    if p.get("actual_upload_date") and pd.Timestamp(p["actual_upload_date"]) >= week_ago
+    if p.get("actual_upload_date") and _naive_ts(p["actual_upload_date"]) >= week_ago
 )
-logs_this_week = sum(1 for lg in my_logs_all if pd.Timestamp(lg["created_at"]) >= week_ago)
+logs_this_week = sum(1 for lg in my_logs_all if _naive_ts(lg["created_at"]) >= week_ago)
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("이번주 신규 등록", f"{new_this_week}건")
