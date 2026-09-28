@@ -185,14 +185,34 @@ st.divider()
 # 🖊️ 오늘 빠른 기록
 # ══════════════════════════════════════════════════════════
 st.subheader("🖊️ 오늘 빠른 기록")
-st.caption("특정 브랜드/인플루언서 카드를 안 만들어도, 그냥 오늘 뭐 했는지 한 줄만 남기면 됩니다.")
+st.caption("오늘 한 일, 내일/오늘 할 일, 뭐든 편하게 적으세요. 링크나 PDF도 같이 남길 수 있어요 — 형식 신경 안 쓰셔도 됩니다.")
 with st.form("quick_log_form", clear_on_submit=True):
-    qc1, qc2 = st.columns([4, 1])
-    quick_note = qc1.text_input("오늘 한 일", placeholder="예: 사누바리한테 왕홍 5명 섭외 지시함", label_visibility="collapsed")
-    quick_submitted = qc2.form_submit_button("기록", type="primary", use_container_width=True)
+    quick_note = st.text_area(
+        "오늘/앞으로 할 일", placeholder="예: 오늘 사누바리한테 왕홍 5명 섭외 지시함 / 내일은 명동점 재고 확인 예정",
+        label_visibility="collapsed", height=90,
+    )
+    qc1, qc2 = st.columns(2)
+    quick_link = qc1.text_input("참고 링크(구글시트/문서 등, 선택)", placeholder="https://...")
+    quick_file = qc2.file_uploader("파일 첨부(PDF 등, 선택)", type=["pdf", "docx", "png", "jpg", "jpeg", "xlsx"])
+    quick_submitted = st.form_submit_button("📝 기록", type="primary", use_container_width=True)
 if quick_submitted:
     if quick_note.strip():
-        SUPA.table("daily_activity_log").insert({"staff_name": my_name, "note": quick_note.strip()}).execute()
+        attachment_url = None
+        if quick_file is not None:
+            try:
+                path = f"{my_name}/{int(pd.Timestamp.now().timestamp())}_{quick_file.name}"
+                SUPA.storage.from_("daily-log-attachments").upload(
+                    path, quick_file.getvalue(),
+                    {"content-type": quick_file.type or "application/octet-stream"},
+                )
+                base = os.environ.get("SUPABASE_URL")
+                attachment_url = f"{base}/storage/v1/object/public/daily-log-attachments/{path}"
+            except Exception as e:
+                st.warning(f"파일 첨부는 실패했지만 기록은 남길게요 ({e})")
+        SUPA.table("daily_activity_log").insert({
+            "staff_name": my_name, "note": quick_note.strip(),
+            "link_url": quick_link.strip() or None, "attachment_url": attachment_url,
+        }).execute()
         st.success("기록 완료!")
         refresh()
     else:
@@ -203,7 +223,13 @@ if recent_logs:
     with st.expander(f"최근 기록 {len(recent_logs)}건 보기"):
         for lg in recent_logs:
             when = lg["created_at"][:16].replace("T", " ")
-            st.caption(f"{when} · **{lg['staff_name']}** · {lg['note']}")
+            extra = []
+            if lg.get("link_url"):
+                extra.append(f"[링크]({lg['link_url']})")
+            if lg.get("attachment_url"):
+                extra.append(f"[첨부파일]({lg['attachment_url']})")
+            extra_txt = " · " + " · ".join(extra) if extra else ""
+            st.caption(f"{when} · **{lg['staff_name']}** · {lg['note']}{extra_txt}")
 
 st.divider()
 
@@ -605,3 +631,62 @@ m4.metric("전체 진행중", f"{sum(v for k, v in status_counts.items() if k no
 
 st.markdown("**상태별 현황**")
 st.bar_chart(pd.Series(status_counts))
+
+st.divider()
+
+# ══════════════════════════════════════════════════════════
+# 🎯 팀 OKR 현황 (읽기 전용 — 기존 OKR 자료 그대로, 편집 기능 없음)
+# ══════════════════════════════════════════════════════════
+st.subheader("🎯 팀 OKR 현황")
+
+
+@st.cache_data(ttl=60)
+def load_okr():
+    org = SUPA.table("okr_org").select("*").order("person").execute().data
+    items = SUPA.table("okr_items").select("*").order("person").execute().data
+    return org, items
+
+
+with st.expander("열기 (평소엔 접어둠)", expanded=False):
+    st.caption("전사 목표(OKR)를 참고용으로 보여드려요. 여기서는 수정이 안 되고 확인만 하는 용도예요 — 편집은 기존 OKR 페이지에서 계속 하시면 됩니다.")
+    okr_org_data, okr_items_data = load_okr()
+
+    if not okr_org_data:
+        st.caption("등록된 OKR이 없습니다.")
+    else:
+        okr_view = st.radio("보기", ["🏢 회사 전체 OKR", "👤 개별 보기"], horizontal=True, key="okr_view_mode")
+
+        if okr_view == "🏢 회사 전체 OKR":
+            for o in okr_org_data:
+                pending_tag = " · 🔲채용예정" if o.get("pending") else ""
+                st.markdown(f"**{o['person']}**{pending_tag} — {o.get('objective') or '-'}")
+        else:
+            target_p = st.selectbox("사람 선택", [o["person"] for o in okr_org_data], key="okr_indiv_person")
+            o = next(x for x in okr_org_data if x["person"] == target_p)
+            with st.container(border=True):
+                pending_tag = " · 🔲 채용예정" if o.get("pending") else ""
+                st.markdown(f"#### 👤 {o['person']}{pending_tag}")
+                if o.get("tag"):
+                    st.caption(o["tag"])
+                st.markdown(f"**🎯 Objective:** {o.get('objective') or '-'}")
+
+                krs = o.get("krs") or []
+                if krs:
+                    st.markdown("**Key Results**")
+                    for kr in krs:
+                        st.markdown(f"- {kr}")
+
+                person_items = [it for it in okr_items_data if it["person"] == o["person"]]
+                if person_items:
+                    st.markdown(f"**📌 세부 진행 항목 ({len(person_items)}개)**")
+                    for it in person_items:
+                        try:
+                            target = float(it.get("target_qty") or 0)
+                            progress = float(it.get("progress") or 0)
+                        except (TypeError, ValueError):
+                            target, progress = 0, 0
+                        pct = min(progress / target, 1.0) if target > 0 else (1.0 if progress > 0 else 0.0)
+                        conf = "✅" if it.get("confirmed") else "🔲"
+                        unit = it.get("unit") or ""
+                        st.caption(f"{conf} [{it.get('category') or '미분류'}] {it['title']} — {progress:g}/{target:g}{unit}")
+                        st.progress(pct)
