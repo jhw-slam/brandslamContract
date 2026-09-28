@@ -207,14 +207,11 @@ st.caption(
 )
 
 
-def _sheet_csv_url(sheet_url):
+def _sheet_xlsx_url(sheet_url):
     if "/spreadsheets/d/" not in sheet_url:
         return None
     sheet_id = sheet_url.split("/spreadsheets/d/")[1].split("/")[0]
-    gid = "0"
-    if "gid=" in sheet_url:
-        gid = sheet_url.split("gid=")[1].split("&")[0].split("#")[0]
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
 
 
 def _map_sheet_row(row):
@@ -238,42 +235,48 @@ default_brand = st.text_input(
     "이 시트 전체에 적용할 기본 브랜드명 (행에 브랜드사 칸이 없으면 이걸로 채워요, 예: 기자단 섹션)",
     placeholder="예: OWM",
 )
+st.caption("스프레드시트 안에 탭이 여러 개 있어도, 링크 하나만 붙여넣으면 모든 탭을 자동으로 다 읽어옵니다.")
 
 if load_clicked:
     if not sheet_url.strip():
         st.error("링크를 붙여넣어주세요.")
     else:
-        csv_url = _sheet_csv_url(sheet_url.strip())
-        if not csv_url:
+        xlsx_url = _sheet_xlsx_url(sheet_url.strip())
+        if not xlsx_url:
             st.error("구글시트 링크 형식이 아닌 것 같아요. 시트를 열어서 주소창의 링크를 그대로 복사해주세요.")
         else:
             try:
-                res = requests.get(csv_url, timeout=15)
+                res = requests.get(xlsx_url, timeout=30)
                 if res.status_code != 200:
                     raise ValueError(f"응답 코드 {res.status_code}")
-                raw_df = pd.read_csv(io.StringIO(res.text), header=None, dtype=str)
-                if raw_df.empty:
-                    st.warning("시트에서 데이터를 찾지 못했습니다.")
-                else:
-                    raw_rows = _parse_multi_section_sheet(raw_df)
-                    if not raw_rows:
-                        st.warning("인플루언서명(이름/Name/아이디 이름 등)을 인식하지 못했습니다. 시트 헤더 이름을 확인해주세요.")
-                    # 브랜드사가 없는 행(예: 기자단 섹션)은 기본 브랜드명으로 채움
-                    for r in raw_rows:
-                        if not r.get("brand_name"):
-                            r["brand_name"] = default_brand.strip() or "미지정"
-                    # 브랜드사 칸에 "닥터리엔장,텔로엑트,옵티팜" 처럼 여러 브랜드가 콤마로 같이 들어있으면
-                    # 브랜드별로 한 건씩 쪼개서 저장한다 (업체별 배치 현황을 정확히 보기 위함)
-                    rows = []
-                    for r in raw_rows:
-                        brand_field = r["brand_name"]
-                        brand_list = [b.strip("() ") for b in brand_field.replace("、", ",").split(",") if b.strip("() ")]
-                        for b in (brand_list or [brand_field]):
-                            row_copy = dict(r)
-                            row_copy["brand_name"] = b
-                            rows.append(row_copy)
-                    st.session_state["sheet_rows_preview"] = rows
-                    st.success(f"{len(rows)}건 인식됨 (섹션 {len(_find_header_rows(raw_df))}개 감지). 아래에서 확인 후 등록하세요.")
+                all_sheets = pd.read_excel(io.BytesIO(res.content), sheet_name=None, header=None, dtype=str)
+                raw_rows = []
+                sections_found = 0
+                for sheet_name, raw_df in all_sheets.items():
+                    if raw_df.empty:
+                        continue
+                    sections_found += len(_find_header_rows(raw_df))
+                    for r in _parse_multi_section_sheet(raw_df):
+                        r["_source_tab"] = sheet_name
+                        raw_rows.append(r)
+                if not raw_rows:
+                    st.warning("인플루언서명(이름/Name/아이디 이름 등)을 인식하지 못했습니다. 시트 헤더 이름을 확인해주세요.")
+                # 브랜드사가 없는 행(예: 기자단 섹션)은 기본 브랜드명으로 채움
+                for r in raw_rows:
+                    if not r.get("brand_name"):
+                        r["brand_name"] = default_brand.strip() or "미지정"
+                # 브랜드사 칸에 "닥터리엔장,텔로엑트,옵티팜" 처럼 여러 브랜드가 콤마로 같이 들어있으면
+                # 브랜드별로 한 건씩 쪼개서 저장한다 (업체별 배치 현황을 정확히 보기 위함)
+                rows = []
+                for r in raw_rows:
+                    brand_field = r["brand_name"]
+                    brand_list = [b.strip("() ") for b in brand_field.replace("、", ",").split(",") if b.strip("() ")]
+                    for b in (brand_list or [brand_field]):
+                        row_copy = dict(r)
+                        row_copy["brand_name"] = b
+                        rows.append(row_copy)
+                st.session_state["sheet_rows_preview"] = rows
+                st.success(f"탭 {len(all_sheets)}개 · 섹션 {sections_found}개에서 {len(rows)}건 인식됨. 아래에서 확인 후 등록하세요.")
             except Exception as e:
                 st.error(
                     f"시트를 못 읽었어요 ({e}). 구글시트가 '링크가 있는 모든 사용자 - 뷰어'로 공유되어 있는지 확인해주세요."
