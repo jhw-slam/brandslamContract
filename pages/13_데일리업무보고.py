@@ -35,10 +35,20 @@ GUIDELINE_OPTS = ["미확인", "가이드라인 준수", "수정 필요"]
 GUIDELINE_TO_BOOL = {"미확인": None, "가이드라인 준수": True, "수정 필요": False}
 BOOL_TO_GUIDELINE = {None: "미확인", True: "가이드라인 준수", False: "수정 필요"}
 
-# 구글시트 열 이름 ↔ DB 컬럼 매핑 (열 이름은 이 중 아무거나 써도 인식됨)
+# 구글시트 열 이름 ↔ DB 컬럼 매핑 (실제 직원들이 쓰던 작업시트 헤더 기준)
+# 열 이름은 아래 별칭 중 아무거나 써도 인식됨 (대소문자 구분 없음)
 SHEET_COL_MAP = {
-    "brand_name": ["브랜드명", "브랜드", "업체명"],
-    "influencer_name": ["인플루언서명", "인플루언서", "인플루언서이름"],
+    "influencer_name": ["Name", "이름", "인플루언서명", "인플루언서"],
+    "sns_id": ["SNS_ID", "SNS_아이디"],
+    "sns_url": ["SNS_URL", "SNS_링크"],
+    "visit_location": ["방문지점", "지점"],
+    "visit_date": ["방문날짜", "방문일"],
+    "product_name": ["상품", "제품명", "상품명"],
+    "content_link": ["Upload_URL", "업로드URL", "업로드_URL", "콘텐츠링크", "콘텐츠 링크"],
+    "views": ["조회수"],
+    "likes": ["좋아요수", "좋아요"],
+    "saves": ["저장수"],
+    "brand_name": ["브랜드사", "브랜드명", "브랜드", "업체명"],
     "category": ["카테고리", "분류"],
     "content_type": ["콘텐츠유형", "콘텐츠 유형", "유형"],
     "agency_name": ["대행사", "대행사명"],
@@ -48,6 +58,32 @@ SHEET_COL_MAP = {
     "guideline_link": ["가이드라인링크", "가이드라인 링크"],
     "notes": ["메모", "비고"],
 }
+# 시트 열 이름이 대소문자/공백만 다르게 들어와도 인식되도록, 별칭을 정규화해서 매칭한다
+SHEET_COL_MAP_NORM = {
+    db_col: [a.strip().lower() for a in aliases] for db_col, aliases in SHEET_COL_MAP.items()
+}
+
+
+def _clean_number(val):
+    if val is None:
+        return None
+    s = str(val).strip().replace(",", "")
+    if not s or s in ("-", "–", "N/A", "n/a"):
+        return None
+    try:
+        return int(float(s))
+    except ValueError:
+        return None
+
+
+def _clean_date(val):
+    if val is None or str(val).strip() == "":
+        return None
+    s = str(val).strip().replace(".", "-").rstrip("-")
+    try:
+        return pd.to_datetime(s).date().isoformat()
+    except Exception:
+        return None
 
 
 @st.cache_resource
@@ -118,8 +154,8 @@ st.subheader("📥 구글시트로 일괄 등록")
 st.caption(
     "여러 건을 한 번에 올리고 싶으면, 구글시트 링크를 붙여넣으세요. "
     "시트는 '링크가 있는 모든 사용자 - 뷰어'로 공유 설정만 해두면 됩니다. "
-    "열 이름 예시: 브랜드명, 인플루언서명, 카테고리, 콘텐츠유형, 대행사, 예정일, 단가, 섭외지시대상, 가이드라인링크, 메모 "
-    "(다 안 채워도 되고, 순서도 상관없어요 — 브랜드명/인플루언서명만 있으면 나머지는 비워둬도 됩니다)"
+    "지금 쓰시는 작업시트 헤더(Name, SNS_ID, SNS_URL, 방문지점, 방문날짜, 상품, Upload_URL, 조회수, 좋아요수, 저장수, 브랜드사) 그대로 인식돼요. "
+    "브랜드사 칸에 여러 브랜드가 콤마로 같이 있으면 브랜드별로 자동으로 나눠서 등록됩니다. Upload_URL이 있으면 상태도 자동으로 '업로드완료'로 잡혀요."
 )
 
 
@@ -135,11 +171,15 @@ def _sheet_csv_url(sheet_url):
 
 def _map_sheet_row(row):
     mapped = {}
-    for db_col, aliases in SHEET_COL_MAP.items():
-        for alias in aliases:
-            if alias in row.index and pd.notna(row[alias]) and str(row[alias]).strip():
-                mapped[db_col] = str(row[alias]).strip()
-                break
+    row_index_norm = {str(c).strip().lower(): c for c in row.index}
+    for db_col, aliases_norm in SHEET_COL_MAP_NORM.items():
+        for alias_norm in aliases_norm:
+            if alias_norm in row_index_norm:
+                real_col = row_index_norm[alias_norm]
+                val = row[real_col]
+                if pd.notna(val) and str(val).strip():
+                    mapped[db_col] = str(val).strip()
+                    break
     return mapped
 
 
@@ -163,8 +203,18 @@ if load_clicked:
                 if df.empty:
                     st.warning("시트에서 데이터를 찾지 못했습니다.")
                 else:
-                    rows = [_map_sheet_row(r) for _, r in df.iterrows()]
-                    rows = [r for r in rows if r.get("brand_name") and r.get("influencer_name")]
+                    raw_rows = [_map_sheet_row(r) for _, r in df.iterrows()]
+                    raw_rows = [r for r in raw_rows if r.get("brand_name") and r.get("influencer_name")]
+                    # 브랜드사 칸에 "닥터리엔장,텔로엑트,옵티팜" 처럼 여러 브랜드가 콤마로 같이 들어있으면
+                    # 브랜드별로 한 건씩 쪼개서 저장한다 (업체별 배치 현황을 정확히 보기 위함)
+                    rows = []
+                    for r in raw_rows:
+                        brand_field = r["brand_name"]
+                        brand_list = [b.strip() for b in brand_field.replace("、", ",").split(",") if b.strip()]
+                        for b in (brand_list or [brand_field]):
+                            row_copy = dict(r)
+                            row_copy["brand_name"] = b
+                            rows.append(row_copy)
                     st.session_state["sheet_rows_preview"] = rows
                     st.success(f"{len(rows)}건 인식됨. 아래에서 확인 후 등록하세요.")
             except Exception as e:
@@ -177,15 +227,24 @@ if preview_rows:
     st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
     if st.button(f"✅ 이 {len(preview_rows)}건 일괄 등록", type="primary"):
         for r in preview_rows:
+            content_link = r.get("content_link")
             payload = {
                 "brand_name": r.get("brand_name"), "influencer_name": r.get("influencer_name"),
                 "category": r.get("category") if r.get("category") in CATEGORY_OPTS else "기타",
                 "content_type": r.get("content_type") if r.get("content_type") in CONTENT_TYPE_OPTS else "기타",
                 "agency_name": r.get("agency_name"),
-                "scheduled_date": r.get("scheduled_date") or None,
-                "unit_price": float(r["unit_price"]) if r.get("unit_price") and str(r["unit_price"]).replace(".", "", 1).isdigit() else None,
+                "sns_id": r.get("sns_id"), "sns_url": r.get("sns_url"),
+                "product_name": r.get("product_name"), "visit_location": r.get("visit_location"),
+                "visit_date": _clean_date(r.get("visit_date")),
+                "scheduled_date": _clean_date(r.get("scheduled_date")),
+                "unit_price": _clean_number(r.get("unit_price")),
+                "views": _clean_number(r.get("views")), "likes": _clean_number(r.get("likes")),
+                "saves": _clean_number(r.get("saves")),
                 "casting_assigned_to": r.get("casting_assigned_to"),
                 "guideline_link": r.get("guideline_link"),
+                "content_link": content_link,
+                "status": "업로드완료" if content_link else "섭외중",
+                "actual_upload_date": date.today().isoformat() if content_link else None,
                 "notes": r.get("notes"),
                 "assigned_to": my_name,
             }
@@ -275,8 +334,15 @@ for brand in brands:
         for p in brand_items:
             with st.container(border=True):
                 emoji = STATUS_EMOJI.get(p["status"], "⚪")
-                st.markdown(f"**{p['influencer_name']}** · {p.get('category') or ''} · {p.get('content_type') or ''}  {emoji} {p['status']}")
+                sns = f" (@{p['sns_id']})" if p.get("sns_id") else ""
+                st.markdown(f"**{p['influencer_name']}**{sns} · {p.get('category') or ''} · {p.get('content_type') or ''}  {emoji} {p['status']}")
                 meta = []
+                if p.get("product_name"):
+                    meta.append(f"상품: {p['product_name']}")
+                if p.get("visit_location"):
+                    meta.append(f"방문지점: {p['visit_location']}")
+                if p.get("visit_date"):
+                    meta.append(f"방문일: {p['visit_date']}")
                 if p.get("agency_name"):
                     meta.append(f"대행사: {p['agency_name']}")
                 if p.get("assigned_to"):
@@ -287,6 +353,10 @@ for brand in brands:
                     meta.append(f"예정일: {p['scheduled_date']}")
                 if meta:
                     st.caption(" · ".join(meta))
+                if any(p.get(k) for k in ("views", "likes", "saves")):
+                    st.caption(f"📈 조회수 {p.get('views') or 0:,} · 좋아요 {p.get('likes') or 0:,} · 저장 {p.get('saves') or 0:,}")
+                if p.get("sns_url"):
+                    st.caption(f"🔗 SNS: {p['sns_url']}")
                 if p.get("guideline_link"):
                     st.caption(f"📎 가이드라인: {p['guideline_link']}")
                 if p.get("contract_file_url"):
