@@ -743,7 +743,28 @@ elif menu == "🏦 뱅크다 연동":
                 st.error(f"{when} · 조회기간 {period} · 오류[{lg.get('error_code')}]: {lg.get('error_message')}")
         st.caption("결과가 '조회 O건 · 신규저장 0건'이면 실패가 아니라, 이미 저장된 거래라 중복을 걸러낸 것입니다. 실제 데이터는 '📊 대시보드' · '🔗 전체 매칭 현황' 탭에서 확인하세요.")
         st.divider()
-
+    # ── 최근 거래내역 50건 (가져오기 버튼을 누르든 안 누르든 항상 보임) ──
+    recent_txns = (
+        SUPA.table("bank_transactions")
+        .select("txn_date,txn_datetime,direction,amount,description,account_label,account_category_id")
+        .order("txn_date", desc=True)
+        .limit(50)
+        .execute()
+        .data
+    )
+    if recent_txns:
+        cat_lookup = {c["id"]: c["name"] for c in categories}
+        recent_df = pd.DataFrame([{
+            "날짜": r["txn_date"], "구분": "입금" if r["direction"] == "in" else "출금",
+            "금액": f"₩{float(r['amount']):,.0f}", "적요": r.get("description") or "",
+            "계좌": r.get("account_label") or "", "계정과목": cat_lookup.get(r.get("account_category_id"), "미분류"),
+        } for r in recent_txns])
+        st.markdown(f"**📋 최근 거래내역 ({len(recent_txns)}건)**")
+        st.dataframe(recent_df, use_container_width=True, hide_index=True)
+        st.divider()
+    else:
+        st.caption("아직 저장된 은행거래 데이터가 없습니다.")
+        st.divider()
     # ── 계좌 라벨 매핑 관리 ──────────────────────────────────
     # 뱅크다가 돌려주는 accountnum마다, 기존에 수동 업로드에서 쓰던 계좌 이름(account_label)을
     # 매핑해둬야 대시보드 표시·dedup이 기존 데이터와 어긋나지 않는다.
