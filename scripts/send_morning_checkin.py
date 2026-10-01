@@ -16,15 +16,19 @@ SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 RESEND_API_KEY = os.environ["RESEND_API_KEY"]
 RESEND_FROM = os.environ.get("RESEND_FROM", "브랜드슬램 업무보고 <onboarding@resend.dev>")
 APP_URL = os.environ.get("DAILY_REPORT_APP_URL", "").strip()
+ADMIN_BCC_EMAIL = os.environ.get("ADMIN_BCC_EMAIL", "").strip()  # 비워두면 BCC 안 걸림, 값 넣으면 그 주소로 사본 전송
 
 SUPA = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
 def send_email(to_addr, subject, body_text, purpose):
+    payload = {"from": RESEND_FROM, "to": [to_addr], "subject": subject, "text": body_text}
+    if ADMIN_BCC_EMAIL:
+        payload["bcc"] = [ADMIN_BCC_EMAIL]
     res = requests.post(
         "https://api.resend.com/emails",
         headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
-        json={"from": RESEND_FROM, "to": [to_addr], "subject": subject, "text": body_text},
+        json=payload,
         timeout=15,
     )
     ok = res.status_code < 300
