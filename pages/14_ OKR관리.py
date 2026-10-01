@@ -293,10 +293,28 @@ else:
             if s.get("drive_file_name"):
                 link = f" — [{s['drive_file_name']}]({s['drive_file_url']})" if s.get("drive_file_url") else f" — {s['drive_file_name']}"
                 st.caption(f"📎 발견된 파일{link}")
+            if s.get("suggest_new_account") and s.get("suggested_brand_name"):
+                st.info(f"🏢 승인하면 '{s['suggested_brand_name']}' 브랜드 계정을 {s['person']} 담당으로 자동 생성합니다 (내용은 비어있는 상태로 시작, 나중에 채우면 됨)")
             sc1, sc2 = st.columns(2)
-            approve_label = "✅ 연동 승인" if s.get("suggestion_type") == "drive_link" else "✅ 반영할게요 (표시만)"
+            if s.get("suggestion_type") == "drive_link":
+                approve_label = "✅ 연동 승인 + 계정 생성" if s.get("suggest_new_account") else "✅ 연동 승인"
+            else:
+                approve_label = "✅ 반영할게요 (표시만)"
             if sc1.button(approve_label, key=f"applysug_{s['id']}", use_container_width=True):
+                if s.get("suggest_new_account") and s.get("suggested_brand_name"):
+                    existing = (
+                        SUPA.table("sales_accounts").select("id")
+                        .eq("assigned_to", s["person"]).eq("brand_name", s["suggested_brand_name"])
+                        .execute().data
+                    )
+                    if not existing:
+                        SUPA.table("sales_accounts").insert({
+                            "brand_name": s["suggested_brand_name"], "assigned_to": s["person"],
+                            "status": "협상중", "contract_drive_url": s.get("drive_file_url"),
+                            "notes": f"구글드라이브 파일 스캔으로 자동 생성됨 ({s.get('drive_file_name') or ''}) — 내용 확인 후 채워주세요.",
+                        }).execute()
                 SUPA.table("kpi_alignment_suggestions").update({"status": "applied"}).eq("id", s["id"]).execute()
+                st.success("승인 완료" + (" — 브랜드 계정도 생성했어요" if s.get("suggest_new_account") else ""))
                 refresh()
             if sc2.button("🗑️ 무시", key=f"dismisssug_{s['id']}", use_container_width=True):
                 SUPA.table("kpi_alignment_suggestions").update({"status": "dismissed"}).eq("id", s["id"]).execute()
