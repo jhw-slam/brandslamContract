@@ -2,6 +2,7 @@ import os
 from datetime import date
 
 import pandas as pd
+import requests
 import streamlit as st
 from supabase import create_client
 
@@ -257,3 +258,115 @@ with st.expander("➕ 새 항목 추가"):
             }).execute()
             st.success("추가 완료")
             refresh()
+
+st.divider()
+
+# ══════════════════════════════════════════════════════════
+# 🧭 KPI ↔ DB 맥락 정렬 제안 (하루 2번, Claude가 분석)
+# ══════════════════════════════════════════════════════════
+st.subheader("🧭 KPI ↔ DB 맥락 정렬 제안")
+st.caption(
+    "하루 2번, Claude가 각자의 목표(KPI)와 실제 쌓이는 데이터를 비교해서 제안을 남깁니다. "
+    "⚠️ 스키마(테이블 구조) 변경은 여기서 자동 실행되지 않습니다 — 적용하려면 Claude(채팅)에게 "
+    "'이 제안 반영해줘'라고 요청해주세요."
+)
+
+SUGGESTION_TYPE_LABEL = {
+    "kpi_gap": "🧩 KPI-데이터 구조",
+    "drive_link": "📁 구글드라이브 연동 (승인 필요)",
+    "org_improvement": "🏢 조직/업무방식 개선",
+}
+
+kpi_suggestions = (
+    SUPA.table("kpi_alignment_suggestions").select("*")
+    .eq("status", "open").order("created_at", desc=True).execute().data
+)
+if not kpi_suggestions:
+    st.caption("새로운 제안이 없습니다.")
+else:
+    for s in kpi_suggestions:
+        with st.container(border=True):
+            when = s["created_at"][:16].replace("T", " ")
+            type_label = SUGGESTION_TYPE_LABEL.get(s.get("suggestion_type"), "🧩")
+            st.markdown(f"**{s['person']}** · {type_label} · {when}")
+            st.write(s["suggestion_text"])
+            if s.get("drive_file_name"):
+                link = f" — [{s['drive_file_name']}]({s['drive_file_url']})" if s.get("drive_file_url") else f" — {s['drive_file_name']}"
+                st.caption(f"📎 발견된 파일{link}")
+            sc1, sc2 = st.columns(2)
+            approve_label = "✅ 연동 승인" if s.get("suggestion_type") == "drive_link" else "✅ 반영할게요 (표시만)"
+            if sc1.button(approve_label, key=f"applysug_{s['id']}", use_container_width=True):
+                SUPA.table("kpi_alignment_suggestions").update({"status": "applied"}).eq("id", s["id"]).execute()
+                refresh()
+            if sc2.button("🗑️ 무시", key=f"dismisssug_{s['id']}", use_container_width=True):
+                SUPA.table("kpi_alignment_suggestions").update({"status": "dismissed"}).eq("id", s["id"]).execute()
+                refresh()
+
+st.divider()
+
+# ══════════════════════════════════════════════════════════
+# 💬 Claude에게 바로 요청하기 (관리자 전용 채팅)
+# ══════════════════════════════════════════════════════════
+st.subheader("💬 Claude에게 바로 요청하기")
+st.caption(
+    "위 검토화면 보면서 바로 의견을 남기거나 물어보세요. "
+    "⚠️ 여기서는 상담/계획까지만 하고, 실제 DB·코드 변경은 이 대화 내용을 본 뒤 "
+    "claude.ai 채팅(지금까지 쓰시던 그 대화)에서 '이거 반영해줘'라고 요청하시면 제가 적용합니다."
+)
+
+
+@st.cache_data(ttl=5)
+def load_chat_messages():
+    return SUPA.table("admin_chat_messages").select("*").order("created_at").execute().data
+
+
+def call_claude_chat(history, new_message):
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None, "ANTHROPIC_API_KEY 환경변수가 없습니다."
+
+    recent_suggestions = SUPA.table("kpi_alignment_suggestions").select("*").eq("status", "open").limit(10).execute().data
+    context_text = "\n".join(f"- [{s['person']}] {s['suggestion_text']}" for s in recent_suggestions) or "(없음)"
+
+    system = (
+        "너는 브랜드슬램 대표(장현우)의 운영 보좌 역할을 하는 Claude다. 직원 업무보고 시스템과 OKR/KPI 데이터를 "
+        "잘 알고 있고, 대표가 현황판을 보면서 떠오르는 질문이나 '이렇게 바꿔줘' 같은 요청을 편하게 던지면 "
+        "같이 논의하고 계획을 다듬어주는 역할이다.\n\n"
+        "지금 열려있는 KPI/데이터/드라이브 연동 제안들:\n" + context_text + "\n\n"
+        "중요: 너는 지금 이 화면에서 실제로 DB나 코드를 바꿀 수 없다. 논의하고 계획을 정리해주되, "
+        "'실제 반영은 claude.ai 채팅에서 요청해주시면 제가 처리하겠습니다' 라는 취지로 안내해라. "
+        "한국어로, 짧고 실무적으로 답해라."
+    )
+    messages = [{"role": m["role"], "content": m["content"]} for m in history] + [{"role": "user", "content": new_message}]
+    try:
+        res = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-sonnet-5", "max_tokens": 1500, "system": system, "messages": messages},
+            timeout=60,
+        )
+        if res.status_code >= 300:
+            return None, f"{res.status_code} {res.text[:200]}"
+        data = res.json()
+        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+        return text.strip(), None
+    except Exception as e:
+        return None, str(e)
+
+
+chat_history = load_chat_messages()
+for m in chat_history:
+    with st.chat_message(m["role"]):
+        st.write(m["content"])
+
+chat_input = st.chat_input("궁금한 점이나 요청을 적어주세요...")
+if chat_input:
+    SUPA.table("admin_chat_messages").insert({"role": "user", "content": chat_input}).execute()
+    with st.spinner("Claude가 답변 작성 중..."):
+        reply, err = call_claude_chat(chat_history, chat_input)
+    if err:
+        st.error(f"응답 실패: {err}")
+    else:
+        SUPA.table("admin_chat_messages").insert({"role": "assistant", "content": reply}).execute()
+    load_chat_messages.clear()
+    st.rerun()
