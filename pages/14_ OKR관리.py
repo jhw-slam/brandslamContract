@@ -85,6 +85,8 @@ if person_filter != "전체":
 
 st.caption(f"{len(view_logs)}건 (미검토 우선)")
 
+REACTION_OPTS = ["👍", "🔥", "💯", "🙌", "💬"]
+
 for lg in view_logs:
     with st.container(border=True):
         when = lg["created_at"][:16].replace("T", " ")
@@ -95,6 +97,23 @@ for lg in view_logs:
             st.caption(f"🔗 [참고 링크]({lg['link_url']})")
         if lg.get("attachment_url"):
             st.caption(f"📎 [첨부파일]({lg['attachment_url']})")
+        if lg.get("manager_feedback"):
+            st.success(f"💬 이미 남긴 피드백: {lg.get('manager_reaction') or ''} {lg['manager_feedback']}")
+
+        with st.expander("💬 피드백/칭찬 남기기 (직원 화면에 바로 보여요)"):
+            fc1, fc2 = st.columns([1, 4])
+            reaction = fc1.selectbox("반응", REACTION_OPTS, key=f"reaction_{lg['id']}", label_visibility="collapsed")
+            feedback_text = fc2.text_input(
+                "코멘트", value=lg.get("manager_feedback") or "", placeholder="잘했어요! / 이 부분은 이렇게 해볼까요?",
+                key=f"feedback_{lg['id']}", label_visibility="collapsed",
+            )
+            if st.button("전송", key=f"sendfb_{lg['id']}"):
+                SUPA.table("daily_activity_log").update({
+                    "manager_feedback": feedback_text.strip() or None, "manager_reaction": reaction,
+                }).eq("id", lg["id"]).execute()
+                st.success("피드백 전송 완료")
+                refresh()
+
         if not lg.get("reviewed"):
             if st.button("✅ 검토완료로 표시", key=f"review_{lg['id']}"):
                 SUPA.table("daily_activity_log").update({"reviewed": True}).eq("id", lg["id"]).execute()
@@ -119,30 +138,104 @@ if org_row:
 else:
     st.caption("이 사람의 org-level Objective가 아직 없습니다 (기존 OKR 페이지에서 추가해주세요).")
 
+st.info(
+    "🎯 **OKR**(시한부 도전과제, 이번 분기 안에 끝낼 것, 60~70% 달성이 정상)과 "
+    "📊 **KPI**(상시 추적하는 건강지표, '반복업무'로 등록, 끝없이 계속 체크)를 분리해서 관리합니다. "
+    "— Google/2025 HR 트렌드에서 권장하는 방식이에요."
+)
+
 person_items = [it for it in okr_items_data if it["person"] == target_person]
-if not person_items:
-    st.caption("세부 KR 항목이 없습니다.")
-else:
-    for it in person_items:
-        with st.container(border=True):
-            try:
-                target_qty = float(it.get("target_qty") or 0)
-                progress = float(it.get("progress") or 0)
-            except (TypeError, ValueError):
-                target_qty, progress = 0.0, 0.0
-            st.markdown(f"**[{it.get('category') or '미분류'}] {it['title']}**")
-            pc1, pc2, pc3 = st.columns([1.5, 1, 1])
-            new_progress = pc1.number_input(
-                f"진행 ({it.get('unit') or ''})", value=progress, step=1.0,
-                key=f"prog_{it['id']}", label_visibility="visible",
-            )
-            new_confirmed = pc2.checkbox("확정", value=bool(it.get("confirmed")), key=f"conf_{it['id']}")
-            if target_qty > 0:
-                pc3.progress(min(new_progress / target_qty, 1.0), text=f"{new_progress:g}/{target_qty:g}")
-            if st.button("저장", key=f"okrsave_{it['id']}"):
-                update_payload = {"progress": new_progress, "confirmed": new_confirmed}
+
+
+def _item_editor(it, key_prefix):
+    with st.container(border=True):
+        try:
+            target_qty = float(it.get("target_qty") or 0)
+            progress = float(it.get("progress") or 0)
+        except (TypeError, ValueError):
+            target_qty, progress = 0.0, 0.0
+
+        last_checkin = it.get("last_checkin_at")
+        staleness = ""
+        if last_checkin:
+            days = (pd.Timestamp.now(tz="UTC") - pd.Timestamp(last_checkin)).days
+            if days >= 7:
+                staleness = f" · ⚠️ {days}일간 체크인 없음"
+        else:
+            staleness = " · ⚠️ 체크인 기록 없음"
+
+        with st.expander(f"{'✅' if it.get('confirmed') else '🔲'} [{it.get('category') or '미분류'}] {it['title']}{staleness}"):
+            ec1, ec2 = st.columns(2)
+            new_category = ec1.text_input("카테고리", value=it.get("category") or "", key=f"{key_prefix}_cat_{it['id']}")
+            new_title = ec2.text_input("제목", value=it["title"], key=f"{key_prefix}_title_{it['id']}")
+
+            pc1, pc2, pc3 = st.columns(3)
+            new_target = pc1.number_input("목표치", value=target_qty, step=1.0, key=f"{key_prefix}_target_{it['id']}")
+            new_unit = pc2.text_input("단위", value=it.get("unit") or "", key=f"{key_prefix}_unit_{it['id']}")
+            new_progress = pc3.number_input("현재 진행", value=progress, step=1.0, key=f"{key_prefix}_prog_{it['id']}")
+
+            if new_target > 0:
+                st.progress(min(new_progress / new_target, 1.0), text=f"{new_progress:g}/{new_target:g}{new_unit}")
+
+            cc1, cc2, cc3, cc4 = st.columns(4)
+            new_confirmed = cc1.checkbox("✅ 달성완료", value=bool(it.get("confirmed")), key=f"{key_prefix}_conf_{it['id']}")
+            new_recurring = cc2.checkbox("🔁 반복업무(KPI)로 등록", value=bool(it.get("is_recurring")), key=f"{key_prefix}_rec_{it['id']}")
+            save_clicked = cc3.button("💾 저장", key=f"{key_prefix}_save_{it['id']}", use_container_width=True)
+            delete_clicked = cc4.button("🗑️ 삭제", key=f"{key_prefix}_del_{it['id']}", use_container_width=True)
+
+            if save_clicked:
+                update_payload = {
+                    "category": new_category or None, "title": new_title,
+                    "target_qty": new_target, "unit": new_unit or None, "progress": new_progress,
+                    "confirmed": new_confirmed, "is_recurring": new_recurring,
+                    "last_checkin_at": date.today().isoformat(),
+                }
                 if new_confirmed and not it.get("confirmed_at"):
                     update_payload["confirmed_at"] = date.today().isoformat()
                 SUPA.table("okr_items").update(update_payload).eq("id", it["id"]).execute()
-                st.success("저장 완료")
+                st.success("저장 완료 (체크인 시각도 갱신됨)")
                 refresh()
+            if delete_clicked:
+                SUPA.table("okr_items").delete().eq("id", it["id"]).execute()
+                st.success("삭제 완료")
+                refresh()
+
+
+okr_only = [it for it in person_items if not it.get("is_recurring")]
+kpi_only = [it for it in person_items if it.get("is_recurring")]
+
+st.markdown(f"**🎯 이번 사이클 OKR 세부항목 ({len(okr_only)}개)**")
+if not okr_only:
+    st.caption("없음")
+for it in okr_only:
+    _item_editor(it, "okr")
+
+st.markdown(f"**📊 상시 추적 KPI ({len(kpi_only)}개)**")
+if not kpi_only:
+    st.caption("없음")
+for it in kpi_only:
+    _item_editor(it, "kpi")
+
+with st.expander("➕ 새 항목 추가"):
+    with st.form(f"add_item_form_{target_person}", clear_on_submit=True):
+        nc1, nc2 = st.columns(2)
+        new_item_category = nc1.text_input("카테고리")
+        new_item_title = nc2.text_input("제목 *")
+        nc3, nc4, nc5 = st.columns(3)
+        new_item_target = nc3.number_input("목표치", min_value=0.0, step=1.0)
+        new_item_unit = nc4.text_input("단위")
+        new_item_is_kpi = nc5.checkbox("🔁 반복업무(KPI)로 등록")
+        add_submitted = st.form_submit_button("추가", type="primary")
+    if add_submitted:
+        if not new_item_title.strip():
+            st.error("제목은 꼭 입력해주세요.")
+        else:
+            SUPA.table("okr_items").insert({
+                "person": target_person, "category": new_item_category.strip() or None,
+                "title": new_item_title.strip(), "target_qty": new_item_target,
+                "unit": new_item_unit.strip() or None, "progress": 0,
+                "is_recurring": new_item_is_kpi, "confirmed": False,
+                "cadence": "monthly" if new_item_is_kpi else "once",
+            }).execute()
+            st.success("추가 완료")
+            refresh()
