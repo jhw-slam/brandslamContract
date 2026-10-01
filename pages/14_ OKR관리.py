@@ -114,9 +114,27 @@ for lg in view_logs:
                 st.success("피드백 전송 완료")
                 refresh()
 
+        bc1, bc2 = st.columns(2)
         if not lg.get("reviewed"):
-            if st.button("✅ 검토완료로 표시", key=f"review_{lg['id']}"):
+            if bc1.button("✅ 검토완료로 표시", key=f"review_{lg['id']}", use_container_width=True):
                 SUPA.table("daily_activity_log").update({"reviewed": True}).eq("id", lg["id"]).execute()
+                refresh()
+        if lg.get("admin_signed"):
+            bc2.caption(f"✍️ 승인 서명됨 ({lg['admin_signed_at'][:10]})")
+        else:
+            if bc2.button("✍️ 완료 승인(서명)", key=f"sign_{lg['id']}", use_container_width=True,
+                          help="서명하면 reviewed로도 표시되고, 이 보고가 AI로 매칭했던 OKR 항목이 있으면 자동으로 '달성완료' 처리됩니다."):
+                SUPA.table("daily_activity_log").update({
+                    "admin_signed": True, "admin_signed_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                    "reviewed": True,
+                }).eq("id", lg["id"]).execute()
+                if lg.get("ai_matched_item_id"):
+                    SUPA.table("okr_items").update({
+                        "confirmed": True, "last_checkin_at": date.today().isoformat(),
+                    }).eq("id", lg["ai_matched_item_id"]).execute()
+                    st.success("승인 완료 — 연결된 OKR 항목도 자동으로 달성완료 처리했어요.")
+                else:
+                    st.success("승인 완료")
                 refresh()
 
 st.divider()
