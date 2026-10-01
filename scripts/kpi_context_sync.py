@@ -127,7 +127,9 @@ def call_claude_analysis(person, okr_org_row, okr_items, role_data, drive_files)
         "못 보던 거라면 '구글시트 연동해드릴까요?' 식으로 쉬운 대안도 같이 제안해라.\n"
         "2) drive_link — 구글드라이브 파일 목록 중에, 이 사람의 업무 데이터(계약/캠페인/계정 등)와 이름이 겹치거나 "
         "관련 있어 보이는 파일이 있으면 '이 파일을 연동할지 물어보자'는 제안을 해라. 파일명과 왜 관련있어 보이는지 "
-        "반드시 같이 적어라.\n"
+        "반드시 같이 적어라. 만약 파일명에서 브랜드명이 짐작되는데 role_data_sample의 sales_accounts 목록에 "
+        "그 브랜드가 없다면, suggest_new_account를 true로 하고 suggested_brand_name에 짐작되는 브랜드명을 적어라 "
+        "(승인되면 그 이름으로 브랜드 계정이 자동 생성된다 — 확신 없으면 하지 마라).\n"
         "3) org_improvement — 이 사람의 최근 업무기록(recent_logs) 내용을 보고, 일하는 방식이나 조직 구조에서 "
         "대표가 바꾸면 좋을 것 같은 게 보이면 제안해라 (예: 특정 업무에 시간이 과도하게 쏠림, 반복되는 병목 등). "
         "확실하지 않으면 이 유형은 만들지 마라 — 추측으로 조직 얘기를 하는 건 위험하다.\n\n"
@@ -137,7 +139,8 @@ def call_claude_analysis(person, okr_org_row, okr_items, role_data, drive_files)
         "- 정말 문제가 없으면 빈 배열을 반환해라. 억지로 제안을 만들어내지 마라. 전체 최대 3개까지.\n\n"
         "출력은 오직 JSON 배열만: [{\"suggestion_type\": \"kpi_gap|drive_link|org_improvement\", "
         "\"suggestion\": \"짧고 구체적인 제안(80자 이내)\", "
-        "\"drive_file_name\": \"drive_link일 때만, 아니면 null\", \"drive_file_url\": \"drive_link일 때만, 아니면 null\"}]. "
+        "\"drive_file_name\": \"drive_link일 때만, 아니면 null\", \"drive_file_url\": \"drive_link일 때만, 아니면 null\", "
+        "\"suggest_new_account\": true 또는 false, \"suggested_brand_name\": \"신규계정 제안일 때만, 아니면 null\"}]. "
         "다른 텍스트는 절대 포함하지 마라."
     )
     user_content = json.dumps({
@@ -148,6 +151,7 @@ def call_claude_analysis(person, okr_org_row, okr_items, role_data, drive_files)
                        "target": i.get("target_qty"), "is_recurring": i.get("is_recurring")} for i in okr_items],
         "role_data_summary": {k: len(v) if isinstance(v, list) else v for k, v in role_data.items()},
         "role_data_sample": {k: v[:5] if isinstance(v, list) else v for k, v in role_data.items()},
+        "existing_brand_names": [a.get("brand_name") for a in role_data.get("sales_accounts", [])],
         "recent_work_logs": [l.get("note") for l in role_data.get("recent_logs", [])],
         "drive_files": [{"name": f["name"], "url": f.get("webViewLink")} for f in drive_files[:50]],
     }, ensure_ascii=False, default=str)
@@ -201,6 +205,8 @@ def main():
                 "person": person, "suggestion_text": text,
                 "suggestion_type": s.get("suggestion_type") or "kpi_gap",
                 "drive_file_name": s.get("drive_file_name"), "drive_file_url": s.get("drive_file_url"),
+                "suggest_new_account": bool(s.get("suggest_new_account")),
+                "suggested_brand_name": s.get("suggested_brand_name"),
             }).execute()
         print(f"[{person}] 제안 {len(suggestions)}건 처리")
 
