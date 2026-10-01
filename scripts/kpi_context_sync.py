@@ -65,6 +65,8 @@ def list_drive_files(max_files=200):
                     q=f"'{fid}' in parents and trashed = false",
                     fields="nextPageToken, files(id, name, mimeType, webViewLink, modifiedTime)",
                     pageToken=page_token, pageSize=100,
+                    supportsAllDrives=True, includeItemsFromAllDrives=True,
+                    corpora="allDrives",
                 ).execute()
                 for f in res.get("files", []):
                     if f["mimeType"] == "application/vnd.google-apps.folder":
@@ -127,9 +129,12 @@ def call_claude_analysis(person, okr_org_row, okr_items, role_data, drive_files)
         "못 보던 거라면 '구글시트 연동해드릴까요?' 식으로 쉬운 대안도 같이 제안해라.\n"
         "2) drive_link — 구글드라이브 파일 목록 중에, 이 사람의 업무 데이터(계약/캠페인/계정 등)와 이름이 겹치거나 "
         "관련 있어 보이는 파일이 있으면 '이 파일을 연동할지 물어보자'는 제안을 해라. 파일명과 왜 관련있어 보이는지 "
-        "반드시 같이 적어라. 만약 파일명에서 브랜드명이 짐작되는데 role_data_sample의 sales_accounts 목록에 "
-        "그 브랜드가 없다면, suggest_new_account를 true로 하고 suggested_brand_name에 짐작되는 브랜드명을 적어라 "
-        "(승인되면 그 이름으로 브랜드 계정이 자동 생성된다 — 확신 없으면 하지 마라).\n"
+        "반드시 같이 적어라. 두 가지 경우로 나뉜다:\n"
+        "   (a) 파일명에서 브랜드명이 짐작되는데 existing_brand_names에 그 브랜드가 없다 → 새 계정이 필요한 "
+        "경우다. suggest_new_account를 true로, suggested_brand_name에 브랜드명을 적어라 (회사 전체에 영향을 "
+        "주는 일이라 대표 승인을 거친다).\n"
+        "   (b) 그 브랜드가 이미 existing_brand_names에 있다 → 이미 등록된 자기 자신의 레코드를 보완하는 "
+        "것뿐이다. is_personal_existing_match를 true로 해라 (본인이 바로 확인하면 되고 대표 승인은 필요 없다).\n"
         "3) org_improvement — 이 사람의 최근 업무기록(recent_logs) 내용을 보고, 일하는 방식이나 조직 구조에서 "
         "대표가 바꾸면 좋을 것 같은 게 보이면 제안해라 (예: 특정 업무에 시간이 과도하게 쏠림, 반복되는 병목 등). "
         "확실하지 않으면 이 유형은 만들지 마라 — 추측으로 조직 얘기를 하는 건 위험하다.\n\n"
@@ -140,7 +145,8 @@ def call_claude_analysis(person, okr_org_row, okr_items, role_data, drive_files)
         "출력은 오직 JSON 배열만: [{\"suggestion_type\": \"kpi_gap|drive_link|org_improvement\", "
         "\"suggestion\": \"짧고 구체적인 제안(80자 이내)\", "
         "\"drive_file_name\": \"drive_link일 때만, 아니면 null\", \"drive_file_url\": \"drive_link일 때만, 아니면 null\", "
-        "\"suggest_new_account\": true 또는 false, \"suggested_brand_name\": \"신규계정 제안일 때만, 아니면 null\"}]. "
+        "\"suggest_new_account\": true 또는 false, \"suggested_brand_name\": \"신규계정 제안일 때만, 아니면 null\", "
+        "\"is_personal_existing_match\": true 또는 false}]. "
         "다른 텍스트는 절대 포함하지 마라."
     )
     user_content = json.dumps({
@@ -178,6 +184,38 @@ def call_claude_analysis(person, okr_org_row, okr_items, role_data, drive_files)
         return []
 
 
+def check_sales_meetings(person, sales_accounts):
+    """세일즈 담당자에게만: 본인이 등록한 '업체명'이 실제로 언급된 회의만 골라서 알림.
+    다른 회의(재무/인사/기타)는 절대 안 보여준다 — 업체명 키워드 매칭이 기준."""
+    brand_names = [a["brand_name"].strip() for a in sales_accounts if a.get("brand_name")]
+    if not brand_names:
+        return
+
+    already_alerted = {
+        a["meeting_id"] for a in
+        SUPA.table("sales_meeting_alerts").select("meeting_id").eq("person", person).execute().data
+    }
+
+    recent_meetings = (
+        SUPA.table("meetings").select("id,title,meeting_date,summary,raw_transcript")
+        .order("meeting_date", desc=True).limit(100).execute().data
+    )
+    for m in recent_meetings:
+        if m["id"] in already_alerted:
+            continue
+        haystack = f"{m.get('title') or ''} {m.get('summary') or ''} {m.get('raw_transcript') or ''}"
+        matched = next((b for b in brand_names if b and b in haystack), None)
+        if not matched:
+            continue
+        snippet = (m.get("summary") or "")[:200]
+        SUPA.table("sales_meeting_alerts").insert({
+            "person": person, "meeting_id": m["id"], "brand_matched": matched,
+            "meeting_title": m.get("title"), "meeting_date": m.get("meeting_date"),
+            "summary_snippet": snippet,
+        }).execute()
+        print(f"  [{person}] 회의 알림 생성: {m.get('title')} (업체명 '{matched}' 매칭)")
+
+
 def main():
     drive_files = list_drive_files()
     print(f"구글드라이브 파일 {len(drive_files)}개 확인됨" if drive_files else "구글드라이브 연동 미설정 — 이 부분은 건너뜀")
@@ -189,11 +227,29 @@ def main():
         okr_items = SUPA.table("okr_items").select("*").eq("person", person).execute().data
         role_data = gather_role_data(person, role)
 
+        if role == "sales":
+            check_sales_meetings(person, role_data.get("sales_accounts", []))
+
         suggestions = call_claude_analysis(person, okr_org_row, okr_items, role_data, drive_files)
         for s in suggestions:
             text = (s.get("suggestion") or "").strip()
             if not text:
                 continue
+            if s.get("suggestion_type") == "drive_link" and s.get("is_personal_existing_match"):
+                # 본인의 기존 레코드를 보완하는 것뿐 — 대표 승인 없이 본인이 바로 확인
+                recent_draft = (
+                    SUPA.table("ai_drafted_updates").select("id")
+                    .eq("person", person).eq("status", "pending").ilike("draft_content", f"%{text[:20]}%")
+                    .execute().data
+                )
+                if recent_draft:
+                    continue
+                SUPA.table("ai_drafted_updates").insert({
+                    "person": person, "source": "google_drive", "source_ref": s.get("drive_file_url"),
+                    "target_table": "sales_accounts", "draft_content": text,
+                }).execute()
+                continue
+
             recent = (
                 SUPA.table("kpi_alignment_suggestions").select("id")
                 .eq("person", person).eq("status", "open").ilike("suggestion_text", f"%{text[:20]}%")
