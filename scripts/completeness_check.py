@@ -16,6 +16,7 @@ Railway 설정 방법은 이 파일 맨 아래 주석 참고.
 """
 
 import os
+import json
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -24,6 +25,7 @@ from supabase import create_client
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 EMAIL_RESEND_COOLDOWN_HOURS = 6
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
@@ -168,10 +170,85 @@ def check_sales_campaigns():
                 maybe_email(p)
 
 
+WHITELISTED_FIELDS = {
+    "sales_accounts": ["contact_name", "contact_email", "contact_phone", "monthly_budget",
+                        "contract_start", "renewal_date", "status"],
+    "dev_tasks": ["status", "description"],
+    "influencer_pool": ["relationship_status", "last_collab_date", "rate"],
+    "casting_funnel": ["stage", "test_rate"],
+}
+
+
+def call_claude_extract_fields(target_table, draft_content, correction_note):
+    """자유 텍스트(수정사항)를 보고, 화이트리스트에 있는 필드만 골라서 업데이트값을 뽑아낸다.
+    확신 없는 필드는 아예 포함하지 않는다 — 틀린 자동수정보다 '그냥 notes에만 남기는 것'이 안전하다."""
+    if not ANTHROPIC_API_KEY:
+        return {}
+    allowed = WHITELISTED_FIELDS.get(target_table, [])
+    if not allowed:
+        return {}
+    system = (
+        f"너는 '{target_table}' 테이블의 레코드를 고치는 보조원이다. 아래 자유 텍스트(직원이 쓴 수정사항)를 보고, "
+        f"이 필드들 중에서만({', '.join(allowed)}) 확실하게 바뀌어야 하는 값을 뽑아내라. "
+        "확신 없는 필드는 절대 포함하지 마라 — 틀리게 채우는 것보다 비워두는 게 낫다. "
+        "날짜는 YYYY-MM-DD 형식으로. 출력은 오직 JSON 객체만: {\"필드명\": \"값\", ...}. 해당하는 게 없으면 {}."
+    )
+    user_content = f"원래 AI가 찾은 내용: {draft_content}\n\n직원이 남긴 수정사항: {correction_note}"
+    try:
+        res = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-sonnet-5", "max_tokens": 500, "system": system,
+                  "messages": [{"role": "user", "content": user_content}]},
+            timeout=30,
+        )
+        if res.status_code >= 300:
+            return {}
+        text = "".join(b.get("text", "") for b in res.json().get("content", []) if b.get("type") == "text").strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.startswith("json"):
+                text = text[4:]
+        data = json.loads(text)
+        return {k: v for k, v in data.items() if k in allowed}
+    except Exception as e:
+        print(f"필드 추출 실패: {e}")
+        return {}
+
+
+def process_correction_requests():
+    """직원이 '수정사항'란에 자유롭게 쓴 글을 읽고, 알아서 정리해서 실제 레코드에 반영한다."""
+    requests_open = (
+        SUPA.table("ai_drafted_updates").select("*").eq("status", "correction_requested").execute().data
+    )
+    for req in requests_open:
+        target_table = req["target_table"]
+        record_id = req.get("target_record_id")
+        note = req.get("correction_note") or ""
+
+        fields = call_claude_extract_fields(target_table, req["draft_content"], note)
+
+        if record_id:
+            update_payload = dict(fields)
+            # 화이트리스트 필드 업데이트와 별개로, 원문은 항상 notes에 그대로 남겨서 추적 가능하게 함
+            existing = SUPA.table(target_table).select("notes").eq("id", record_id).execute().data
+            old_notes = (existing[0].get("notes") or "") if existing else ""
+            update_payload["notes"] = (old_notes + f"\n[{now_iso()[:10]} 자동반영] {note}").strip()
+            SUPA.table(target_table).update(update_payload).eq("id", record_id).execute()
+        else:
+            print(f"  ⚠️ {req['person']}의 수정요청에 연결된 레코드가 없어서, 기록만 남기고 넘어감: {note[:50]}")
+
+        SUPA.table("ai_drafted_updates").update({
+            "status": "applied", "resolved_at": now_iso(),
+        }).eq("id", req["id"]).execute()
+        print(f"  ✅ {req['person']}의 수정사항 반영 완료 ({len(fields)}개 필드)")
+
+
 def main():
     check_sales_accounts()
     check_influencer_placements()
     check_sales_campaigns()
+    process_correction_requests()
     print(f"[{now_iso()}] 완성도 체크 완료")
 
 
