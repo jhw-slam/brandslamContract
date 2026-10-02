@@ -1,5 +1,5 @@
 import os
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import requests
@@ -165,6 +165,30 @@ st.info(
 
 person_items = [it for it in okr_items_data if it["person"] == target_person]
 
+# ── 요약 통계바 (옛 OKR목표관리 페이지의 "관리중업무/지연/주의/확정된목표/달성" 이식) ──
+today_d = date.today()
+total_cnt = len(person_items)
+confirmed_cnt = sum(1 for it in person_items if it.get("confirmed"))
+overdue_cnt = sum(
+    1 for it in person_items
+    if it.get("due_date") and pd.to_datetime(it["due_date"]).date() < today_d and not it.get("confirmed")
+)
+soon_cnt = sum(
+    1 for it in person_items
+    if it.get("due_date") and not it.get("confirmed")
+    and today_d <= pd.to_datetime(it["due_date"]).date() <= today_d + timedelta(days=3)
+)
+achieved_cnt = sum(
+    1 for it in person_items
+    if it.get("confirmed") or (float(it.get("target_qty") or 0) > 0 and float(it.get("progress") or 0) >= float(it.get("target_qty") or 0))
+)
+sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+sc1.metric("관리 중 업무", f"{total_cnt}건")
+sc2.metric("지연", f"{overdue_cnt}건", delta="확인 필요" if overdue_cnt else None, delta_color="inverse")
+sc3.metric("주의(3일내 마감)", f"{soon_cnt}건")
+sc4.metric("확정된 목표", f"{confirmed_cnt}/{total_cnt}")
+sc5.metric("🏆 달성", f"{achieved_cnt}건")
+
 
 def _item_editor(it, key_prefix):
     with st.container(border=True):
@@ -183,15 +207,24 @@ def _item_editor(it, key_prefix):
         else:
             staleness = " · ⚠️ 체크인 기록 없음"
 
-        with st.expander(f"{'✅' if it.get('confirmed') else '🔲'} [{it.get('category') or '미분류'}] {it['title']}{staleness}"):
+        due_badge = ""
+        if it.get("due_date"):
+            d_date = pd.to_datetime(it["due_date"]).date()
+            due_badge = f" · ⚠️ 마감 {d_date}(지연)" if (not it.get("confirmed") and d_date < date.today()) else f" · 마감 {d_date}"
+
+        with st.expander(f"{'✅' if it.get('confirmed') else '🔲'} [{it.get('category') or '미분류'}] {it['title']}{staleness}{due_badge}"):
             ec1, ec2 = st.columns(2)
             new_category = ec1.text_input("카테고리", value=it.get("category") or "", key=f"{key_prefix}_cat_{it['id']}")
             new_title = ec2.text_input("제목", value=it["title"], key=f"{key_prefix}_title_{it['id']}")
 
-            pc1, pc2, pc3 = st.columns(3)
+            pc1, pc2, pc3, pc4 = st.columns(4)
             new_target = pc1.number_input("목표치", value=target_qty, step=1.0, key=f"{key_prefix}_target_{it['id']}")
             new_unit = pc2.text_input("단위", value=it.get("unit") or "", key=f"{key_prefix}_unit_{it['id']}")
             new_progress = pc3.number_input("현재 진행", value=progress, step=1.0, key=f"{key_prefix}_prog_{it['id']}")
+            new_due = pc4.date_input(
+                "마감일", value=pd.to_datetime(it["due_date"]).date() if it.get("due_date") else None,
+                key=f"{key_prefix}_due_{it['id']}",
+            )
 
             if new_target > 0:
                 st.progress(min(new_progress / new_target, 1.0), text=f"{new_progress:g}/{new_target:g}{new_unit}")
@@ -207,6 +240,7 @@ def _item_editor(it, key_prefix):
                     "category": new_category or None, "title": new_title,
                     "target_qty": new_target, "unit": new_unit or None, "progress": new_progress,
                     "confirmed": new_confirmed, "is_recurring": new_recurring,
+                    "due_date": new_due.isoformat() if new_due else None,
                     "last_checkin_at": date.today().isoformat(),
                 }
                 if new_confirmed and not it.get("confirmed_at"):
@@ -240,10 +274,11 @@ with st.expander("➕ 새 항목 추가"):
         nc1, nc2 = st.columns(2)
         new_item_category = nc1.text_input("카테고리")
         new_item_title = nc2.text_input("제목 *")
-        nc3, nc4, nc5 = st.columns(3)
+        nc3, nc4, nc5, nc6 = st.columns(4)
         new_item_target = nc3.number_input("목표치", min_value=0.0, step=1.0)
         new_item_unit = nc4.text_input("단위")
         new_item_is_kpi = nc5.checkbox("🔁 반복업무(KPI)로 등록")
+        new_item_due = nc6.date_input("마감일(선택)", value=None)
         add_submitted = st.form_submit_button("추가", type="primary")
     if add_submitted:
         if not new_item_title.strip():
@@ -254,6 +289,7 @@ with st.expander("➕ 새 항목 추가"):
                 "title": new_item_title.strip(), "target_qty": new_item_target,
                 "unit": new_item_unit.strip() or None, "progress": 0,
                 "is_recurring": new_item_is_kpi, "confirmed": False,
+                "due_date": new_item_due.isoformat() if new_item_due else None,
                 "cadence": "monthly" if new_item_is_kpi else "once",
             }).execute()
             st.success("추가 완료")
