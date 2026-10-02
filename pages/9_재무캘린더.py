@@ -369,6 +369,31 @@ if menu == "📊 대시보드":
         st.dataframe(monthly.style.format("₩{:,.0f}"), use_container_width=True)
         st.bar_chart(monthly[["입금", "출금"]])
 
+    # ── 인플루언서 송금 대기 (직원 업무보고 페이지에서 구글시트로 등록한 건) ──
+    pending_payments = (
+        SUPA.table("payment_requests").select("*").eq("status", "pending")
+        .order("scheduled_date").execute().data
+    )
+    if pending_payments:
+        total_pending_amt = sum(float(p.get("amount") or 0) for p in pending_payments)
+        st.divider()
+        st.subheader(f"💸 인플루언서 송금 대기 ({len(pending_payments)}건, 합계 ₩{total_pending_amt:,.0f})")
+        st.caption("직원 업무보고 페이지에서 구글시트로 등록한 송금 예정 건입니다. 위 대시보드 숫자(실제 입출금)엔 아직 안 들어있어요 — 실제로 송금되고 은행거래로 잡히면 그때 반영됩니다.")
+        for p in pending_payments:
+            with st.container(border=True):
+                amt = f"₩{float(p['amount']):,.0f}" if p.get("amount") else "-"
+                st.markdown(f"**{p['influencer_name']}** · {amt} · 예정일 {p.get('scheduled_date') or '-'}")
+                bank_info = " · ".join(filter(None, [p.get("bank_name"), p.get("bank_account_no"), p.get("account_holder_name")]))
+                if bank_info:
+                    st.caption(f"🏦 {bank_info}")
+                doc1 = f"계약서 {'✅' if p.get('contract_link') else '⚠️ 미수령'}"
+                doc2 = f"신분증 {'✅' if p.get('id_doc_link') else '⚠️ 미수령'}"
+                st.caption(f"{doc1} · {doc2} · 등록: {p.get('submitted_by') or ''}")
+                if st.button("💰 송금완료 처리", key=f"fincal_pay_done_{p['id']}"):
+                    SUPA.table("payment_requests").update({
+                        "status": "paid", "paid_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                    }).eq("id", p["id"]).execute()
+                    st.rerun()
 
 # ════════════════════════════════════════════════════════════
 # 🔗 전체 매칭 현황
