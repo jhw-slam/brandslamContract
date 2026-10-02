@@ -116,6 +116,9 @@ def gather_role_data(person, role):
     data["open_completeness_prompts"] = (
         SUPA.table("data_completeness_prompts").select("message").eq("person", person).eq("status", "open").execute().data
     )
+    data["already_registered_data_sources"] = (
+        SUPA.table("kpi_data_sources").select("related_suggestion_text,source_url").eq("person", person).execute().data
+    )
     return data
 
 
@@ -142,7 +145,9 @@ def call_claude_analysis(person, okr_org_row, okr_items, role_data, drive_files,
         "확인할 것 (세 종류의 제안을 만들 수 있다):\n"
         "1) kpi_gap — 지금 목표(Objective/KR)를 현재 데이터 구조로 제대로 추적할 수 있는가? 필요한 정보인데 "
         "어디에도 기록이 안 되거나 여러 곳에 흩어져서 한눈에 안 보이면 이 유형으로 제안해라. 데이터가 부족해서 "
-        "못 보던 거라면 '구글시트 연동해드릴까요?' 식으로 쉬운 대안도 같이 제안해라.\n"
+        "못 보던 거라면 '구글시트 연동해드릴까요?' 식으로 쉬운 대안도 같이 제안해라. "
+        "⚠️ already_registered_data_sources에 이미 비슷한 내용으로 소스가 등록되어 있으면, 똑같은 제안을 "
+        "또 만들지 마라 — 이미 해결된 것으로 보고 건너뛰어라.\n"
         "2) drive_link — 구글드라이브 파일 목록 중에, 이 사람의 업무 데이터(existing_record_names에 있는 "
         "항목들 — 역할에 따라 브랜드/작업/인플루언서/캐스팅 대상 등 다양하다)와 이름이 겹치거나 관련 있어 "
         "보이는 파일이 있으면 '이 파일을 연동할지 물어보자'는 제안을 해라. 파일명과 왜 관련있어 보이는지, "
@@ -178,6 +183,7 @@ def call_claude_analysis(person, okr_org_row, okr_items, role_data, drive_files,
         "existing_record_names": _existing_record_names(role, role_data),
         "recent_work_logs": [l.get("note") for l in role_data.get("recent_logs", [])],
         "drive_files": [{"name": f["name"], "url": f.get("webViewLink")} for f in drive_files[:50]],
+        "already_registered_data_sources": role_data.get("already_registered_data_sources", []),
     }, ensure_ascii=False, default=str)
 
     res = requests.post(
