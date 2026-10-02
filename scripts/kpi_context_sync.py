@@ -119,7 +119,23 @@ def gather_role_data(person, role):
     return data
 
 
-def call_claude_analysis(person, okr_org_row, okr_items, role_data, drive_files):
+def _existing_record_names(role, role_data):
+    """역할별로 '이름으로 구글드라이브 파일과 매칭해볼 만한' 기존 레코드 목록을 뽑는다.
+    - 세일즈(김선재): 브랜드 계정명 (sales_accounts)
+    - 인플루언서(곽재선)/중국운영(이단우): 담당 캠페인의 '브랜드명' — 리스팅·업로드 관리 파일엔
+      인플루언서 개인 이름보다 브랜드명이 적혀있는 경우가 많아서 influencer_placements 기준으로 잡는다.
+    - 개발(구정회): 아직 명확한 매칭 기준이 없어 dev_tasks 제목으로 임시 설정 — 추후 재정의 필요."""
+    if role == "sales":
+        return [a.get("brand_name") for a in role_data.get("sales_accounts", []) if a.get("brand_name")]
+    if role in ("influencer", "china_ops"):
+        brands = {p.get("brand_name") for p in role_data.get("influencer_placements", []) if p.get("brand_name")}
+        return list(brands)
+    if role == "dev":
+        return [t.get("title") for t in role_data.get("dev_tasks", []) if t.get("title")]
+    return []
+
+
+def call_claude_analysis(person, okr_org_row, okr_items, role_data, drive_files, role):
     system = (
         "너는 이 회사의 데이터 아키텍트 겸 PM이다. 한 사람의 OKR/KPI(목표)와, 그걸 추적하기 위해 실제로 "
         "쌓이고 있는 업무 데이터, 그리고 구글드라이브에 있는 관련 파일 목록까지 비교해서 분석하는 게 네 역할이다.\n\n"
@@ -127,13 +143,15 @@ def call_claude_analysis(person, okr_org_row, okr_items, role_data, drive_files)
         "1) kpi_gap — 지금 목표(Objective/KR)를 현재 데이터 구조로 제대로 추적할 수 있는가? 필요한 정보인데 "
         "어디에도 기록이 안 되거나 여러 곳에 흩어져서 한눈에 안 보이면 이 유형으로 제안해라. 데이터가 부족해서 "
         "못 보던 거라면 '구글시트 연동해드릴까요?' 식으로 쉬운 대안도 같이 제안해라.\n"
-        "2) drive_link — 구글드라이브 파일 목록 중에, 이 사람의 업무 데이터(계약/캠페인/계정 등)와 이름이 겹치거나 "
-        "관련 있어 보이는 파일이 있으면 '이 파일을 연동할지 물어보자'는 제안을 해라. 파일명과 왜 관련있어 보이는지 "
-        "반드시 같이 적어라. 두 가지 경우로 나뉜다:\n"
-        "   (a) 파일명에서 브랜드명이 짐작되는데 existing_brand_names에 그 브랜드가 없다 → 새 계정이 필요한 "
-        "경우다. suggest_new_account를 true로, suggested_brand_name에 브랜드명을 적어라 (회사 전체에 영향을 "
-        "주는 일이라 대표 승인을 거친다).\n"
-        "   (b) 그 브랜드가 이미 existing_brand_names에 있다 → 이미 등록된 자기 자신의 레코드를 보완하는 "
+        "2) drive_link — 구글드라이브 파일 목록 중에, 이 사람의 업무 데이터(existing_record_names에 있는 "
+        "항목들 — 역할에 따라 브랜드/작업/인플루언서/캐스팅 대상 등 다양하다)와 이름이 겹치거나 관련 있어 "
+        "보이는 파일이 있으면 '이 파일을 연동할지 물어보자'는 제안을 해라. 파일명과 왜 관련있어 보이는지, "
+        "그리고 **이걸 실제로 반영하려면 아직 뭐가 더 필요한지(보완 요소)**도 반드시 같이 적어라 "
+        "(예: '날짜/금액은 파일명만으론 알 수 없어서 본인 확인 필요'). 두 가지 경우로 나뉜다:\n"
+        "   (a) 파일명에서 짐작되는 이름이 existing_record_names에 없다 → 새 레코드가 필요한 경우다. "
+        "suggest_new_account를 true로, suggested_brand_name에 짐작되는 이름을 적어라 (회사 전체에 영향을 "
+        "주는 일이라 대표 승인을 거친다). 세일즈가 아닌 역할이면 이 경우는 잘 안 나올 것이다.\n"
+        "   (b) 그 이름이 이미 existing_record_names에 있다 → 이미 등록된 자기 자신의 레코드를 보완하는 "
         "것뿐이다. is_personal_existing_match를 true로 해라 (본인이 바로 확인하면 되고 대표 승인은 필요 없다).\n"
         "3) org_improvement — 이 사람의 최근 업무기록(recent_logs) 내용을 보고, 일하는 방식이나 조직 구조에서 "
         "대표가 바꾸면 좋을 것 같은 게 보이면 제안해라 (예: 특정 업무에 시간이 과도하게 쏠림, 반복되는 병목 등). "
@@ -157,7 +175,7 @@ def call_claude_analysis(person, okr_org_row, okr_items, role_data, drive_files)
                        "target": i.get("target_qty"), "is_recurring": i.get("is_recurring")} for i in okr_items],
         "role_data_summary": {k: len(v) if isinstance(v, list) else v for k, v in role_data.items()},
         "role_data_sample": {k: v[:5] if isinstance(v, list) else v for k, v in role_data.items()},
-        "existing_brand_names": [a.get("brand_name") for a in role_data.get("sales_accounts", [])],
+        "existing_record_names": _existing_record_names(role, role_data),
         "recent_work_logs": [l.get("note") for l in role_data.get("recent_logs", [])],
         "drive_files": [{"name": f["name"], "url": f.get("webViewLink")} for f in drive_files[:50]],
     }, ensure_ascii=False, default=str)
@@ -230,7 +248,7 @@ def main():
         if role == "sales":
             check_sales_meetings(person, role_data.get("sales_accounts", []))
 
-        suggestions = call_claude_analysis(person, okr_org_row, okr_items, role_data, drive_files)
+        suggestions = call_claude_analysis(person, okr_org_row, okr_items, role_data, drive_files, role)
         for s in suggestions:
             text = (s.get("suggestion") or "").strip()
             if not text:
