@@ -1,9 +1,14 @@
 import os
+import sys
+from pathlib import Path
 import html
 from datetime import date, datetime, timedelta, timezone
 
 import streamlit as st
 from supabase import create_client
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 레포 루트의 ceo_common.py 를 어디서 실행해도 찾게
+from ceo_common import STATUS_LABEL, build_receivables, summarize
 
 st.set_page_config(page_title="Command Center", layout="wide")
 
@@ -196,7 +201,7 @@ def load_money(month_start_iso, since6_iso, since90_iso):
     matched, _ = tryq(lambda: _sel("bank_transactions", "matched_cash_event_id").eq("direction", "in")
                       .execute().data, [])
     matched_ids = {r["matched_cash_event_id"] for r in matched if r.get("matched_cash_event_id")}
-    checks, e_chk = tryq(lambda: _sel("ceo_receivable_checks", "id,cash_event_id,status,note,checked_at")
+    checks, e_chk = tryq(lambda: _sel("ceo_receivable_checks", "id,cash_event_id,status,received_amount,note,checked_at")
                          .order("checked_at", desc=True).execute().data, [])
     cats, _ = tryq(lambda: _sel("fin_account_categories", "id,name,type").execute().data, [])
     rev_ids = [c["id"] for c in cats if c.get("type") == "revenue"]
@@ -218,8 +223,8 @@ def load_money(month_start_iso, since6_iso, since90_iso):
 def load_ops(since30_iso, since14_iso):
     acc, _ = tryq(lambda: _sel("sales_accounts", "status,created_at,satisfaction_score,last_contact_date,renewal_date,monthly_budget")
                   .execute().data, [])
-    camp, _ = tryq(lambda: _sel("sales_campaigns", "open_date").gte("open_date", since30_iso).execute().data, [])
-    deals, e_deal = tryq(lambda: _sel("sales_pipeline_deals", "brand_name,expected_amount,expected_month,probability,status")
+    camp, _ = tryq(lambda: _sel("sales_campaigns", "open_date,contract_url,invoice_amount,brand_approved_at").limit(1000).execute().data, [])
+    deals, e_deal = tryq(lambda: _sel("sales_pipeline_deals", "brand_name,expected_amount,expected_month,probability,status,submitted_by,note")
                          .execute().data, [])
     plc, _ = tryq(lambda: _sel("influencer_placements", "status,guideline_ok,updated_at").limit(1000).execute().data, [])
     act, _ = tryq(lambda: _sel("daily_activity_log", "manager_feedback,created_at").gte("created_at", since14_iso)
@@ -323,10 +328,6 @@ def _write(label, fn):
         flash(label)
     except Exception as e:
         flash(f"저장하지 못했어요 ({type(e).__name__}: {str(e)[:160]}). migrations/20261009_ceo_command_center.sql 을 DB에 적용했는지 확인해주세요.", False)
-
-
-def check_receivable(event_id, status, label):
-    _write(label, lambda: SUPA.table("ceo_receivable_checks").insert({"cash_event_id": event_id, "status": status}).execute())
 
 
 # ══════════════════════════════════════════════════════════════
@@ -451,92 +452,80 @@ with st.expander("➕ 할 일 추가 / ✏️ 수정"):
                 st.rerun()
 
 # ══════════════════════════════════════════════════════════════
-# 받을 돈 + 계약예정
+# 받을 돈 + 계약예정 — 현황만 보여준다. 확인·처리(받음/부분입금/아직/계약취소)는 CFO > Receivables 에서.
 # ══════════════════════════════════════════════════════════════
-latest_check = {}
-for c in money["checks"]:  # checked_at 내림차순이라 처음 만난 것이 최신
-    latest_check.setdefault(c["cash_event_id"], c)
-open_ev, confirmed_ev = [], []
-for e in money["ev"]:
-    if e["id"] in money["matched_ids"]:
-        continue  # 은행 입금과 매칭된 건은 이미 받은 것
-    ck = latest_check.get(e["id"])
-    (confirmed_ev if ck and ck["status"] == "received" else open_ev).append(e)
-open_ev.sort(key=lambda e: -float(e.get("amount") or 0))
-total_open = sum(float(e.get("amount") or 0) for e in open_ev)
+rc = build_receivables(money["ev"], money["projs"], money["matched_ids"], money["checks"], TODAY)
+open_rows = rc["open"]
+sm = summarize(open_rows)
+total_open, max_over = sm["total"], sm["max_over"]
 
-
-def needs_check(e):
-    ck = latest_check.get(e["id"])
-    return ck is None or (days_ago(ck["checked_at"]) or 0) >= CHECK_EVERY_DAYS
-
-
-need = [e for e in open_ev if needs_check(e)]
-overdue_ev = [e for e in open_ev if to_date(e.get("due_date")) and to_date(e["due_date"]) < TODAY]
-max_over = max([(TODAY - to_date(e["due_date"])).days for e in overdue_ev], default=0)
-
+# 계약예정: 대표님이 대화로 알려주신 추정(submitted_by=장현우)과, 김선재가 계약서·인보이스 기준으로 입력한 정확한 값을 나눠서 본다.
 live_deals = [d for d in ops["deals"] if d.get("status") in ("예정", "협의중")]
-deal_sum = sum(float(d.get("expected_amount") or 0) for d in live_deals)
+ceo_deals = [d for d in live_deals if d.get("submitted_by") == "장현우"]
+sales_deals = [d for d in live_deals if d.get("submitted_by") != "장현우"]
+ceo_deal_sum = sum(float(d.get("expected_amount") or 0) for d in ceo_deals)
+sales_deal_sum = sum(float(d.get("expected_amount") or 0) for d in sales_deals)
 fc_in = money["forecasts"]
 fc_sum = sum(float(f.get("amount") or 0) for f in fc_in)
+deal_total = ceo_deal_sum + sales_deal_sum + fc_sum
+
+# 김선재 쪽 계약 데이터 현황(캠페인·계약서·인보이스)
+camps = ops["camp"]
+camp_contract = sum(1 for c in camps if c.get("contract_url"))
+camp_invoice = [c for c in camps if c.get("invoice_amount") is not None]
+camp_invoice_sum = sum(float(c.get("invoice_amount") or 0) for c in camp_invoice)
 
 st.markdown("### 💰 받을 돈 · 계약예정")
 m1, m2 = st.columns(2)
 with m1:
     top_rows = ""
-    for e in open_ev[:6]:
-        pr = money["projs"].get(e.get("project_id")) or {}
-        name = pr.get("brand") or e.get("title") or "(이름 없음)"
-        dd = to_date(e.get("due_date"))
-        over = dd and dd < TODAY
-        ck = latest_check.get(e["id"])
-        tag = pill("체크 필요", RED) if needs_check(e) else f"<span class='cc-gray'>{days_ago(ck['checked_at'])}일 전 확인({'아직' if ck['status'] == 'pending' else ck['status']})</span>"
-        due_txt = (f"<b style='color:{RED}'>{(TODAY - dd).days}일 경과</b>" if over else (f"D-{(dd - TODAY).days}" if dd else "기한 미정"))
-        top_rows += f"<div class='cc-row'><span class='n'>{esc(name)} <span class='cc-gray'>{esc(e.get('title') or '')}</span></span><span>{won(e.get('amount'))} · {due_txt} {tag}</span></div>"
-    if not open_ev:
+    for r in open_rows[:6]:
+        name = r["brand"] or r["title"] or "(이름 없음)"
+        ck = r["check"]
+        tag = pill("체크 필요", RED) if r["need_check"] else (f"<span class='cc-gray'>{days_ago(ck['checked_at'])}일 전 확인({STATUS_LABEL[ck['status']]})</span>" if ck else "")
+        due_txt = (f"<b style='color:{RED}'>{r['overdue_days']}일 경과</b>" if r["overdue_days"] else (f"D-{(r['due_date'] - TODAY).days}" if r["due_date"] else "기한 미정"))
+        part = f" <span class='cc-gray'>(예정 {won(r['amount'])} 중 {won(r['received'])} 받음)</span>" if r["received"] else ""
+        top_rows += (f"<div class='cc-row'><span class='n'>{esc(name)} <span class='cc-gray'>{esc(r['title'])}</span></span>"
+                     f"<span>{won(r['remaining'])}{part} · {due_txt} {tag}</span></div>")
+    if not open_rows:
         top_rows = "<div class='cc-row cc-gray'><span>받을 돈(예정) 건이 없어요</span><span>0건</span></div>"
     st.markdown(
         "<div class='cc-card'><div class='cc-eyebrow'>O2 · 현금</div><div class='cc-h2'>받을 돈 (예정)</div>"
         "<div class='cc-big' style='color:{c}'>{v}</div>"
         "<div class='cc-sub'>예정 {n}건 · <b style='color:{c2}'>체크 필요 {nc}건</b> · 기한 경과 {no}건(최대 {mo}일)</div>"
-        "<div class='cc-sub'>은행 매칭이 안 돼 있어도, 큰 금액부터 보여드려요. 대표님이 확인(받음/아직)하면 숫자가 정확해져요.</div>"
+        "<div class='cc-sub'>남은 금액이 큰 순서예요. 부분입금은 남은 금액만, 계약취소·받음은 뺀 값이에요.</div>"
         "<div style='margin-top:10px'>{rows}</div></div>".format(
-            c=RED if total_open else "inherit", v=won(total_open) if total_open else "0원", n=len(open_ev), c2=RED if need else GRAY,
-            nc=len(need), no=len(overdue_ev), mo=max_over, rows=top_rows), unsafe_allow_html=True)
+            c=RED if total_open else "inherit", v=won(total_open) if total_open else "0원", n=sm["n"], c2=RED if sm["need_n"] else GRAY,
+            nc=sm["need_n"], no=sm["late_n"], mo=max_over, rows=top_rows), unsafe_allow_html=True)
+    try:
+        st.page_link("pages/17_수금관리.py", label="💰 확인·처리는 CFO › Receivables 에서 →")
+    except Exception:
+        st.caption("확인·처리는 상단 메뉴 CFO › Receivables 에서 해요.")
 with m2:
+    deal_rows = ""
+    for d in sorted(live_deals, key=lambda d: -float(d.get("expected_amount") or 0))[:5]:
+        src = "대표 메모(추정)" if d.get("submitted_by") == "장현우" else "김선재 입력"
+        mon = str(d.get("expected_month") or "")[:7]
+        deal_rows += (f"<div class='cc-row'><span class='n'>{esc(d.get('brand_name'))} <span class='cc-gray'>{esc(src)}"
+                      f"{' · ' + esc(mon) if mon else ''}{' · ' + esc(d.get('probability')) if d.get('probability') else ''}</span></span>"
+                      f"<span>{won(d.get('expected_amount'))}</span></div>")
     st.markdown(
-        "<div class='cc-card'><div class='cc-eyebrow'>직원 보고 · 예측회의 반영</div><div class='cc-h2'>계약예정</div>"
+        "<div class='cc-card'><div class='cc-eyebrow'>대표 메모 · 김선재 입력 · 직원 신고</div><div class='cc-h2'>계약예정</div>"
         "<div class='cc-big' style='color:{c}'>{v}</div>"
-        "<div class='cc-sub'>김선재 계약예정 {a}건 · 직원 예상입금 신고 {b}건 (₩{fs})</div>"
-        "<div class='cc-row'><span>계약예정(예측회의, 김선재 입력)</span><span class='n'>{a}건 · {ds}</span></div>"
-        "<div class='cc-row'><span>직원 예상입금 신고(미처리)</span><span class='n'>{b}건 · {fs2}</span></div>"
-        "<div class='cc-sub' style='margin-top:8px'>{gap}</div></div>".format(
-            c=BLUE if (deal_sum or fc_sum) else GRAY, v=won(deal_sum + fc_sum) if (deal_sum or fc_sum) else "0원",
-            a=len(live_deals), b=len(fc_in), fs=f"{fc_sum:,.0f}", ds=won(deal_sum), fs2=won(fc_sum),
-            gap="김선재 입력 대기 — 팀스페이스 업무보고에서 '계약예정'을 입력하면 여기에 바로 나타나요." if not live_deals else ""),
-        unsafe_allow_html=True)
-
-if open_ev:
-    with st.expander(f"🔴 받을 돈 확인하기 (큰 금액 순 · 체크 필요 {len(need)}건)", expanded=bool(need)):
-        for e in open_ev[:12]:
-            pr = money["projs"].get(e.get("project_id")) or {}
-            c1, c2, c3, c4 = st.columns([5, 2, 1, 1])
-            c1.markdown(f"**{pr.get('brand') or e.get('title') or '(이름 없음)'}** · {e.get('title') or ''}")
-            c2.markdown(f"{won(e.get('amount'))} · 기한 {e.get('due_date') or '미정'}")
-            c3.button("✅ 받음", key=f"rc_in_{e['id']}", on_click=check_receivable, args=(e["id"], "received", "받았다고 확인했어요. 받을 돈에서 뺐어요."),
-                      disabled=money["missing_checks"], use_container_width=True)
-            c4.button("⏳ 아직", key=f"rc_no_{e['id']}", on_click=check_receivable, args=(e["id"], "pending", "아직 못 받았다고 확인했어요. 14일 뒤 다시 알려드려요."),
-                      disabled=money["missing_checks"], use_container_width=True)
-        if money["missing_checks"]:
-            st.caption("확인 버튼은 DB 테이블(ceo_receivable_checks) 적용 후 켜져요.")
-        st.caption("이 확인은 재무 데이터(cash_events)를 바꾸지 않고 별도로 기록돼요. 재무 완료 처리는 계속 은행거래 매칭으로만 해요.")
-if confirmed_ev:
-    with st.expander(f"내가 받았다고 확인한 건 {len(confirmed_ev)}건 ({won(sum(float(e.get('amount') or 0) for e in confirmed_ev))})"):
-        for e in confirmed_ev:
-            c1, c2 = st.columns([6, 1])
-            pr = money["projs"].get(e.get("project_id")) or {}
-            c1.markdown(f"{pr.get('brand') or e.get('title')} · {won(e.get('amount'))}")
-            c2.button("되돌리기", key=f"rc_undo_{e['id']}", on_click=check_receivable, args=(e["id"], "pending", "되돌렸어요."))
+        "<div class='cc-row'><span>대표 메모(추정, 대화로 입력)</span><span class='n'>{a}건 · {ads}</span></div>"
+        "<div class='cc-row'><span>김선재 입력(계약서·인보이스 기준, 정확)</span><span class='n'>{b}건 · {bds}</span></div>"
+        "<div class='cc-row'><span>직원 예상입금 신고(미처리)</span><span class='n'>{f}건 · {fs}</span></div>"
+        "{deals}"
+        "<div class='cc-sub' style='margin-top:10px'>김선재 계약 데이터: 캠페인 {nc}건 · 계약서 첨부 {ct}건 · 인보이스 금액 입력 {ni}/{nc}건"
+        "{invsum}</div>"
+        "<div class='cc-sub'>{gap}</div><div class='cc-sub'>{wait}</div></div>".format(
+            c=BLUE if deal_total else GRAY, v=won(deal_total) if deal_total else "0원",
+            a=len(ceo_deals), ads=won(ceo_deal_sum), b=len(sales_deals), bds=won(sales_deal_sum), f=len(fc_in), fs=won(fc_sum),
+            deals=deal_rows, nc=len(camps), ct=camp_contract, ni=len(camp_invoice),
+            invsum=f" (합계 {won(camp_invoice_sum)})" if camp_invoice else "",
+            gap=("인보이스 금액이 입력되면 청구액으로 보여드려요 — 팀스페이스 김선재 업무보고에서 입력." if len(camps) and not camp_invoice else
+                 ("" if camps else "아직 등록된 캠페인이 없어요.")),
+            wait="" if sales_deals else "김선재 계약예정 입력 대기 — 팀스페이스 업무보고에서 입력하면 여기에 바로 나타나요."), unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════
 # SCM 8단계 — 조직도 배치 · 비어있음/막힘/느림
@@ -567,6 +556,7 @@ rev_this = rev_by_month.get(TODAY.strftime("%Y-%m"), 0)
 acc = ops["acc"]
 n_active = sum(1 for a in acc if a.get("status") in ("운영중", "계약완료"))
 n_neg = sum(1 for a in acc if a.get("status") == "협상중")
+camp30 = sum(1 for c in ops["camp"] if to_date(c.get("open_date")) and (TODAY - to_date(c["open_date"])).days <= 30)
 n_new30 = sum(1 for a in acc if days_ago(a.get("created_at")) is not None and days_ago(a["created_at"]) <= 30)
 sat = [a for a in acc if a.get("satisfaction_score") is not None]
 renew30 = sum(1 for a in acc if to_date(a.get("renewal_date")) and 0 <= (to_date(a["renewal_date"]) - TODAY).days <= 30)
@@ -599,12 +589,12 @@ def lg(c):
 
 
 METRICS = {
-    "S1": (str(n_neg), "협상중 브랜드(곳)", [("최근 30일 신규 계정", f"{n_new30}곳"), ("계약예정 입력(김선재)", f"{len(live_deals)}건 · {won(deal_sum)}")], n_neg + n_new30 + len(live_deals) > 0),
-    "S2": (won(rev_this) if rev_this else "0원", "이번 달 입금 매출(은행, 매출 계정)", [("운영중 브랜드", f"{n_active}곳"), ("이번 달 캠페인 등록", f"{len(ops['camp'])}건 (30일)"), ("월예산 입력된 계정", f"{budget_in}/{len(acc)}")], bool(rev_this or acc)),
+    "S1": (str(n_neg), "협상중 브랜드(곳)", [("최근 30일 신규 계정", f"{n_new30}곳"), ("계약예정(대표 메모+김선재)", f"{len(live_deals)}건 · {won(ceo_deal_sum + sales_deal_sum)}")], n_neg + n_new30 + len(live_deals) > 0),
+    "S2": (won(rev_this) if rev_this else "0원", "이번 달 입금 매출(은행, 매출 계정)", [("운영중 브랜드", f"{n_active}곳"), ("최근 30일 캠페인 등록", f"{camp30}건"), ("월예산 입력된 계정", f"{budget_in}/{len(acc)}")], bool(rev_this or acc)),
     "S3": (pct(plc_done, len(plc)), f"업로드 완료율({plc_done}/{len(plc)}건)", [("진행중(미완료)", f"{len(plc) - plc_done}건"), ("가이드라인 확인", f"{plc_ok}/{len(plc)}"), ("최근 14일 갱신", f"{plc_recent}건")], bool(plc)),
     "S4": (f"{len(sat)}/{len(acc)}", "만족도 점수 입력된 계정", [("30일 넘게 접촉 없음", f"{no_contact}곳"), ("갱신일 30일 이내", f"{renew30}곳"), ("공짜요소·시즌성 부여 기록", "항목 없음(설계 필요)")], bool(sat)),
     "S5": (avg_pct(by_stage["S5"]), "자동화 OKR 평균 달성률", [("개발 할 일 미완료", f"{dev_open}건"), ("지난 KPI 기간 달성", lg("S5"))], bool(by_stage["S5"]) or bool(ops["dev"])),
-    "S6": (pct(money["tot90"] - money["unc90"], money["tot90"]) if cls_rate is not None else "0%", "은행거래 분류율(90일)", [("미분류 거래", f"{money['unc90']}건"), ("받을 돈 체크 필요", f"{len(need)}건"), ("기한 경과 미수", f"{len(overdue_ev)}건")], bool(money["tot90"])),
+    "S6": (pct(money["tot90"] - money["unc90"], money["tot90"]) if cls_rate is not None else "0%", "은행거래 분류율(90일)", [("미분류 거래", f"{money['unc90']}건"), ("받을 돈 체크 필요", f"{sm['need_n']}건"), ("기한 경과 미수", f"{sm['late_n']}건")], bool(money["tot90"])),
     "S7": (f"{len(act)}건", "최근 14일 업무기록", [("대표 피드백 달린 기록", f"{fb}건"), ("대표 할일 완료", f"{asg_done}/{len(ops['asg'])}"), ("회의록(30일)", f"{ops['meet']}건"), ("지난 KPI 기간 달성", lg("S7"))], bool(act or ops["meet"])),
     "S8": ("입력", "IR 지표 정의 필요", [("회사 비전 마지막 수정", f"{vis_age}일 전" if vis_age is not None else "기록 없음"), ("1~7단계 핵심 숫자", "IR 재료로 쌓는 중")], False),
 }

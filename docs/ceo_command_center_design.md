@@ -15,7 +15,7 @@
 | 그룹 | 메뉴 | 파일 |
 |---|---|---|
 | CEO · Decisions | Command Center / Meetings | `pages/16_커맨드센터.py` / `pages/11_회의록.py` |
-| CFO · Finance & IR | Finance Calendar | `pages/9_재무캘린더.py` (📄 실시간 손익계산서 포함) |
+| CFO · Finance & IR | Receivables / Finance Calendar | `pages/17_수금관리.py`(받을 돈 확인·처리 + 최근 입금내역) / `pages/9_재무캘린더.py`(📄 실시간 손익계산서 포함) |
 | COO · People & Automation | OKR Feedback / Leave | `pages/14_ OKR피드백관리.py` / `pages/15_휴가관리.py` |
 
 - 나머지 페이지(계약콘솔·계약서·송금캘린더·인보이스·영업·OKR목표관리·손익현황·지출예정보고·데일리업무보고·옛 종합상황판)는 **삭제하지 않고 메뉴에서만 숨김**.
@@ -33,13 +33,20 @@
 | 5 | SCM 8단계 | 아래 4장 | 단계별 '데이터 대기/비어있음' |
 | 6 | O1~O4 | `ceo_okr_objectives`, `ceo_okr_krs`(+ 자동 KR은 DB에서 직접 계산) | 회색 "입력" |
 
-### 받을 돈 로직
-1. 대상: 입금 예정(`direction='in'`)이고 `paid=false`.
-2. 제외: 은행거래의 `matched_cash_event_id` 로 이미 매칭된 건, 대표가 마지막으로 '받음' 확인한 건.
-3. 정렬: **금액 큰 순**. 합계·건수·기한 경과(최대 경과일) 표시.
-4. **체크 필요**: 대표의 확인 기록이 없거나 마지막 확인이 14일 이상 지난 건(`CHECK_EVERY_DAYS`).
-5. 버튼 `✅ 받음`(received) / `⏳ 아직`(pending). '받음' 건은 합계에서 빠지고, "내가 받았다고 확인한 건"에서 되돌릴 수 있다.
-6. 참고: 2026-10-09 기준 `cash_events` 에는 기한이 지난 미입금 14건(3.84억)이 남아 있다. 입금 처리가 안 된 옛 데이터일 가능성이 커서, 대표님이 하나씩 '받음/아직'을 눌러 정리하는 용도.
+### 받을 돈 로직 (계산: `ceo_common.py`, 조작: CFO › Receivables, Command Center는 현황만)
+1. 대상: 입금 예정(`direction='in'`)이고 `paid=false` 인 `cash_events`.
+2. 제외: 은행거래의 `matched_cash_event_id` 로 이미 매칭된 건, 대표가 마지막으로 **받음**/**계약취소** 표시한 건.
+3. **부분입금**: 대표가 '지금까지 받은 금액(누적)'을 입력하면 남은 금액(예정 − 받은 금액)만 받을 돈에 남는다. 예정 금액 이상이면 전액 받음으로 처리.
+4. 정렬: **남은 금액 큰 순**. 합계·건수·기한 경과(최대 경과일) 표시.
+5. **체크 필요**: 대표의 확인 기록이 없거나 마지막 확인이 14일 이상 지난 건(`CHECK_EVERY_DAYS`).
+6. 버튼 4종: `✅ 받음`(received) · `💵 부분`(partial, 받은 금액 입력) · `⏳ 아직`(pending) · `✖ 취소`(canceled, 확인 팝업). '정리된 건'에서 받음/계약취소는 되돌릴 수 있다(되돌리면 pending 기록).
+7. 모든 확인은 `ceo_receivable_checks` 에 이력으로 쌓이고(가장 최근 기록이 현재 상태), `cash_events` 는 바꾸지 않는다.
+8. 참고: 2026-10-09 기준 `cash_events` 에는 기한이 지난 미입금 14건(3.84억, 23yearsold·포에버성형외과·OWM·Lagom·Boosteone)이 남아 있다. 입금 처리가 안 된 옛 데이터일 가능성이 커서, 대표님이 하나씩 정리하는 용도.
+9. 김선재의 계약 데이터(`sales_campaigns`: 계약서 첨부·인보이스)는 위 cash_events 와 **다른 브랜드 묶음**이다(운영 브랜드 8곳). 인보이스 금액이 입력되면(`invoice_amount`) 청구액으로 보여주고, 입금 매칭은 다음 단계.
+
+### 최근 입금내역 (CFO › Receivables 두 번째 탭)
+- `bank_transactions` 입금 전체. 기간(30/90/180/365일) · 보기(전체/미매칭만/매칭됨만) · 내부이체 제외(기본 켜짐).
+- 매칭 = `matched_cash_event_id` 있음(✅ 브랜드·제목 표시) / 없음(⚠️ 미매칭). 계정과목이 없으면 '분류 전'. CSV 다운로드(utf-8-sig).
 
 ## 4. SCM 8단계 설계
 
@@ -91,10 +98,11 @@
 | 받을 돈 '받음/아직' 확인 | 대표 | Command Center | 구현됨 |
 | SCM 단계 배치 | 대표 | Command Center | 구현됨 |
 | 계약예정(예측회의 결과) | 김선재 | 팀스페이스 업무보고 (`sales_pipeline_deals`) | **테이블만 준비, 입력 화면은 팀스페이스에서 추가 예정** |
+| 계약예정(대표 추정: 어떤 업체가 얼마 규모) | 대표 | Claude와의 대화로 알려주면 Claude가 `sales_pipeline_deals` 에 `submitted_by='장현우'` 로 입력 | 화면에는 '대표 메모(추정)'으로 구분 표시. 김선재 입력이 들어오면 그쪽이 정확한 값 |
 | 만족도·갱신일·월예산 | 김선재 | 팀스페이스 `🏢 계정 관리` (`sales_accounts`) | 기존 화면 활용/강화 예정 |
 
 ## 6. 적용 순서
-1. `migrations/20261009_ceo_command_center.sql` 을 Supabase(`grlayjybcxrcaufnwysb`)에 적용 — 새 테이블 8개 추가만 하고 기존 데이터는 안 건드림.
+1. (2026-10-09 적용 완료) `migrations/20261009_ceo_command_center.sql` · `20261009_ceo_receivable_partial_cancel.sql`(부분입금·계약취소) 을 Supabase(`grlayjybcxrcaufnwysb`)에 적용 — 새 테이블 8개 추가만 하고 기존 데이터는 안 건드림.
 2. (선택) `migrations/20261009_ceo_command_center_seed.sql` — 2026 Q4 O1~O4 초안과 브랜드 런칭 선행조건 시드. 현재값은 비워 둠.
 3. 코드 배포. **1·2번을 적용하기 전에도 화면은 정상으로 열리고**, 해당 칸이 '입력 대기'로 표시된다.
 4. 이후 팀스페이스에서 `sales_pipeline_deals` 입력 화면 추가.

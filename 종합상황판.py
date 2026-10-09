@@ -17,6 +17,7 @@ NAV = {
         st.Page("pages/11_회의록.py", title="Meetings", icon="🗒️", url_path="meetings"),
     ],
     "CFO · Finance & IR": [
+        st.Page("pages/17_수금관리.py", title="Receivables", icon="💰", url_path="receivables"),
         st.Page("pages/9_재무캘린더.py", title="Finance Calendar", icon="💹", url_path="finance"),
     ],
     "COO · People & Automation": [
