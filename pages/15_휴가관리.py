@@ -25,12 +25,9 @@ FINANCE_PASSWORD = os.environ.get("FINANCE_PASSWORD")
 st.title("🏖️ 휴가 관리")
 st.caption("직원 휴가의 입사일·연간 부여일수와 휴가 기록을 고치는 화면 — 대표 전용")
 
-# 재무캘린더는 비밀번호 변수가 없으면 그냥 열리지만, 직원 기록을 고치는 화면이라 여기서는 반대로 잠가둔다.
-if not FINANCE_PASSWORD:
-    st.error("🔒 FINANCE_PASSWORD 환경변수가 설정되어 있지 않아 이 페이지를 열 수 없습니다. (Railway Variables에 추가해주세요)")
-    st.stop()
-
-if not st.session_state.get("finance_ok"):
+# 재무캘린더·OKR피드백관리와 같은 방식: FINANCE_PASSWORD 변수가 비어 있으면 로그인 없이 열린다(검토용, 10/9 대표 지시).
+# 운영 서비스에는 이 변수를 반드시 넣어 둘 것 — 이 화면은 직원 휴가 기록을 고칠 수 있다.
+if FINANCE_PASSWORD and not st.session_state.get("finance_ok"):
     st.warning("🔒 이 페이지는 장현우 전용입니다. 이메일과 비밀번호를 입력해주세요.")
     gc1, gc2 = st.columns(2)
     email_in = gc1.text_input("이메일", placeholder=ADMIN_EMAIL)
@@ -43,7 +40,7 @@ if not st.session_state.get("finance_ok"):
             st.error("이메일 또는 비밀번호가 올바르지 않습니다.")
     st.stop()
 
-if st.columns([6, 1])[1].button("🔒 잠그기"):
+if FINANCE_PASSWORD and st.columns([6, 1])[1].button("🔒 잠그기"):
     st.session_state.finance_ok = False
     st.rerun()
 
