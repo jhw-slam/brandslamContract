@@ -226,8 +226,9 @@ def mark_duplicates(df, keep_ids=None):
     if df.empty:
         return df
     # 짝짓는 순서: 거래 시각(없으면 입력 시각) — 결제가 먼저, 취소가 그다음, 마지막이 실결제
-    df["_sort_key"] = pd.to_datetime(df["txn_datetime"] if "txn_datetime" in df.columns else None, errors="coerce")
-    df["_sort_key"] = df["_sort_key"].fillna(pd.to_datetime(df.get("created_at"), errors="coerce"))
+    # 시각 열마다 시간대 표기가 다를 수 있다(거래시각=표기 없음, 입력시각=+00:00) → 둘 다 utc=True 로 맞춘 뒤 비교
+    df["_sort_key"] = pd.to_datetime(df["txn_datetime"] if "txn_datetime" in df.columns else None, errors="coerce", utc=True)
+    df["_sort_key"] = df["_sort_key"].fillna(pd.to_datetime(df.get("created_at"), errors="coerce", utc=True))
 
     def _flag(group_cols, target_col):
         decided = df["offset_kept"]
