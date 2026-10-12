@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 레포 루트의 expense_breakdown.py
 from expense_breakdown import group_merchants, proposal_summary
+from bank_common import OFFSET_WINDOW_MIN, mark_duplicates, parse_txn_datetime
 
 st.set_page_config(page_title="재무캘린더", layout="wide")
 
@@ -35,6 +36,10 @@ FINANCE_ADMIN_EMAIL = "jhw@slam-global.com"
 FINANCE_PASSWORD = os.environ.get("FINANCE_PASSWORD")
 
 st.title("💹 재무캘린더")
+try:
+    st.page_link("pages/20_부가세신고.py", label="🧾 부가세 신고 준비 (VAT Filing)")
+except Exception:
+    pass  # 상단 메뉴 없이 단독 실행할 때는 링크를 건너뜀
 st.caption("계정과목별 현금흐름 · 전체 매칭 관리자 모드 · 실시간 손익계산서 — 접근 제한 페이지")
 
 if FINANCE_PASSWORD and not st.session_state.get("finance_ok"):
@@ -247,51 +252,6 @@ if not ev_df.empty:
     ev_df["brand"] = ev_df["project_id"].map(lambda x: proj_by_id.get(x, {}).get("brand", "-"))
     ev_df["month"] = ev_df["due_date"].dt.to_period("M").astype(str)
 
-OFFSET_WINDOW_MIN = 10   # 입금·출금이 이 분 안에 있어야 '결제 ↔ 취소' 상쇄로 본다
-
-
-def mark_duplicates(df, keep_ids=None):
-    """'상쇄' = 같은 계좌에서 같은 날, 같은 금액의 입금과 출금이 몇 분 차이로 짝을 이룬 것 (결제 ↔ 취소/환불). (DB는 안 바꾸고 화면용 플래그만 계산)
-    - is_dup_certain(=상쇄): 계좌+금액+날짜가 같고 방향이 반대(입금↔출금)이며 거래 시각 차이가 OFFSET_WINDOW_MIN분 이하인 쌍.
-        가장 가까운 것끼리 1:1로 짝지어 둘 다 집계에서 뺀다. 짝이 없는 거래는 그대로 반영된다.
-    - is_dup_suspect(=애매): 같은 날·같은 금액의 입금/출금이 있는데 시간 차이가 크거나 시각을 몰라서 짝을 못 지은 거래 → 집계에는 포함, 화면에 표시만
-    - 같은 방향(출금/출금, 입금/입금)끼리는 상쇄가 아니다. (같은 거래의 이중 입력은 dedup_hash 가 이미 막는다)
-    - keep_ids: 대표님이 '상쇄 아님(별개 거래)'으로 정한 거래 id → 자동 판단에서 완전히 뺀다
-    """
-    df = df.copy()
-    keep_ids = keep_ids or set()
-    df["is_dup_certain"] = False
-    df["is_dup_suspect"] = False
-    df["dup_group"] = None
-    df["offset_kept"] = df["id"].isin(keep_ids)
-    if df.empty:
-        return df
-    ts = pd.to_datetime(df["txn_datetime"], errors="coerce", utc=True, format="mixed") if "txn_datetime" in df.columns else pd.Series(pd.NaT, index=df.index)
-    pool = df[~df["offset_kept"]]
-    for gkey, g in pool.groupby(["account_label", "amount", "txn_date"], dropna=True):
-        ins, outs = g.index[g["direction"] == "in"], g.index[g["direction"] == "out"]
-        if len(ins) == 0 or len(outs) == 0:
-            continue
-        cand = sorted(
-            (abs((ts[i] - ts[o]).total_seconds()), i, o)
-            for i in ins for o in outs if pd.notna(ts[i]) and pd.notna(ts[o])
-        )
-        used, matched = set(), []
-        for gap, i, o in cand:
-            if gap > OFFSET_WINDOW_MIN * 60:
-                break
-            if i in used or o in used:
-                continue
-            used.update((i, o)); matched += [i, o]
-        left_in = [i for i in ins if i not in used]
-        left_out = [o for o in outs if o not in used]
-        if matched:
-            df.loc[matched, "is_dup_certain"] = True
-        if left_in and left_out:   # 같은 날·같은 금액인데 짝을 못 지은 입금/출금 → 애매
-            df.loc[left_in + left_out, "is_dup_suspect"] = True
-        if matched or (left_in and left_out):   # 화면에서 한 묶음으로 보이게(짝 없는 거래도 '남음'으로 함께 표시)
-            df.loc[g.index, "dup_group"] = str(gkey)
-    return df
 
 
 _keep_ids, _keep_err = load_offset_keep()
@@ -301,7 +261,7 @@ if not bank_df.empty:
     bank_df["txn_date"] = pd.to_datetime(bank_df["txn_date"], errors="coerce")
     if "txn_datetime" in bank_df.columns:
         # 은행마다 표기가 다르다(SC제일 '2025.10.07 12:42:04' / 기업 '2025-11-19 14:21:23'). 첫 줄 형식으로 통째로 읽으면 나머지가 빈 값이 되므로 형식을 섞어서 읽는다
-        bank_df["txn_datetime"] = pd.to_datetime(bank_df["txn_datetime"].astype("string").str.replace(".", "-", regex=False), errors="coerce", format="mixed")
+        bank_df["txn_datetime"] = parse_txn_datetime(bank_df["txn_datetime"])
     bank_df["cat_name"] = bank_df["account_category_id"].map(lambda x: cat_by_id.get(x, {}).get("name", "미분류"))
     bank_df["cat_type"] = bank_df["account_category_id"].map(lambda x: cat_by_id.get(x, {}).get("type"))
     bank_df["matched_brand"] = bank_df["matched_cash_event_id"].map(

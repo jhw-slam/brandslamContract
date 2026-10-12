@@ -20,6 +20,7 @@ NAV = {
         st.Page("pages/17_수금관리.py", title="Receivables", icon="💰", url_path="receivables"),
         st.Page("pages/18_캠페인마진.py", title="Campaign Margin", icon="📈", url_path="campaign-margin"),
         st.Page("pages/9_재무캘린더.py", title="Finance Calendar", icon="💹", url_path="finance"),
+        st.Page("pages/20_부가세신고.py", title="VAT Filing", icon="🧾", url_path="vat-filing"),
     ],
     "COO · People & Automation": [
         st.Page("pages/14_ OKR피드백관리.py", title="OKR Feedback", icon="🧭", url_path="okr-feedback"),
