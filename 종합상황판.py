@@ -24,6 +24,7 @@ NAV = {
     "COO · People & Automation": [
         st.Page("pages/14_ OKR피드백관리.py", title="OKR Feedback", icon="🧭", url_path="okr-feedback"),
         st.Page("pages/15_휴가관리.py", title="Leave", icon="🏖️", url_path="leave"),
+        st.Page("pages/19_직원입력현황.py", title="Team Input", icon="👥", url_path="team-input"),
     ],
 }
 
