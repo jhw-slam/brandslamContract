@@ -159,6 +159,19 @@ def refresh():
     st.rerun()
 
 
+def _mark_normal(ids, what):
+    """대표님이 '정상(중복·상쇄 아님)'으로 확인한 은행거래를 기록한다. 데이터는 바꾸지 않고 bank_offset_overrides 에만 쌓는다."""
+    ids = [i for i in ids if i]
+    try:
+        SUPA.table("bank_offset_overrides").upsert(
+            [{"bank_transaction_id": i, "decision": "keep", "decided_by": "장현우"} for i in ids], on_conflict="bank_transaction_id").execute()
+        st.session_state["offset_flash"] = f"{what} — {len(ids)}건을 정상 거래로 표시했어요."
+    except Exception as e:
+        st.session_state["offset_flash"] = (f"저장하지 못했어요 ({type(e).__name__}: {str(e)[:120]}). "
+                                            "migrations/20261012_bank_offset_overrides.sql 이 DB에 적용됐는지 확인해주세요.")
+    refresh()
+
+
 @st.cache_data(ttl=45)
 def load_business_notes(active_only=True):
     q = SUPA.table("fin_business_notes").select("*").order("created_at", desc=True)
@@ -292,7 +305,7 @@ if total_unc > 0:
 else:
     st.success("✅ 모든 항목이 계정과목으로 분류되어 있습니다.")
 if n_dup_certain or n_dup_suspect:
-    st.info(f"🧹 은행거래 상쇄·중복 — 상쇄 {n_dup_certain}건(결제↔취소 쌍, 둘 다 집계에서 제외됨) · 애매한 중복 {n_dup_suspect}건(표시만, 집계엔 포함) → **'전체 매칭 현황 > 은행거래내역'**의 '상쇄·중복 정리'에서 확인하세요.")
+    st.info(f"🧹 은행거래 상쇄·중복 — 상쇄 {n_dup_certain}건(결제↔취소 쌍, 둘 다 집계에서 제외됨) · 애매한 중복 {n_dup_suspect}건(대부분 정상 출금 — 집계에 포함, 분류 목록에 함께 표시) → **'전체 매칭 현황 > 은행거래내역'**의 '상쇄·중복 정리'에서 확인하세요.")
 
 menu = st.radio(
     "메뉴", ["📊 대시보드", "🔗 전체 매칭 현황", "🤖 AI 계정과목 추천", "🏦 뱅크다 연동", "⚙️ 계정과목 설정", "📄 손익계산서", "📝 CFO 인사이트"],
@@ -465,12 +478,12 @@ elif menu == "🔗 전체 매칭 현황":
 
     # ── 은행거래내역 ──────────────────────────────────────
     with tab_bank:
+        if st.session_state.get("offset_flash"):
+            st.success(st.session_state.pop("offset_flash"))
         n_certain = int(bank_df["is_dup_certain"].sum())
         n_suspect = int(bank_df["is_dup_suspect"].sum())
         if n_certain or n_suspect or _keep_ids:
             with st.expander(f"🧹 상쇄·중복 정리 — 상쇄 {n_certain}건 · 애매한 중복 {n_suspect}건", expanded=True):
-                if st.session_state.get("offset_flash"):
-                    st.success(st.session_state.pop("offset_flash"))
                 if n_certain:
                     st.markdown("**상쇄 처리된 거래** — 같은 계좌·방향·금액·날짜·적요인 거래를 **결제와 취소가 서로 지워지는 쌍**으로 보고, 시간순으로 2건씩 짝지어 "
                                 "대시보드/손익계산서 집계에서 둘 다 뺐어요. (결제·취소·실결제 3건이면 앞의 2건이 상쇄되고 마지막 1건만 반영돼요.) "
@@ -498,7 +511,11 @@ elif menu == "🔗 전체 매칭 현황":
                             refresh()
                         st.divider()
                 if n_suspect:
-                    st.markdown("**애매한 중복 의심** (계좌+방향+금액+날짜는 같은데 적요나 시간이 다름) — 집계에는 그대로 포함되어 있고, 자동으로 지우지 않습니다. 직접 확인 후 필요하면 위 확실한 중복처럼 개별적으로 지워주세요.")
+                    st.markdown("**애매한 중복 의심** (계좌+방향+금액+날짜는 같은데 적요나 시간이 다름) — 대부분 **정상 출금**이에요. 집계에는 그대로 포함되어 있고, "
+                                "아래 거래는 **'미분류만 보기' 목록에도 자동으로 함께 나와서** 계정과목을 다시 확인·분류할 수 있어요. "
+                                "정상이면 '✅ 정상'을 눌러 이 의심 표시에서 빼세요. (지우지 않아요)")
+                    if st.button(f"✅ 애매한 중복 {n_suspect}건 모두 정상으로 표시", key="bulk_normal_suspect", disabled=bool(_keep_err)):
+                        _mark_normal(bank_df.loc[bank_df["is_dup_suspect"], "id"].tolist(), "애매한 중복 전체")
                     for gkey, g in bank_df[bank_df["is_dup_suspect"]].groupby("dup_group"):
                         for _, row in g.sort_values("txn_date").iterrows():
                             d = row["txn_date"].strftime("%Y-%m-%d") if pd.notna(row["txn_date"]) else "-"
@@ -507,6 +524,8 @@ elif menu == "🔗 전체 매칭 현황":
                             if dc2.button("삭제", key=f"delsus_{row['id']}"):
                                 SUPA.table("bank_transactions").delete().eq("id", row["id"]).execute()
                                 st.success("삭제 완료"); refresh()
+                        if st.button("✅ 정상 — 이 거래들은 중복이 아니에요", key=f"normalgrp_{hashlib.md5(str(gkey).encode('utf-8')).hexdigest()[:12]}", disabled=bool(_keep_err)):
+                            _mark_normal(g["id"].tolist(), "정상 확인")
                         st.divider()
                 if _keep_ids:
                     st.caption(f"'상쇄 아님'으로 정한 거래 {len(_keep_ids)}건 (자동 상쇄 판단에서 빠져 있어요)")
@@ -520,8 +539,10 @@ elif menu == "🔗 전체 매칭 현황":
 
         show_only_unc = st.checkbox("미분류만 보기", value=True, key="bank_unc_only")
         base = bank_df[~bank_df["is_dup_certain"]]  # 상쇄된 거래는 기본 목록에서 항상 숨김
-        b_show = base[base["account_category_id"].isna()] if show_only_unc else base
+        b_show = base[base["account_category_id"].isna() | base["is_dup_suspect"]] if show_only_unc else base  # 애매한 중복도 분류 확인용으로 함께 보여준다
         b_show = b_show.sort_values("txn_date", ascending=False)
+        if n_suspect:
+            st.caption(f"⚠️ 같은 날·같은 금액 거래(애매한 중복 {n_suspect}건)도 계정과목을 확인할 수 있게 이 목록에 함께 나와요. 정상이면 각 줄의 '✅ 정상'을 눌러 빼세요.")
         st.caption(f"{len(b_show)}건 · ⚠️ 여기서 재연결하면 송금캘린더의 매칭(완료 상태)에도 즉시 반영됩니다 — 신중하게 사용하세요.")
         cat_opts = ["(선택 안함)"] + list(cat_name_to_id.keys())
         for _, row in b_show.head(150).iterrows():
@@ -532,13 +553,16 @@ elif menu == "🔗 전체 매칭 현황":
                     mb = row["matched_brand"] if pd.notna(row["matched_brand"]) else "-"
                     mt = row["matched_title"] if pd.notna(row["matched_title"]) else ""
                     match_info = f"🔗 매칭됨: {mb} · {mt}"
-                sus = " · ⚠️중복의심" if row["is_dup_suspect"] else ""
+                sus = " · ⚠️같은 날·같은 금액 거래 있음(확인)" if row["is_dup_suspect"] else ""
                 xfer = " · 🔁내부이체" if row["cat_type"] == "transfer" else ""
                 bsflag = " · 🏦재무상태표항목" if row["cat_type"] == "balance_sheet" else ""
                 d = row["txn_date"].strftime("%Y-%m-%d") if pd.notna(row["txn_date"]) else "-"
                 rc1.markdown(f"**{'입금' if row['direction']=='in' else '출금'}** · {d} · ₩{row['amount']:,.0f}\n\n{row['description'] or ''}  {match_info}{sus}{xfer}{bsflag}")
                 cur_idx = cat_opts.index(row["cat_name"]) if row["cat_name"] in cat_opts else 0
                 chosen = rc2.selectbox("계정과목", options=cat_opts, index=cur_idx, key=f"bankcat_{row['id']}", label_visibility="collapsed")
+                if row["is_dup_suspect"] and rc3.button("✅ 정상", key=f"normal_{row['id']}", disabled=bool(_keep_err),
+                                                        help="같은 날 같은 금액이지만 별개의 정상 거래예요 — 이 의심 표시에서 빼요"):
+                    _mark_normal(bank_df.loc[bank_df["dup_group"] == row["dup_group"], "id"].tolist(), "정상 확인")
                 if rc3.button("저장", key=f"bankassign_{row['id']}"):
                     new_val = cat_name_to_id.get(chosen) if chosen != "(선택 안함)" else None
                     SUPA.table("bank_transactions").update({"account_category_id": new_val}).eq("id", row["id"]).execute()
