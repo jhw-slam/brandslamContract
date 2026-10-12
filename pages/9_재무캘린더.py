@@ -158,9 +158,41 @@ def load_offset_keep():
         return set(), f"{type(e).__name__}: {str(e)[:120]}"
 
 
+@st.cache_data(ttl=45)
+def load_campaign_link_data():
+    """입금 ↔ 캠페인 연결에 쓰는 자료. 반환: (캠페인 선택지 {라벨: id}, 연결 {은행거래id: [캠페인id,...]}, 에러문구 또는 None).
+    campaign_deposit_links 테이블이 아직 없으면 에러문구를 돌려줘서 화면이 안내만 보여주게 한다."""
+    try:
+        camps = SUPA.table("sales_campaigns").select("id,account_id,campaign_name,open_date").order("open_date", desc=True).execute().data
+        accts = {a["id"]: a.get("brand_name") for a in SUPA.table("sales_accounts").select("id,brand_name").execute().data}
+    except Exception as e:
+        return {}, {}, f"캠페인 목록을 읽지 못했어요 ({type(e).__name__}: {str(e)[:100]})"
+    opts, seen = {}, set()
+    for c in camps:
+        label = f"{accts.get(c['account_id']) or '-'} · {c.get('campaign_name') or '(이름 없음)'}" + (f" ({c['open_date']})" if c.get("open_date") else "")
+        if label in seen:
+            label += f" #{str(c['id'])[:4]}"
+        seen.add(label); opts[label] = c["id"]
+    try:
+        links, start = [], 0
+        while True:
+            chunk = SUPA.table("campaign_deposit_links").select("bank_transaction_id,campaign_id").range(start, start + 999).execute().data
+            links += chunk
+            if len(chunk) < 1000:
+                break
+            start += 1000
+    except Exception as e:
+        return opts, {}, f"입금↔캠페인 연결 테이블(campaign_deposit_links)이 아직 DB에 없어요 ({type(e).__name__})"
+    by_tx = {}
+    for l in links:
+        by_tx.setdefault(l["bank_transaction_id"], []).append(l["campaign_id"])
+    return opts, by_tx, None
+
+
 def refresh():
     load_all.clear()
     load_offset_keep.clear()
+    load_campaign_link_data.clear()
     st.rerun()
 
 
@@ -307,7 +339,7 @@ if total_unc > 0:
 else:
     st.success("✅ 모든 항목이 계정과목으로 분류되어 있습니다.")
 if n_dup_certain or n_dup_suspect:
-    st.info(f"🧹 은행거래 상쇄·중복 — 상쇄 {n_dup_certain}건(입금↔출금 쌍, 둘 다 집계에서 제외됨) · 애매한 의심 {n_dup_suspect}건(집계에 포함, 분류 목록에 함께 표시) → **'전체 매칭 현황 > 은행거래내역'**의 '상쇄 정리'에서 확인하세요.")
+    st.info(f"🧹 은행거래 상쇄·중복 — 상쇄 {n_dup_certain}건(입금↔출금 쌍, 둘 다 집계에서 제외됨) · 애매한 의심 {n_dup_suspect}건(집계에 포함, 분류 목록에 함께 표시) → 「전체 매칭 현황 > 은행거래내역」의 '상쇄 정리'에서 확인하세요.")
 
 menu = st.radio(
     "메뉴", ["📊 대시보드", "🔗 전체 매칭 현황", "🤖 AI 계정과목 추천", "🏦 뱅크다 연동", "⚙️ 계정과목 설정", "📄 손익계산서", "📝 CFO 인사이트"],
@@ -341,6 +373,8 @@ if menu == "📊 대시보드":
     m5.metric("예상 출금(직원신고, 미해결)", f"₩{fc_out_total:,.0f}")
 
     st.divider()
+    if st.session_state.get("offset_flash"):
+        st.success(st.session_state.pop("offset_flash"))
     st.subheader("📊 계정과목별 현황 (은행거래 실제 기준, 상쇄 제외)")
 
     period_choice = st.radio("기간", ["전체", "이번달", "이번분기"], horizontal=True, key="dash_period")
@@ -374,6 +408,71 @@ if menu == "📊 대시보드":
             _dtype = _d["cat_type"].iloc[0] if not _d.empty else None
             st.caption(f"{len(_d)}건 · 합계 ₩{_d['amount'].sum():,.0f} (위 기간 설정과 상쇄 제외가 그대로 적용돼요)")
             _mon = _d.groupby(_d["txn_date"].dt.strftime("%Y-%m"))["amount"].sum()
+            if _dtype == "revenue":
+                st.markdown("**💼 입금 ↔ 캠페인 연결** — 매출 입금이 어느 캠페인의 돈인지 연결해요. 연결하면 캠페인 마진의 '입금' 기준에 반영돼요.")
+                _camp_opts, _links_by_tx, _link_err = load_campaign_link_data()
+                _dep = _d[_d["direction"] == "in"].sort_values("txn_date", ascending=False)
+                if _link_err:
+                    st.info(f"🔒 아직 연결을 저장할 수 없어요 — {_link_err}. `brandslamteamspace/migrations/20261009_margin_data_collection.sql`을 DB에 적용하면 켜져요.")
+                elif not _camp_opts:
+                    st.info("등록된 캠페인이 없어요. 김선재님이 팀스페이스 '캠페인 등록'에서 캠페인을 등록하면 여기서 고를 수 있어요.")
+                elif _dep.empty:
+                    st.caption("이 기간에 입금이 없어요.")
+                else:
+                    _id_to_label = {v: k for k, v in _camp_opts.items()}
+                    _MULTI = "여러 캠페인으로 나뉨 (팀스페이스에서 관리)"
+                    _NONE = "(연결 안 함)"
+                    _only_unlinked = st.checkbox("아직 연결 안 된 입금만 보기", value=True, key="camp_link_unlinked")
+                    _dep_view = _dep[~_dep["id"].isin(_links_by_tx.keys())] if _only_unlinked else _dep
+                    st.caption(f"입금 {len(_dep)}건 중 연결 안 된 건 {int((~_dep['id'].isin(_links_by_tx.keys())).sum())}건 · 아직 저장되지 않았어요 — 표에서 고른 뒤 **저장**을 한 번만 누르세요.")
+                    _cl_ver = st.session_state.get("camp_link_ver", 0)
+                    _psize = 10
+                    _npg = max(1, -(-len(_dep_view) // _psize))
+                    _pg = int(st.number_input("페이지 (10건씩)", min_value=1, max_value=_npg, value=1, step=1, key="camp_link_page")) if (_npg > 1 and not _only_unlinked) else 1
+                    _pv = _dep_view.iloc[(_pg - 1) * _psize: _pg * _psize]
+                    def _cur_label(tx):
+                        ids = _links_by_tx.get(tx, [])
+                        return _NONE if not ids else (_id_to_label.get(ids[0], _NONE) if len(ids) == 1 else _MULTI)
+                    _lk = pd.DataFrame({
+                        "날짜": _pv["txn_date"].dt.strftime("%Y-%m-%d"), "금액": _pv["amount"].map(lambda v: f"₩{v:,.0f}"), "입금자(적요)": _pv["description"].fillna(""),
+                        "캠페인": [_cur_label(i) for i in _pv["id"]],
+                    })
+                    _lk.index = _pv["id"].tolist()
+                    _amt_by_tx = dict(zip(_pv["id"], _pv["amount"].astype(float)))
+                    if _pv.empty:
+                        st.success("연결할 입금이 없어요 👍")
+                    else:
+                        with st.form(f"camp_link_form_{_cl_ver}"):
+                            _ed = st.data_editor(
+                                _lk, hide_index=True, use_container_width=True, key=f"camp_link_editor_{_cl_ver}_{_pg}_{int(_only_unlinked)}",
+                                disabled=["날짜", "금액", "입금자(적요)"],
+                                column_config={"금액": st.column_config.TextColumn(width="small"),
+                                               "캠페인": st.column_config.SelectboxColumn("캠페인 ▼", options=[_NONE] + ([_MULTI] if (_lk["캠페인"] == _MULTI).any() else []) + list(_camp_opts.keys()), required=True, width="large")})
+                            _save_links = st.form_submit_button("💾 캠페인 연결 저장 (여기서 저장돼요)", type="primary")
+                        if _save_links:
+                            _n_ok, _err = 0, None
+                            for tx in _ed.index:
+                                new, old = _ed.loc[tx, "캠페인"], _lk.loc[tx, "캠페인"]
+                                if new == old or new == _MULTI:
+                                    continue
+                                try:
+                                    SUPA.table("campaign_deposit_links").delete().eq("bank_transaction_id", tx).execute()
+                                    if new != _NONE:
+                                        SUPA.table("campaign_deposit_links").insert({
+                                            "bank_transaction_id": tx, "campaign_id": _camp_opts[new], "ratio": 1,
+                                            "allocated_amount": float(_amt_by_tx[tx]), "matched_by": "장현우"}).execute()
+                                    _n_ok += 1
+                                except Exception as e:
+                                    _err = f"{type(e).__name__}: {str(e)[:140]}"; break
+                            if _err:
+                                st.error(f"❌ 저장 중 오류 — {_err}. {_n_ok}건은 저장됐어요. 새로고침해서 확인해주세요.")
+                            elif not _n_ok:
+                                st.info("바뀐 항목이 없어요.")
+                            else:
+                                st.session_state["camp_link_ver"] = _cl_ver + 1
+                                st.session_state["offset_flash"] = f"✅ 입금 {_n_ok}건의 캠페인 연결을 저장했어요. (캠페인 마진 화면에 반영돼요)"
+                                refresh()
+                st.markdown("---")
             if _dtype == "labor":
                 # 급여·인건비는 개인별로 보여주지 않는다(월별 합계만)
                 st.info("🔒 급여·인건비는 개인이 드러나지 않게 **월별 합계만** 보여줘요. (세금·급여 세부 내역은 따로 올리실 대량송금 자료로 보강 예정)")
@@ -581,47 +680,87 @@ elif menu == "🔗 전체 매칭 현황":
         b_show = b_show.sort_values("txn_date", ascending=False)
         if n_suspect:
             st.caption(f"⚠️ 같은 날·같은 금액의 입금/출금(애매한 의심 {n_suspect}건)도 계정과목을 확인할 수 있게 이 목록에 함께 나와요. 정상이면 각 줄의 '✅ 정상'을 눌러 빼세요.")
-        st.caption(f"{len(b_show)}건 · ⚠️ 여기서 재연결하면 송금캘린더의 매칭(완료 상태)에도 즉시 반영됩니다 — 신중하게 사용하세요.")
+        st.caption(f"{len(b_show)}건")
         cat_opts = ["(선택 안함)"] + list(cat_name_to_id.keys())
-        for _, row in b_show.head(150).iterrows():
-            with st.container(border=True):
-                rc1, rc2, rc3 = st.columns([3.2, 1.4, 1.2])
-                match_info = ""
-                if pd.notna(row["matched_cash_event_id"]):
-                    mb = row["matched_brand"] if pd.notna(row["matched_brand"]) else "-"
-                    mt = row["matched_title"] if pd.notna(row["matched_title"]) else ""
-                    match_info = f"🔗 매칭됨: {mb} · {mt}"
-                sus = " · ⚠️같은 날 같은 금액의 반대 거래 있음(확인)" if row["is_dup_suspect"] else ""
-                xfer = " · 🔁내부이체" if row["cat_type"] == "transfer" else ""
-                bsflag = " · 🏦재무상태표항목" if row["cat_type"] == "balance_sheet" else ""
-                d = row["txn_date"].strftime("%Y-%m-%d") if pd.notna(row["txn_date"]) else "-"
-                rc1.markdown(f"**{'입금' if row['direction']=='in' else '출금'}** · {d} · ₩{row['amount']:,.0f}\n\n{row['description'] or ''}  {match_info}{sus}{xfer}{bsflag}")
-                cur_idx = cat_opts.index(row["cat_name"]) if row["cat_name"] in cat_opts else 0
-                chosen = rc2.selectbox("계정과목", options=cat_opts, index=cur_idx, key=f"bankcat_{row['id']}", label_visibility="collapsed")
-                if row["is_dup_suspect"] and rc3.button("✅ 정상", key=f"normal_{row['id']}", disabled=bool(_keep_err),
-                                                        help="같은 날 같은 금액이지만 별개의 정상 거래예요 — 이 의심 표시에서 빼요"):
-                    _mark_normal(bank_df.loc[bank_df["dup_group"] == row["dup_group"], "id"].tolist(), "정상 확인")
-                if rc3.button("저장", key=f"bankassign_{row['id']}"):
-                    new_val = cat_name_to_id.get(chosen) if chosen != "(선택 안함)" else None
-                    SUPA.table("bank_transactions").update({"account_category_id": new_val}).eq("id", row["id"]).execute()
-                    st.success("저장 완료"); refresh()
 
-                with st.expander("🔧 송금일정(cash_event) 재연결"):
-                    cur_label = None
-                    if pd.notna(row["matched_cash_event_id"]):
-                        for lbl, eid in ev_label_to_id.items():
-                            if eid == row["matched_cash_event_id"]:
-                                cur_label = lbl; break
-                    cur_link_idx = ev_link_opts.index(cur_label) if cur_label in ev_link_opts else 0
-                    rl1, rl2 = st.columns([4, 1])
-                    new_link_label = rl1.selectbox(
-                        "연결할 송금일정 선택", options=ev_link_opts, index=cur_link_idx,
-                        key=f"relink_{row['id']}", label_visibility="collapsed",
-                    )
-                    if rl2.button("연결 저장", key=f"relinkbtn_{row['id']}"):
-                        new_ev_id = ev_label_to_id.get(new_link_label)  # None이면 연결 해제
-                        SUPA.table("bank_transactions").update({"matched_cash_event_id": new_ev_id}).eq("id", row["id"]).execute()
-                        st.success("재연결 완료 — 송금캘린더에도 즉시 반영됩니다"); refresh()
+        # 여러 건을 표에서 한꺼번에 고르고 '저장'은 한 번만 (10/12 대표 요청). 저장하면 분류된 건은 목록에서 빠지고 다음 건이 올라온다.
+        _bank_ver = st.session_state.get("bank_ver", 0)
+        _size_opts = [10, 20, 50]
+        pc1, pc2, _pc3 = st.columns([1, 1, 3])
+        page_size = pc1.selectbox("한 번에 보기", _size_opts, index=0, key="bank_page_size", format_func=lambda n: f"{n}건씩")
+        n_pages = max(1, -(-len(b_show) // page_size))
+        if show_only_unc:
+            page = 1   # 저장한 건이 빠지면서 다음 건이 올라오므로 항상 첫 페이지
+            pc2.caption(f"남은 {len(b_show)}건 중 위에서부터")
+        else:
+            page = int(pc2.number_input("페이지", min_value=1, max_value=n_pages, value=1, step=1, key="bank_page")) if n_pages > 1 else 1
+            if n_pages > 1:
+                st.caption("⚠️ 저장하지 않고 페이지를 넘기면 이 페이지에서 고른 값은 사라져요.")
+        view = b_show.iloc[(page - 1) * page_size: page * page_size]
+
+        def _status_text(row):
+            bits = []
+            if pd.notna(row["matched_cash_event_id"]):
+                bits.append("🔗 " + (str(row["matched_brand"]) if pd.notna(row["matched_brand"]) else "-") + " · " + (str(row["matched_title"]) if pd.notna(row["matched_title"]) else ""))
+            if row["is_dup_suspect"]:
+                bits.append("⚠️같은 날 같은 금액의 반대 거래")
+            if row["cat_type"] == "transfer":
+                bits.append("🔁내부이체")
+            if row["cat_type"] == "balance_sheet":
+                bits.append("🏦재무상태표")
+            return " ".join(bits)
+
+        if view.empty:
+            st.success("분류할 거래가 없어요 👍")
+        else:
+            ed_df = pd.DataFrame({
+                "날짜": view["txn_date"].dt.strftime("%Y-%m-%d"), "구분": view["direction"].map({"in": "입금", "out": "출금"}),
+                "금액": view["amount"].map(lambda v: f"₩{v:,.0f}"), "적요": view["description"].fillna(""), "참고": [_status_text(r) for _, r in view.iterrows()],
+                "계정과목": view["cat_name"].where(view["cat_name"].isin(cat_opts), "(선택 안함)"),
+            })
+            ed_df.index = view["id"].tolist()
+            st.caption("🟡 아직 저장되지 않았어요 — 표의 '계정과목'을 원하는 만큼 고른 뒤 맨 아래 **저장**을 한 번만 누르세요. (미분류는 '(선택 안함)'으로 보여요)")
+            with st.form(f"bank_bulk_form_{_bank_ver}"):
+                edited = st.data_editor(
+                    ed_df, hide_index=True, use_container_width=True, key=f"bank_editor_{_bank_ver}_{page}_{page_size}_{int(show_only_unc)}",
+                    disabled=["날짜", "구분", "금액", "적요", "참고"],
+                    column_config={
+                        "금액": st.column_config.TextColumn(width="small"),
+                        "계정과목": st.column_config.SelectboxColumn("계정과목 ▼", options=cat_opts, required=True, width="medium"),
+                        "참고": st.column_config.TextColumn(width="medium"),
+                    })
+                bulk_save = st.form_submit_button("💾 고른 내용 저장 (여기서 저장돼요)", type="primary")
+            if bulk_save:
+                changes = {}
+                for rid in edited.index:
+                    if edited.loc[rid, "계정과목"] != ed_df.loc[rid, "계정과목"]:
+                        nm = edited.loc[rid, "계정과목"]
+                        changes.setdefault(cat_name_to_id.get(nm) if nm != "(선택 안함)" else None, []).append(rid)
+                n_changed = sum(len(v) for v in changes.values())
+                if not n_changed:
+                    st.info("바뀐 항목이 없어요. 계정과목을 고른 뒤 저장해주세요.")
+                else:
+                    try:
+                        for cid, ids in changes.items():
+                            # 대표님이 직접 정한 분류 = 확정(자동분류 표시를 끈다)
+                            SUPA.table("bank_transactions").update({"account_category_id": cid, "is_auto_categorized": False}).in_("id", ids).execute()
+                        st.session_state["offset_flash"] = f"✅ {n_changed}건의 계정과목을 저장했어요."
+                        st.session_state["bank_ver"] = _bank_ver + 1
+                        refresh()
+                    except Exception as e:
+                        st.error(f"❌ 저장하지 못했어요 ({type(e).__name__}: {str(e)[:160]}) — 일부만 저장됐을 수 있으니 새로고침해서 확인해주세요.")
+
+            with st.expander("🔧 송금일정(cash_event) 재연결 — 한 건씩 (송금캘린더의 완료 상태에도 바로 반영돼요, 신중히)"):
+                with st.form(f"relink_form_{_bank_ver}"):
+                    _tx_label = {r["id"]: f"{r['txn_date'].strftime('%Y-%m-%d') if pd.notna(r['txn_date']) else '-'} · {'입금' if r['direction'] == 'in' else '출금'} · ₩{r['amount']:,.0f} · {r['description'] or ''}"
+                                 for _, r in view.iterrows()}
+                    tx_pick = st.selectbox("거래 선택(위 표에 보이는 거래)", list(_tx_label.keys()), format_func=lambda i: _tx_label[i], key=f"relink_tx_{_bank_ver}")
+                    ev_pick = st.selectbox("연결할 송금일정", ev_link_opts, key=f"relink_ev_{_bank_ver}")
+                    do_relink = st.form_submit_button("연결 저장")
+                if do_relink:
+                    SUPA.table("bank_transactions").update({"matched_cash_event_id": ev_label_to_id.get(ev_pick)}).eq("id", tx_pick).execute()  # (연결 해제)면 None
+                    st.session_state["offset_flash"] = "재연결 완료 — 송금캘린더에도 즉시 반영돼요."
+                    refresh()
 
     # ── 세금계산서내역 ────────────────────────────────────
     with tab_tax:
