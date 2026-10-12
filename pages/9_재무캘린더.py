@@ -12,6 +12,11 @@ import requests
 import streamlit as st
 from supabase import create_client
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 레포 루트의 expense_breakdown.py
+from expense_breakdown import group_merchants, proposal_summary
+
 st.set_page_config(page_title="재무캘린더", layout="wide")
 
 # ── 레이어 1: 앱 공통 비밀번호 게이트 (다른 페이지와 동일) ──────────
@@ -357,6 +362,45 @@ if menu == "📊 대시보드":
         cc1, cc2 = st.columns([2, 3])
         cc1.dataframe(grp.map(lambda v: f"₩{v:,.0f}"), use_container_width=True)
         cc2.bar_chart(grp)
+
+    # ── 세부사항 보기 (보기만 한다 — 이 화면에서는 DB의 분류를 바꾸지 않음) ──
+    _detail_cats = (b_view.groupby("cat_name")["amount"].sum().sort_values(ascending=False).index.tolist()) if not b_view.empty else []
+    if _detail_cats:
+        with st.expander("🔍 세부사항 보기 — 분류 안에 무엇이 들어 있는지 (거래처별 묶음)", expanded=False):
+            _def = next((i for i, n in enumerate(_detail_cats) if n.startswith("단순경비")), 0)
+            _pick = st.selectbox("분류 선택", _detail_cats, index=_def, key="detail_cat",
+                                 format_func=lambda n: f"{n} — ₩{b_view.loc[b_view['cat_name'] == n, 'amount'].sum():,.0f}")
+            _d = b_view[b_view["cat_name"] == _pick]
+            _dtype = _d["cat_type"].iloc[0] if not _d.empty else None
+            st.caption(f"{len(_d)}건 · 합계 ₩{_d['amount'].sum():,.0f} (위 기간 설정과 상쇄 제외가 그대로 적용돼요)")
+            _mon = _d.groupby(_d["txn_date"].dt.strftime("%Y-%m"))["amount"].sum()
+            if _dtype == "labor":
+                # 급여·인건비는 개인별로 보여주지 않는다(월별 합계만)
+                st.info("🔒 급여·인건비는 개인이 드러나지 않게 **월별 합계만** 보여줘요. (세금·급여 세부 내역은 따로 올리실 대량송금 자료로 보강 예정)")
+                st.bar_chart(_mon)
+            else:
+                _groups = group_merchants(_d[["description", "amount", "txn_date"]].to_dict("records"))
+                _name_by_code = {c["code"]: c["name"] for c in categories}
+                st.markdown("**① 거래처별 묶음** — 같은 곳에서 여러 번 쓴 것을 합쳤어요. '제안 분류'는 이름만 보고 짐작한 **제안**이고, 아직 저장되지 않았어요.")
+                _conf_lbl = {"high": "높음", "medium": "보통", "low": "낮음(확인 필요)"}
+                st.dataframe(pd.DataFrame([{
+                    "거래처(적요)": g["merchant"], "건수": g["n"], "합계": f"₩{g['total']:,.0f}", "평균": f"₩{g['avg']:,.0f}", "최근": g["last"] or "-",
+                    "제안 분류": ("카드대금(명세서 필요)" if g["code"] == "CARD_BILL" else _name_by_code.get(g["code"], g["code"]) if g["code"] else "—"),
+                    "확신도": _conf_lbl.get(g["conf"], "-"), "근거": g["why"],
+                } for g in _groups]), hide_index=True, use_container_width=True, height=420)
+                st.markdown("**② 제안대로 나눠 보면** (참고용 — 실제 분류는 그대로예요)")
+                st.dataframe(pd.DataFrame([{"세부 분류": k, "건수": n, "합계": f"₩{t:,.0f}"} for k, n, t in proposal_summary(_groups, _name_by_code)]),
+                             hide_index=True, use_container_width=True)
+                st.markdown("**③ 월별 추이**")
+                st.bar_chart(_mon)
+                with st.expander("④ 거래 원본 목록"):
+                    _raw = _d.sort_values("txn_date", ascending=False)[["txn_date", "account_label", "description", "amount"]].copy()
+                    _raw["txn_date"] = _raw["txn_date"].dt.strftime("%Y-%m-%d")
+                    _raw.columns = ["날짜", "계좌", "적요", "금액"]
+                    st.dataframe(_raw, hide_index=True, use_container_width=True, height=360)
+                st.download_button("⬇️ 거래처별 묶음 CSV (엑셀 호환)", pd.DataFrame([{
+                    "거래처": g["merchant"], "건수": g["n"], "합계": g["total"], "제안분류코드": g["code"] or "", "확신도": g["conf"] or "", "근거": g["why"]} for g in _groups]
+                ).to_csv(index=False).encode("utf-8-sig"), file_name=f"세부사항_{_pick}.csv", mime="text/csv", key="detail_csv")
 
     unclassified = b_view[b_view["cat_name"] == "미분류"]
     if not unclassified.empty:
