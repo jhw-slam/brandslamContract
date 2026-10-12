@@ -11,6 +11,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 레포 루트
 from bank_common import OFFSET_WINDOW_MIN, mark_duplicates, parse_txn_datetime
 from vat_package import (PERIODS, build_account_workbook, build_zip, default_period, find_date_gaps, period_deadline,
                          period_range, prepare_ledger)
+import drive_upload as du
+from hometax_files import check_list, check_pdf, parse_hometax_list, parse_invoice_pdf
+from vat_requests import AUTO, COMPANY_BIZ_NO, REQUEST_INFO, STEP_BY_ID, STEPS, step_status
 
 st.set_page_config(page_title="VAT Filing", layout="wide")
 
@@ -108,160 +111,349 @@ def won(n):
     return f"₩{float(n or 0):,.0f}"
 
 
+# ── 구글드라이브 연결 ──────────────────────────────────────
+OUR_BIZ_NO = os.environ.get("COMPANY_BIZ_NO") or COMPANY_BIZ_NO
+
+
+@st.cache_resource
+def get_svc():
+    return du.build_service()
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def drive_listing(folder_id, ver):
+    """세무사 공유 폴더의 파일 현황(20초 캐시, 올린 뒤에는 clear). 반환 {"err":..., "folder":..., "root":[...], "sub":{폴더이름:[파일...]}}"""
+    svc, err = get_svc()
+    if err:
+        return {"err": err}
+    try:
+        folder = du.get_folder(svc, folder_id)
+        root = du.list_children(svc, folder_id)
+        sub = {}
+        wanted = {st_["folder"] for st_ in STEPS}
+        for c in root:
+            if c["mimeType"] == du.FOLDER_MIME and c["name"] in wanted:
+                sub[c["name"]] = du.list_children(svc, c["id"])
+        return {"err": None, "folder": folder, "root": root, "sub": sub}
+    except Exception as e:
+        return {"err": du.explain_error(e)}
+
+
+def bump_and_rerun(msg=None, kind="ok"):
+    if msg:
+        st.session_state["vat_flash"] = (kind, msg)
+    st.session_state["vat_ver"] = st.session_state.get("vat_ver", 0) + 1
+    drive_listing.clear()
+    st.rerun()
+
+
 # ═════════════════════════════════════════════════════════════
-st.title("🧾 VAT Filing — 부가세 신고 자료 준비")
-st.caption("자료를 모으고 정리해서 세무사사무실이 바로 신고 업무를 시작하게 돕는 화면이에요. "
-           "**세액 계산·신고서 작성·홈택스 제출은 세무사사무실이 합니다.** 기획안: docs/vat_filing_plan.md")
+st.title("🧾 VAT Filing — 세무사 요청 자료 제출")
+st.caption("세무사사무실이 요청한 자료를 **한 단계씩 따라 하면 끝나게** 만든 화면이에요. 파일을 올리면 세무사 공유 폴더(구글드라이브)에 바로 정리돼요. "
+           "**세액 계산·신고서 작성·홈택스 제출은 세무사사무실이 합니다.** (기획안: docs/vat_filing_plan.md)")
+flash = st.session_state.pop("vat_flash", None)
+if flash:
+    {"ok": st.success, "warn": st.warning, "bad": st.error}.get(flash[0], st.info)(flash[1])
 
 d_year, d_label = default_period(TODAY)
 c1, c2, c3 = st.columns([1, 2, 3])
-year = c1.selectbox("연도", [TODAY.year - 1, TODAY.year, TODAY.year + 1], index=[TODAY.year - 1, TODAY.year, TODAY.year + 1].index(d_year), key="vat_year")
+years = [TODAY.year - 1, TODAY.year, TODAY.year + 1]
+year = c1.selectbox("연도", years, index=years.index(d_year), key="vat_year")
 labels = list(PERIODS.keys())
 label = c2.selectbox("신고 구분", labels, index=labels.index(d_label), key="vat_label")
 start, end = period_range(year, label)
-deadline = period_deadline(year, label)
-dday = (deadline - TODAY).days
-c3.metric("신고 기한(법인 기준 추정)", f"{deadline:%Y-%m-%d}", delta=(f"D-{dday}" if dday >= 0 else f"{-dday}일 지남"), delta_color=("inverse" if 0 <= dday <= 14 else "off"))
-st.caption(f"대상 기간 {start} ~ {end}. 예정신고 대상 여부와 정확한 기한은 세무사사무실에 확인하세요.")
-if st.button("🔄 새로고침", key="vat_refresh"):
-    load_period.clear(); st.rerun()
+info = REQUEST_INFO.get((year, label))
+if info:
+    dd = (info["deadline"] - TODAY).days
+    c3.metric("세무사 자료 요청 기한", f"{info['deadline']:%Y-%m-%d}", delta=(f"D-{dd}" if dd >= 0 else f"{-dd}일 지남"), delta_color=("inverse" if dd <= 3 else "off"))
+    st.info(f"📨 {info['from']} — {info['notice']}")
+else:
+    deadline = period_deadline(year, label)
+    dd = (deadline - TODAY).days
+    c3.metric("신고 기한(법인 기준 추정)", f"{deadline:%Y-%m-%d}", delta=(f"D-{dd}" if dd >= 0 else f"{-dd}일 지남"), delta_color="off")
+    st.caption("이 기간은 세무사 요청 메일 정보가 아직 없어서 기본 단계로 보여줘요. 정확한 기한은 세무사사무실에 확인하세요.")
+st.caption(f"대상 기간 {start} ~ {end}")
 
 data = load_period(start.isoformat(), end.isoformat())
 for k, v in data["errs"].items():
-    st.warning(f"⚠️ '{k}' 자료를 읽지 못했어요 ({v}) — 해당 항목은 '확인 불가'로 표시돼요.")
+    st.warning(f"⚠️ '{k}' 자료를 읽지 못했어요 ({v}) — 해당 자동 정리는 건너뛰어요.")
 bank_df = to_bank_df(data["bank"], data["cats"], data["keep"])
-accounts = sorted(bank_df["account_label"].dropna().unique().tolist()) if not bank_df.empty else sorted(data["first_seen"].keys())
+accounts = sorted(bank_df["account_label"].dropna().unique().tolist()) if not bank_df.empty else []
+l0, l1 = label.split(" ")[0], label.split(" ")[1]
+ptag = f"{year}년 {l0}{l1}"
 
-# ── 1) 자료 체크리스트 ────────────────────────────────────
-st.subheader("1️⃣ 자료 체크리스트")
-rows = []
-gaps_by_acct = {}
-for ac in accounts:
-    sub = bank_df[bank_df["account_label"] == ac] if not bank_df.empty else pd.DataFrame()
-    gaps = find_date_gaps([d.date() for d in sub["txn_date"].dropna()] if not sub.empty else [], start, end)
-    gaps_by_acct[ac] = gaps
-    first = data["first_seen"].get(ac)
-    if sub.empty:
-        status, detail = "❌ 기간 내 거래 없음", "자동 수집 대상인데 거래가 없어요 — 뱅크다 연동/수집 시작일 확인" + (f" (이 계좌 수집 시작: {first})" if first else "")
-    elif gaps:
-        status, detail = "⚠️ 확인 필요", f"{len(sub):,}건 · 거래가 7일 이상 없는 구간 {len(gaps)}곳 (아래 '검증'에서 확인)"
-    else:
-        status, detail = "✅ 자동 수집됨", f"{len(sub):,}건"
-    rows.append({"자료": f"은행내역 — {ac}", "방식": "자동(뱅크다)", "상태": status, "상세": detail})
-
-tax = data["taxes"]
-active_tax = [t for t in tax if not t.get("canceled")]
-rows.append({"자료": "매출 전자세금계산서", "방식": "홈택스 업로드(송금캘린더)",
-             "상태": ("✅ 있음" if active_tax else "📥 올려주세요"),
-             "상세": (f"{len(active_tax)}건 · 공급가 {won(sum(float(t.get('supply_amount') or 0) for t in active_tax))} · 세액 {won(sum(float(t.get('vat') or 0) for t in active_tax))} (취소 {len(tax) - len(active_tax)}건 제외)"
-                      if active_tax else "이 기간 매출 세금계산서가 없어요. 홈택스 '매출 목록'을 받아 송금캘린더에 올려주세요") if "tax" not in data["errs"] else "읽지 못함"})
-rows.append({"자료": "매입 전자세금계산서·계산서", "방식": "홈택스 파일 업로드", "상태": "📥 올려주세요", "상세": "업로드 기능은 2단계에서 열려요. 지금은 홈택스에서 받아 파일을 모아 두세요(아래 안내 카드)"})
-rows.append({"자료": "법인카드 사용내역", "방식": "홈택스 또는 카드사 파일", "상태": "📥 올려주세요", "상세": "업로드 기능은 2단계에서 열려요. 홈택스에 사업용 카드를 등록하면 한 곳에서 받을 수 있어요(아래 안내 카드)"})
-pp = bank_df[(bank_df["description"].fillna("").str.upper().str.contains("PAYPAL")) & (bank_df["direction"] == "out") & (~bank_df["is_dup_certain"])] if not bank_df.empty else pd.DataFrame()
-rows.append({"자료": "해외·PayPal 지급", "방식": "은행(자동) + 페이팔 거래내역 파일",
-             "상태": ("📌 은행에서 확인됨 · 페이팔 파일 필요" if len(pp) else "➖ 은행에 PayPal 출금 없음"),
-             "상세": (f"은행 PAYPAL 출금 {len(pp)}건 · {won(pp['amount'].sum())} — 세무사사무실에 처리 방식(공제 여부 등) 확인 필요" if len(pp) else "PayPal 거래내역 파일이 있으면 함께 보관")})
-camps = data["camps"]
-no_inv = [c for c in camps if not c.get("invoice_url")]
-rows.append({"자료": "캠페인 인보이스·계약서", "방식": "자동(캠페인 등록)", "상태": ("✅ 있음" if camps and not no_inv else ("⚠️ 인보이스 없는 캠페인 있음" if no_inv else "➖ 이 기간 캠페인 없음")),
-             "상세": (f"캠페인 {len(camps)}건 중 인보이스 파일 없는 건 {len(no_inv)}건" if camps else "") if "camp" not in data["errs"] else "읽지 못함"})
-rows.append({"자료": "급여·원천세·4대보험(대량송금)", "방식": "별도 DB(분할 후)", "상태": "➖ 아직 해당 없음", "상세": "DB 분할 후 대표님이 올릴 자료로 연결할 예정이에요"})
-chk_df = pd.DataFrame(rows)
-st.dataframe(chk_df, hide_index=True, use_container_width=True)
-st.caption("📥 항목은 받아서 보관하셨는지 아래에 표시해 두세요. (지금은 이 화면을 새로고침하면 체크가 초기화돼요 — 저장 기능은 추후)")
-mk1, mk2, mk3, mk4 = st.columns(4)
-base_key = f"{year}_{label}"
-mk1.checkbox("매입 세금계산서 받음", key=f"vat_got_buy_{base_key}")
-mk2.checkbox("카드 사용내역 받음", key=f"vat_got_card_{base_key}")
-mk3.checkbox("페이팔 거래내역 받음", key=f"vat_got_pp_{base_key}")
-mk4.checkbox("기타 영수증 모음", key=f"vat_got_misc_{base_key}")
-
-# ── 2) 단계별 안내 ────────────────────────────────────────
-st.subheader("2️⃣ 단계별 안내 — 어디서 무엇을 받나")
-st.caption("🔐 비밀번호는 여기에 저장하지 않아요. 로그인은 평소 쓰시는 방식(비밀번호 관리자·공동인증서)으로 하세요. 메뉴 이름은 사이트 개편으로 바뀔 수 있어요 — 안 보이면 세무사사무실에 물어보세요.")
-with st.expander("🏛️ 홈택스 — 매입 전자세금계산서·계산서 (받은 것)", expanded=False):
-    st.markdown("""
-1. [홈택스](https://www.hometax.go.kr) 접속 → **공동인증서(또는 간편인증)** 로그인 (법인 대표/세무 담당 인증서)
-2. **조회/발급 → 전자(세금)계산서 → 목록 조회**에서 **매입**을 선택하고 기간을 **{s} ~ {e}** 로 설정 (세금계산서와 계산서를 각각)
-3. **엑셀(.xls/.csv) 다운로드** → 파일 이름에 기간을 붙여 보관 (예: `매입세금계산서_{y}.xls`)
-4. 이 화면의 체크박스 '매입 세금계산서 받음'을 눌러 두세요. (업로드·자동 정리는 2단계에서 열려요)
-""".format(s=start, e=end, y=f"{year}_{label.split(' ')[0]}{label.split(' ')[1][:2]}"))
-with st.expander("🏛️ 홈택스 — 매출 전자세금계산서 (발행한 것)"):
-    st.markdown("""
-1. 홈택스 로그인 → **조회/발급 → 전자(세금)계산서 → 목록 조회**에서 **매출** 선택, 기간 {s} ~ {e}
-2. 엑셀 다운로드 → **재무 › 송금캘린더**의 '홈택스 세금계산서 목록' 업로드에 그대로 올리세요(이미 있는 기능).
-""".format(s=start, e=end))
-with st.expander("💳 법인카드 사용내역 — 홈택스 한 곳에서 받기 (추천) / 카드사에서 받기"):
-    st.markdown("""
-**지금은 홈택스에 법인카드가 등록돼 있지 않거나 확실하지 않아요.** 등록하면 카드사별 로그인 없이 한 곳에서 받을 수 있어요.
-1. 홈택스 로그인 → 전자세금계산서·현금영수증·신용카드 쪽의 **사업용 신용카드 등록** 메뉴에서 법인카드를 등록 (카드번호와 카드사 확인 필요 — 메뉴 이름은 세무사사무실에 확인)
-2. 등록 후 **사업용 신용카드 매입내역 조회**에서 기간 {s} ~ {e} 를 받아 엑셀로 저장 (등록 직후에는 과거 내역이 바로 안 보일 수 있어요 — 세무사사무실에 문의)
-3. **등록이 어렵다면**: 각 카드사 사이트 → 이용내역 조회 → 기간 설정 → 엑셀 다운로드 (카드마다 반복)
-4. 받은 파일은 '카드 사용내역 받음'에 체크. 카드사 로그인 정보는 **비밀번호 관리자**에 두세요(여기에 저장 안 함).
-""".format(s=start, e=end))
-with st.expander("🅿️ PayPal — 거래내역 (해외 인플루언서 지급)"):
-    st.markdown("""
-1. [PayPal](https://www.paypal.com) 로그인 → **활동(Activity) → 보고서/내역 다운로드**에서 기간 {s} ~ {e}, 형식 **CSV** 선택 (메뉴 이름은 PayPal 개편에 따라 달라요)
-2. **통화별 거래**가 섞이지 않도록 전체 거래(모든 거래)로 받기
-3. 은행에 보이는 `PAYPAL *이름` 출금과 대조할 수 있게 원본 그대로 보관
-4. 해외 인플루언서 지급을 세무상 어떻게 처리할지(공제·증빙)는 **세무사사무실 확인 사항**이에요.
-""".format(s=start, e=end))
-with st.expander("🏦 은행내역 (SC제일·기업) — 자동 수집됨"):
-    st.markdown("뱅크다로 자동 수집돼요. 아래 3️⃣에서 계좌별·기간별 엑셀로 내려받을 수 있고, 거래가 없는 구간이나 미분류가 있으면 알려드려요.")
-
-# ── 3) 은행내역 정리 ──────────────────────────────────────
-st.subheader("3️⃣ 은행내역 정리 — 계좌별·기간별 엑셀")
-if bank_df.empty:
-    st.info("이 기간의 은행거래가 없어요. (뱅크다 수집 시작일 이전이거나 아직 수집되지 않았을 수 있어요)")
+# ── 0) 드라이브 연결 ──────────────────────────────────────
+st.subheader("📁 세무사 공유 폴더 연결")
+env_folder, env_name = du.configured_folder_id()
+manual = st.text_input("폴더 주소 또는 ID (환경변수가 없거나 다른 폴더를 쓰고 싶을 때만)", key="vat_folder_in", placeholder="https://drive.google.com/drive/folders/…",
+                       help="세무사사무실 공유 폴더 중 이번 분기 폴더(예: '브랜드슬램26년2분기')의 주소를 붙여넣으세요. 비워두면 환경변수를 써요.")
+folder_id = du.folder_id_from_text(manual) if manual.strip() else env_folder
+if manual.strip() and not folder_id:
+    st.error("폴더 주소를 읽지 못했어요. '…/folders/' 뒤의 긴 글자(ID)가 보이게 붙여넣어 주세요.")
+ver = st.session_state.get("vat_ver", 0)
+listing = {"err": "폴더가 아직 정해지지 않았어요 (Railway 변수 TAX_DRIVE_FOLDER_ID 또는 DRIVE_FOLDER_ID, 또는 위 칸에 폴더 주소)"}
+if folder_id:
+    listing = drive_listing(folder_id, ver)
+drive_ok = not listing.get("err")
+if drive_ok:
+    fo = listing["folder"]
+    kind = "공유 드라이브" if fo.get("driveId") else "내 드라이브(개인)"
+    src = "붙여넣은 주소" if manual.strip() else f"환경변수 {env_name}"
+    st.success(f"✅ 폴더에 연결됨 — '{fo['name']}' ({kind}, {src}) · 폴더 안 항목 {len(listing['root'])}개")
+    if fo["name"] and not any(k in fo["name"] for k in ("분기", "세무", "부가")):
+        st.caption("⚠️ 폴더 이름이 이번 분기 폴더처럼 보이지 않아요. 맞는 폴더인지 확인해주세요.")
+    if fo.get("webViewLink"):
+        st.link_button("📂 드라이브에서 폴더 열기", fo["webViewLink"])
 else:
-    mask = st.checkbox("급여·인건비 거래의 적요(개인 이름)는 가리기 (권장)", value=True, key="vat_mask",
-                       help="부가세 신고에는 개인별 급여 내역이 필요 없어요. 세무사사무실이 급여 자료를 따로 받는다면 그쪽으로 전달하세요.")
-    st.caption(f"상쇄 규칙: 같은 계좌·같은 날·같은 금액의 입금과 출금이 {OFFSET_WINDOW_MIN}분 안에 있으면 결제↔취소 쌍으로 보고 집계에서 빼요(데이터는 지우지 않고 별도 시트에 남겨요).")
-    workbooks = {}
+    st.warning(f"드라이브에 아직 연결되지 않았어요 — {listing['err']}")
+with st.expander("🔧 연결 점검 (올릴 수 있는지 확인)"):
+    st.caption("폴더를 읽을 수 있는지, 작은 파일을 올렸다 지울 수 있는지 확인해요. 올릴 수 없으면 이유와 해결 방법을 알려드려요.")
+    if st.button("연결 점검하기", key="vat_diag", disabled=not folder_id):
+        svc, err = get_svc()
+        if err:
+            st.error(err)
+        else:
+            sa = getattr(svc, "_sa_email", "")
+            if sa:
+                st.caption(f"서비스계정: {sa} — 폴더에서 이 계정을 **편집자**로 공유해야 올릴 수 있어요.")
+            for name, ok, msg in du.diagnose(svc, folder_id):
+                (st.success if ok else st.error)(f"{'✅' if ok else '❌'} {name}: {msg}")
+
+# ── 1) 진행 현황 ──────────────────────────────────────────
+st.subheader("✅ 진행 현황")
+statuses = {}
+for stp in STEPS:
+    names = [f["name"] for f in listing.get("sub", {}).get(stp["folder"], [])] if drive_ok else []
+    statuses[stp["id"]] = step_status(stp["id"], names)
+done_n = sum(1 for v in statuses.values() if v[0] == "✅")
+st.progress(done_n / len(STEPS), text=f"{len(STEPS)}단계 중 {done_n}단계 완료" + ("" if drive_ok else " (드라이브 연결 후 표시돼요)"))
+cols = st.columns(len(STEPS))
+for col, stp in zip(cols, STEPS):
+    ic, tx = statuses[stp["id"]]
+    col.markdown(f"**{stp['icon']} {stp['no']}. {stp['title'].split(' + ')[0].split(' (')[0]}**\n\n{ic} {tx}")
+if drive_ok and listing["root"]:
+    root_files = [f for f in listing["root"] if f["mimeType"] != du.FOLDER_MIME]
+    if root_files:
+        st.caption("📎 폴더 바로 아래에 이미 있는 파일: " + " · ".join(f"[{f['name']}]({f['webViewLink']})" if f.get("webViewLink") else f["name"] for f in root_files))
+
+# ── 2) 단계별 제출 ────────────────────────────────────────
+st.subheader("📝 단계별 제출 — 위에서부터 하나씩")
+st.caption("🔐 비밀번호는 이 화면에서 받거나 저장하지 않아요. 로그인은 평소 쓰시는 방식(비밀번호 관리자·공동인증서)으로 하세요. 메뉴 이름은 사이트 개편으로 바뀔 수 있어요.")
+
+
+def folder_for(step):
+    """단계 폴더 ID(없으면 만든다). 반환 (id, 에러문구)"""
+    svc, err = get_svc()
+    if err:
+        return None, err
+    try:
+        fid, _ = du.ensure_subfolder(svc, folder_id, step["folder"])
+        return fid, None
+    except Exception as e:
+        return None, du.explain_error(e)
+
+
+def existing_names(fid):
+    svc, _ = get_svc()
+    return {c["name"] for c in du.list_children(svc, fid)}
+
+
+def build_bank_workbooks(mask=True):
+    wbs = {}
     for ac in accounts:
         sub = bank_df[bank_df["account_label"] == ac]
         if sub.empty:
             continue
         ledger = prepare_ledger(sub, mask_labor=mask)
         first = data["first_seen"].get(ac)
-        collected_from = pd.to_datetime(first).date() if first else None
-        workbooks[ac] = build_account_workbook(ledger, start, end, ac, collected_from)
-        inc = ledger[ledger["상태"] != "상쇄(제외)"]
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric(f"{ac} 거래", f"{len(ledger):,}건")
-        m2.metric("입금(상쇄 제외)", won(inc[inc["구분"] == "입금"]["금액"].sum()))
-        m3.metric("출금(상쇄 제외)", won(inc[inc["구분"] == "출금"]["금액"].sum()))
-        m4.metric("상쇄 제외", f"{int((ledger['상태'] == '상쇄(제외)').sum())}건")
-        m5.metric("미분류", f"{int((ledger['상태'] == '미분류').sum())}건")
-        st.download_button(f"⬇️ {ac} 엑셀 내려받기", workbooks[ac], file_name=f"{ac}_{year}_{label.split(' ')[0]}{label.split(' ')[1][:2]}.xlsx".replace("/", "_"),
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"vat_xlsx_{ac}")
-    if workbooks:
-        st.download_button("📦 전체 패키지(ZIP) 내려받기 — 체크리스트 + 계좌별 엑셀", build_zip(workbooks, f"{year}_{label}", chk_df),
-                           file_name=f"부가세자료_{year}_{label.split(' ')[0]}{label.split(' ')[1][:2]}.zip", mime="application/zip", key="vat_zip")
-        st.caption("드라이브 자동 업로드는 3단계(공유 드라이브 준비 후)에 열려요. 그 전에는 이 ZIP을 풀어 세무사 공유 폴더에 올려주세요.")
+        wbs[ac] = build_account_workbook(ledger, start, end, ac, pd.to_datetime(first).date() if first else None)
+    return wbs
 
-    # ── 4) 검증 ──
-    st.subheader("4️⃣ 검증 — 빠진 것·의심 구간")
-    problems = []
-    for ac, gaps in gaps_by_acct.items():
-        for g0, g1, n, why in gaps:
-            problems.append({"계좌": ac, "구간": f"{g0} ~ {g1}", "일수": n, "내용": f"{why} (7일 이상 거래 없음 — 실제로 거래가 없었는지 확인)"})
-    n_unc = int(((bank_df["account_category_id"].isna()) & (~bank_df["is_dup_certain"])).sum())
-    n_sus = int(bank_df["is_dup_suspect"].sum())
-    n_off = int(bank_df["is_dup_certain"].sum())
-    v1, v2, v3, v4 = st.columns(4)
-    v1.metric("거래 없는 의심 구간", f"{len(problems)}곳")
-    v2.metric("미분류 거래", f"{n_unc}건", help="재무캘린더에서 분류하면 줄어들어요")
-    v3.metric("애매한 상쇄 의심", f"{n_sus}건")
-    v4.metric("상쇄 제외", f"{n_off}건")
-    if problems:
-        st.dataframe(pd.DataFrame(problems), hide_index=True, use_container_width=True)
+
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def render_files(step):
+    files = listing.get("sub", {}).get(step["folder"], []) if drive_ok else []
+    if files:
+        st.markdown("**지금 폴더에 있는 파일**")
+        for f in sorted(files, key=lambda x: x["name"]):
+            st.markdown(f"- [{f['name']}]({f['webViewLink']})" if f.get("webViewLink") else f"- {f['name']}")
+    elif drive_ok:
+        st.caption("아직 이 단계 폴더에 파일이 없어요.")
+
+
+def upload_form(step, extra_ui=None):
+    """파일 올리기 폼. 반환 없음 — 눌렀을 때만 처리한다(고르는 동안은 아무것도 실행하지 않는다)."""
+    with st.form(f"vat_form_{step['id']}_{ver}"):
+        ups = st.file_uploader(step["upload_label"], accept_multiple_files=True, type=step["accept"], key=f"vat_up_{step['id']}_{ver}")
+        extra = extra_ui() if extra_ui else {}
+        allow = st.checkbox("경고가 있어도 올리기", key=f"vat_allow_{step['id']}_{ver}") if step["id"] == "tax" else False
+        go = st.form_submit_button(f"📤 이 단계 파일 올리기 (여기서 올라가요)", type="primary", disabled=not drive_ok)
+    if not go:
+        return
+    if not ups and not (extra and extra.get("memo")):
+        st.info("올릴 파일을 먼저 골라주세요.")
+        return
+    fid, err = folder_for(step)
+    if err:
+        st.error(f"❌ {err}")
+        return
+    msgs, plan = [], []
+    for f in ups or []:
+        data_b = f.getvalue()
+        low = f.name.lower()
+        if step["id"] == "tax" and low.endswith((".xls", ".xlsx", ".csv")):
+            parsed = parse_hometax_list(data_b, f.name)
+            for lv, m in check_list(parsed, None, start, end):
+                msgs.append((lv, f"{f.name}: {m}"))
+            if not parsed.get("error"):
+                per = f"{parsed['period'][0]} ~ {parsed['period'][1]}" if parsed["period"] else "기간 불명"
+                msgs.append(("info", f"{f.name}: {parsed['kind'] or '?'} 목록 · {per} · {len(parsed['rows'])}건 · 공급가 {won(parsed['supply'])} · 세액 {won(parsed['vat'])}"))
+        elif step["id"] == "tax" and low.endswith(".pdf"):
+            parsed = parse_invoice_pdf(data_b)
+            for lv, m in check_pdf(parsed, start, end, OUR_BIZ_NO):
+                msgs.append((lv, f"{f.name}: {m}"))
+            if not parsed.get("error"):
+                msgs.append(("info", f"{f.name}: 전자세금계산서 {len(parsed['invoices'])}건 · 공급가 {won(sum(i['supply'] for i in parsed['invoices']))}"))
+        plan.append((f.name, data_b, f.type or "application/octet-stream"))
+    for lv, m in msgs:
+        {"ok": st.success, "info": st.info, "warn": st.warning, "bad": st.error}.get(lv, st.info)(("✅ " if lv == "ok" else "⚠️ " if lv == "warn" else "❌ " if lv == "bad" else "ℹ️ ") + m)
+    if any(lv == "bad" for lv, _ in msgs) and not allow:
+        st.error("🚫 문제가 있는 파일이 있어서 올리지 않았어요. 파일을 확인하거나 '경고가 있어도 올리기'를 체크하고 다시 올려주세요.")
+        return
+    try:
+        names = existing_names(fid)
+        n_ok = 0
+        for name, b, mime in plan:
+            uname = du.unique_name(names, name)
+            du.upload_bytes(get_svc()[0], fid, uname, b, mime); names.add(uname); n_ok += 1
+        if extra and extra.get("memo"):
+            du.replace_or_upload(get_svc()[0], fid, AUTO + extra["memo"][0], extra["memo"][1].encode("utf-8"), "text/plain")
+        bump_and_rerun(f"✅ {step['title'].split(' (')[0]}: 파일 {n_ok}개" + (" + 메모" if extra and extra.get("memo") else "") + "를 올렸어요.")
+    except Exception as e:
+        st.error(f"❌ 올리지 못했어요 — {du.explain_error(e)}")
+
+
+for stp in STEPS:
+    ic, tx = statuses[stp["id"]]
+    with st.expander(f"{ic} {stp['icon']} {stp['no']}단계 — {stp['title']}   ·   {tx}", expanded=(ic != "✅" and stp["no"] == next((s_["no"] for s_ in STEPS if statuses[s_["id"]][0] != "✅"), 0))):
+        st.markdown(f"> 세무사 요청: *{stp['quote']}*")
+        for g in stp["guide"]:
+            st.markdown("- " + g.replace("{s}", str(start)).replace("{e}", str(end)))
+        render_files(stp)
+
+        if stp["id"] == "bank":
+            if not accounts:
+                st.info("이 기간의 은행거래가 없어서 자동으로 만들 엑셀이 없어요.")
+            else:
+                mask = st.checkbox("급여·인건비 거래의 적요(개인 이름)는 가리기 (권장)", value=True, key="vat_mask")
+                wbs = build_bank_workbooks(mask)
+                st.caption("자동 생성: " + " · ".join(f"{a} ({len(bank_df[bank_df['account_label'] == a]):,}건)" for a in wbs) + " — 상쇄(결제↔취소)·내부이체·미분류는 별도 시트로 나눠요.")
+                with st.form(f"vat_bank_auto_{ver}"):
+                    go_b = st.form_submit_button("📤 계좌별 은행내역 엑셀을 '은행' 폴더에 올리기 (같은 이름은 교체돼요)", type="primary", disabled=not drive_ok)
+                if go_b:
+                    fid, err = folder_for(stp)
+                    if err:
+                        st.error(f"❌ {err}")
+                    else:
+                        try:
+                            for ac, b in wbs.items():
+                                du.replace_or_upload(get_svc()[0], fid, f"{AUTO}{ac} {ptag} 거래내역.xlsx", b, XLSX)
+                            bump_and_rerun(f"✅ 은행내역 엑셀 {len(wbs)}개를 올렸어요.")
+                        except Exception as e:
+                            st.error(f"❌ 올리지 못했어요 — {du.explain_error(e)}")
+                for ac, b in wbs.items():
+                    st.download_button(f"⬇️ {ac} 엑셀 내려받기", b, file_name=f"{ac}_{ptag}.xlsx", mime=XLSX, key=f"vat_dl_{ac}")
+            upload_form(stp)
+
+        elif stp["id"] == "export":
+            camps = [c for c in data["camps"] if c.get("invoice_url")]
+            if camps:
+                st.markdown("**캠페인에 등록된 인보이스** (이 기간 오픈 캠페인)")
+                inv_df = pd.DataFrame([{"캠페인": c.get("campaign_name"), "오픈일": c.get("open_date"), "인보이스 금액": c.get("invoice_amount"), "인보이스 링크": c.get("invoice_url")} for c in camps])
+                st.dataframe(inv_df, hide_index=True, use_container_width=True)
+                with st.form(f"vat_inv_auto_{ver}"):
+                    go_i = st.form_submit_button("📤 인보이스 목록 엑셀을 폴더에 올리기", disabled=not drive_ok)
+                if go_i:
+                    fid, err = folder_for(stp)
+                    if err:
+                        st.error(f"❌ {err}")
+                    else:
+                        import io as _io
+                        bio = _io.BytesIO()
+                        inv_df.to_excel(bio, sheet_name="인보이스", index=False)
+                        try:
+                            du.replace_or_upload(get_svc()[0], fid, f"{AUTO}캠페인 인보이스 목록 {ptag}.xlsx", bio.getvalue(), XLSX)
+                            bump_and_rerun("✅ 인보이스 목록을 올렸어요.")
+                        except Exception as e:
+                            st.error(f"❌ 올리지 못했어요 — {du.explain_error(e)}")
+            else:
+                st.caption("이 기간에 인보이스가 등록된 캠페인이 없어요.")
+            upload_form(stp)
+
+        elif stp["id"] == "influencer":
+            pp = bank_df[(bank_df["description"].fillna("").str.upper().str.contains("PAYPAL")) & (bank_df["direction"] == "out") & (~bank_df["is_dup_certain"])] if not bank_df.empty else pd.DataFrame()
+            if len(pp):
+                st.markdown(f"**은행에서 찾은 PAYPAL 출금 {len(pp)}건 · {won(pp['amount'].sum())}**")
+                pp_df = pd.DataFrame({"날짜": pp["txn_date"].dt.strftime("%Y-%m-%d"), "계좌": pp["account_label"], "적요": pp["description"], "금액": pp["amount"].astype(float)}).sort_values("날짜")
+                st.dataframe(pp_df.assign(금액=pp_df["금액"].map(won)), hide_index=True, use_container_width=True, height=220)
+                with st.form(f"vat_pp_auto_{ver}"):
+                    go_p = st.form_submit_button("📤 PAYPAL 출금 목록 엑셀을 폴더에 올리기", disabled=not drive_ok)
+                if go_p:
+                    fid, err = folder_for(stp)
+                    if err:
+                        st.error(f"❌ {err}")
+                    else:
+                        import io as _io
+                        bio = _io.BytesIO()
+                        pp_df.to_excel(bio, sheet_name="PAYPAL 출금", index=False)
+                        try:
+                            du.replace_or_upload(get_svc()[0], fid, f"{AUTO}은행 PAYPAL 출금 목록 {ptag}.xlsx", bio.getvalue(), XLSX)
+                            bump_and_rerun("✅ PAYPAL 출금 목록을 올렸어요.")
+                        except Exception as e:
+                            st.error(f"❌ 올리지 못했어요 — {du.explain_error(e)}")
+            else:
+                st.caption("이 기간 은행에서 PAYPAL 출금이 보이지 않아요.")
+            upload_form(stp)
+
+        elif stp["id"] == "card":
+            def _card_extra():
+                fee = st.radio("연회비가 있나요?", ["없음", "있음", "카드마다 달라요 / 잘 모르겠어요"], horizontal=True, key=f"vat_fee_{ver}", index=None)
+                note = st.text_input("메모 (카드별 연회비 등, 선택)", key=f"vat_feenote_{ver}")
+                if fee is None:
+                    return {}
+                return {"memo": ("연회비_확인.txt", f"기간: {ptag}\n연회비: {fee}\n메모: {note or '-'}\n작성일: {TODAY}\n")}
+            upload_form(stp, _card_extra)
+
+        else:
+            upload_form(stp)
+
+# ── 3) 점검 · 대체 경로 ───────────────────────────────────
+with st.expander("🔎 데이터 점검과 내려받기 (드라이브를 안 쓸 때 대체 경로)"):
+    if bank_df.empty:
+        st.info("이 기간의 은행거래가 없어요. (뱅크다 수집 시작일 이전이거나 아직 수집되지 않았을 수 있어요)")
     else:
-        st.success("거래가 7일 이상 비어 있는 구간은 없어요.")
-    if n_unc or n_sus:
-        st.info("미분류·애매한 의심은 **재무캘린더 › 전체 매칭 현황 › 은행거래내역**에서 정리할 수 있어요. 안 해도 엑셀에는 '미분류' 시트로 남아요.")
+        problems = []
+        for ac in accounts:
+            sub = bank_df[bank_df["account_label"] == ac]
+            for g0, g1, n, why in find_date_gaps([d.date() for d in sub["txn_date"].dropna()], start, end):
+                problems.append({"계좌": ac, "구간": f"{g0} ~ {g1}", "일수": n, "내용": f"{why} (7일 이상 거래 없음 — 실제로 없었는지 확인)"})
+        n_unc = int(((bank_df["account_category_id"].isna()) & (~bank_df["is_dup_certain"])).sum())
+        v1, v2, v3, v4 = st.columns(4)
+        v1.metric("거래 없는 의심 구간", f"{len(problems)}곳")
+        v2.metric("미분류 거래", f"{n_unc}건")
+        v3.metric("애매한 상쇄 의심", f"{int(bank_df['is_dup_suspect'].sum())}건")
+        v4.metric("상쇄 제외", f"{int(bank_df['is_dup_certain'].sum())}건")
+        if problems:
+            st.dataframe(pd.DataFrame(problems), hide_index=True, use_container_width=True)
+        st.caption(f"상쇄 규칙: 같은 계좌·같은 날·같은 금액의 입금과 출금이 {OFFSET_WINDOW_MIN}분 안에 있으면 결제↔취소 쌍으로 보고 집계에서 빼요(데이터는 지우지 않아요).")
+        chk = pd.DataFrame([{"단계": f"{s_['no']}. {s_['title']}", "상태": f"{statuses[s_['id']][0]} {statuses[s_['id']][1]}"} for s_ in STEPS])
+        wb_all = build_bank_workbooks(True)
+        if wb_all:
+            st.download_button("📦 전체 패키지(ZIP) 내려받기 — 진행 현황 + 계좌별 엑셀", build_zip(wb_all, f"{year}_{label}", chk),
+                               file_name=f"부가세자료_{ptag}.zip", mime="application/zip", key="vat_zip")
         try:
-            st.page_link("pages/9_재무캘린더.py", label="💹 재무캘린더로 이동")
+            st.page_link("pages/9_재무캘린더.py", label="💹 재무캘린더에서 미분류·상쇄 정리하기")
         except Exception:
             pass
-st.caption("다음 단계: ② 매입 세금계산서·카드 파일 업로드·정리 → ③ 드라이브 자동 업로드·세무사 알림 → ④ DB 분할 후 급여·원천세 연결")
