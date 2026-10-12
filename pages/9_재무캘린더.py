@@ -210,11 +210,15 @@ if not ev_df.empty:
     ev_df["brand"] = ev_df["project_id"].map(lambda x: proj_by_id.get(x, {}).get("brand", "-"))
     ev_df["month"] = ev_df["due_date"].dt.to_period("M").astype(str)
 
+OFFSET_WINDOW_MIN = 10   # 입금·출금이 이 분 안에 있어야 '결제 ↔ 취소' 상쇄로 본다
+
+
 def mark_duplicates(df, keep_ids=None):
-    """같은 계좌·방향·금액·날짜(·적요)인 은행거래를 '결제 ↔ 취소'가 서로 지워지는 상쇄 쌍으로 본다. (DB는 안 바꾸고 화면용 플래그만 계산)
-    - is_dup_certain(=상쇄): 계좌+방향+금액+거래일시(초단위)가 같거나, 시간이 없어도 적요까지 같은 거래.
-        시간순으로 2건씩 짝지어 둘 다 집계에서 뺀다. 홀수 개면 마지막 1건은 남는다. (예: 결제·취소·실결제 3건 → 앞 2건 상쇄, 마지막 1건 반영)
-    - is_dup_suspect: 계좌+방향+금액+날짜만 같고 적요/시간이 다른 경우 → 애매하니 집계에는 포함하고 화면에 표시만 함
+    """'상쇄' = 같은 계좌에서 같은 날, 같은 금액의 입금과 출금이 몇 분 차이로 짝을 이룬 것 (결제 ↔ 취소/환불). (DB는 안 바꾸고 화면용 플래그만 계산)
+    - is_dup_certain(=상쇄): 계좌+금액+날짜가 같고 방향이 반대(입금↔출금)이며 거래 시각 차이가 OFFSET_WINDOW_MIN분 이하인 쌍.
+        가장 가까운 것끼리 1:1로 짝지어 둘 다 집계에서 뺀다. 짝이 없는 거래는 그대로 반영된다.
+    - is_dup_suspect(=애매): 같은 날·같은 금액의 입금/출금이 있는데 시간 차이가 크거나 시각을 몰라서 짝을 못 지은 거래 → 집계에는 포함, 화면에 표시만
+    - 같은 방향(출금/출금, 입금/입금)끼리는 상쇄가 아니다. (같은 거래의 이중 입력은 dedup_hash 가 이미 막는다)
     - keep_ids: 대표님이 '상쇄 아님(별개 거래)'으로 정한 거래 id → 자동 판단에서 완전히 뺀다
     """
     df = df.copy()
@@ -225,40 +229,31 @@ def mark_duplicates(df, keep_ids=None):
     df["offset_kept"] = df["id"].isin(keep_ids)
     if df.empty:
         return df
-    # 짝짓는 순서: 거래 시각(없으면 입력 시각) — 결제가 먼저, 취소가 그다음, 마지막이 실결제
-    # 시각 열마다 시간대 표기가 다를 수 있다(거래시각=표기 없음, 입력시각=+00:00) → 둘 다 utc=True 로 맞춘 뒤 비교
-    df["_sort_key"] = pd.to_datetime(df["txn_datetime"] if "txn_datetime" in df.columns else None, errors="coerce", utc=True)
-    df["_sort_key"] = df["_sort_key"].fillna(pd.to_datetime(df.get("created_at"), errors="coerce", utc=True))
-
-    def _flag(group_cols, target_col):
-        decided = df["offset_kept"]
-        pool = df[~df["is_dup_certain"] & ~decided] if target_col == "is_dup_certain" else df[~df["is_dup_certain"] & ~df["is_dup_suspect"] & ~decided]
-        grouped = pool.groupby(group_cols, dropna=True).groups
-        for gkey, idx in grouped.items():
-            idxs = list(idx)
-            if len(idxs) < 2:
+    ts = pd.to_datetime(df["txn_datetime"], errors="coerce", utc=True, format="mixed") if "txn_datetime" in df.columns else pd.Series(pd.NaT, index=df.index)
+    pool = df[~df["offset_kept"]]
+    for gkey, g in pool.groupby(["account_label", "amount", "txn_date"], dropna=True):
+        ins, outs = g.index[g["direction"] == "in"], g.index[g["direction"] == "out"]
+        if len(ins) == 0 or len(outs) == 0:
+            continue
+        cand = sorted(
+            (abs((ts[i] - ts[o]).total_seconds()), i, o)
+            for i in ins for o in outs if pd.notna(ts[i]) and pd.notna(ts[o])
+        )
+        used, matched = set(), []
+        for gap, i, o in cand:
+            if gap > OFFSET_WINDOW_MIN * 60:
+                break
+            if i in used or o in used:
                 continue
-            if "description" in group_cols:   # 적요까지 같아야 하는 규칙은 적요가 비어 있으면 건너뜀
-                colpos = group_cols.index("description")
-                val = gkey[colpos] if isinstance(gkey, tuple) else gkey
-                if not val or (isinstance(val, float) and pd.isna(val)):
-                    continue
-            ordered = list(df.loc[idxs].sort_values("_sort_key", na_position="last", kind="stable").index)
-            if target_col == "is_dup_certain":
-                df.loc[ordered[: len(ordered) // 2 * 2], "is_dup_certain"] = True
-            else:
-                df.loc[ordered, "is_dup_suspect"] = True
-            df.loc[ordered, "dup_group"] = df.loc[ordered, "dup_group"].where(df.loc[ordered, "dup_group"].notna(), str(gkey))
-
-    # A. 계좌+방향+금액+거래일시(초단위)까지 완전히 같음 → 상쇄
-    if "txn_datetime" in df.columns:
-        _flag(["account_label", "direction", "amount", "txn_datetime"], "is_dup_certain")
-    # B. 시간정보가 없어도, 계좌+방향+금액+날짜+적요(이름)까지 완전히 같으면 → 상쇄
-    _flag(["account_label", "direction", "amount", "txn_date", "description"], "is_dup_certain")
-    # C. 계좌+방향+금액+날짜만 같고 나머지는 다름 → 애매한 중복 의심 (표시만, 집계에서 빼지 않음)
-    _flag(["account_label", "direction", "amount", "txn_date"], "is_dup_suspect")
-
-    df.drop(columns=["_sort_key"], inplace=True)
+            used.update((i, o)); matched += [i, o]
+        left_in = [i for i in ins if i not in used]
+        left_out = [o for o in outs if o not in used]
+        if matched:
+            df.loc[matched, "is_dup_certain"] = True
+        if left_in and left_out:   # 같은 날·같은 금액인데 짝을 못 지은 입금/출금 → 애매
+            df.loc[left_in + left_out, "is_dup_suspect"] = True
+        if matched or (left_in and left_out):   # 화면에서 한 묶음으로 보이게(짝 없는 거래도 '남음'으로 함께 표시)
+            df.loc[g.index, "dup_group"] = str(gkey)
     return df
 
 
@@ -268,7 +263,8 @@ if not bank_df.empty:
     bank_df["amount"] = pd.to_numeric(bank_df["amount"], errors="coerce").fillna(0)
     bank_df["txn_date"] = pd.to_datetime(bank_df["txn_date"], errors="coerce")
     if "txn_datetime" in bank_df.columns:
-        bank_df["txn_datetime"] = pd.to_datetime(bank_df["txn_datetime"], errors="coerce")
+        # 은행마다 표기가 다르다(SC제일 '2025.10.07 12:42:04' / 기업 '2025-11-19 14:21:23'). 첫 줄 형식으로 통째로 읽으면 나머지가 빈 값이 되므로 형식을 섞어서 읽는다
+        bank_df["txn_datetime"] = pd.to_datetime(bank_df["txn_datetime"].astype("string").str.replace(".", "-", regex=False), errors="coerce", format="mixed")
     bank_df["cat_name"] = bank_df["account_category_id"].map(lambda x: cat_by_id.get(x, {}).get("name", "미분류"))
     bank_df["cat_type"] = bank_df["account_category_id"].map(lambda x: cat_by_id.get(x, {}).get("type"))
     bank_df["matched_brand"] = bank_df["matched_cash_event_id"].map(
@@ -306,7 +302,7 @@ if total_unc > 0:
 else:
     st.success("✅ 모든 항목이 계정과목으로 분류되어 있습니다.")
 if n_dup_certain or n_dup_suspect:
-    st.info(f"🧹 은행거래 상쇄·중복 — 상쇄 {n_dup_certain}건(결제↔취소 쌍, 둘 다 집계에서 제외됨) · 애매한 중복 {n_dup_suspect}건(대부분 정상 출금 — 집계에 포함, 분류 목록에 함께 표시) → **'전체 매칭 현황 > 은행거래내역'**의 '상쇄·중복 정리'에서 확인하세요.")
+    st.info(f"🧹 은행거래 상쇄·중복 — 상쇄 {n_dup_certain}건(입금↔출금 쌍, 둘 다 집계에서 제외됨) · 애매한 의심 {n_dup_suspect}건(집계에 포함, 분류 목록에 함께 표시) → **'전체 매칭 현황 > 은행거래내역'**의 '상쇄 정리'에서 확인하세요.")
 
 menu = st.radio(
     "메뉴", ["📊 대시보드", "🔗 전체 매칭 현황", "🤖 AI 계정과목 추천", "🏦 뱅크다 연동", "⚙️ 계정과목 설정", "📄 손익계산서", "📝 CFO 인사이트"],
@@ -484,10 +480,10 @@ elif menu == "🔗 전체 매칭 현황":
         n_certain = int(bank_df["is_dup_certain"].sum())
         n_suspect = int(bank_df["is_dup_suspect"].sum())
         if n_certain or n_suspect or _keep_ids:
-            with st.expander(f"🧹 상쇄·중복 정리 — 상쇄 {n_certain}건 · 애매한 중복 {n_suspect}건", expanded=True):
+            with st.expander(f"🧹 상쇄 정리 — 상쇄 {n_certain}건 · 애매한 의심 {n_suspect}건", expanded=True):
                 if n_certain:
-                    st.markdown("**상쇄 처리된 거래** — 같은 계좌·방향·금액·날짜·적요인 거래를 **결제와 취소가 서로 지워지는 쌍**으로 보고, 시간순으로 2건씩 짝지어 "
-                                "대시보드/손익계산서 집계에서 둘 다 뺐어요. (결제·취소·실결제 3건이면 앞의 2건이 상쇄되고 마지막 1건만 반영돼요.) "
+                    st.markdown(f"**상쇄 처리된 거래** — 같은 계좌에서 **같은 날 같은 금액의 입금과 출금이 {OFFSET_WINDOW_MIN}분 안에** 있으면 결제와 취소가 서로 지워지는 쌍으로 보고 "
+                                "대시보드/손익계산서 집계에서 둘 다 뺐어요. 짝이 없는 거래는 그대로 반영돼요. "
                                 "데이터는 지우지 않아요. 실제로 따로 일어난 거래라면 '상쇄 아님'을 눌러주세요.")
                     if _keep_err:
                         st.caption("'상쇄 아님' 저장 테이블(bank_offset_overrides)을 읽지 못해서 이 버튼은 꺼져 있어요 — migrations/20261012_bank_offset_overrides.sql 을 DB에 적용하면 켜져요.")
@@ -512,19 +508,16 @@ elif menu == "🔗 전체 매칭 현황":
                             refresh()
                         st.divider()
                 if n_suspect:
-                    st.markdown("**애매한 중복 의심** (계좌+방향+금액+날짜는 같은데 적요나 시간이 다름) — 대부분 **정상 출금**이에요. 집계에는 그대로 포함되어 있고, "
+                    st.markdown(f"**애매한 상쇄 의심** (같은 날·같은 금액의 입금과 출금이 있는데 시간 차이가 {OFFSET_WINDOW_MIN}분보다 크거나 시각을 몰라서 짝을 못 지었어요) — 집계에는 그대로 포함되어 있고, "
                                 "아래 거래는 **'미분류만 보기' 목록에도 자동으로 함께 나와서** 계정과목을 다시 확인·분류할 수 있어요. "
                                 "정상이면 '✅ 정상'을 눌러 이 의심 표시에서 빼세요. (지우지 않아요)")
-                    if st.button(f"✅ 애매한 중복 {n_suspect}건 모두 정상으로 표시", key="bulk_normal_suspect", disabled=bool(_keep_err)):
-                        _mark_normal(bank_df.loc[bank_df["is_dup_suspect"], "id"].tolist(), "애매한 중복 전체")
+                    if st.button(f"✅ 애매한 의심 {n_suspect}건 모두 정상으로 표시", key="bulk_normal_suspect", disabled=bool(_keep_err)):
+                        _mark_normal(bank_df.loc[bank_df["is_dup_suspect"], "id"].tolist(), "애매한 의심 전체")
                     for gkey, g in bank_df[bank_df["is_dup_suspect"]].groupby("dup_group"):
                         for _, row in g.sort_values("txn_date").iterrows():
                             d = row["txn_date"].strftime("%Y-%m-%d") if pd.notna(row["txn_date"]) else "-"
-                            dc1, dc2 = st.columns([5, 1])
-                            dc1.write(f"⚠️ · {'입금' if row['direction']=='in' else '출금'} · {d} · ₩{row['amount']:,.0f} · {row['description'] or ''}")
-                            if dc2.button("삭제", key=f"delsus_{row['id']}"):
-                                SUPA.table("bank_transactions").delete().eq("id", row["id"]).execute()
-                                st.success("삭제 완료"); refresh()
+                            tm = row["txn_datetime"].strftime("%H:%M:%S") if ("txn_datetime" in g.columns and pd.notna(row["txn_datetime"])) else ""
+                            st.write(f"⚠️ · {'입금' if row['direction']=='in' else '출금'} · {d} {tm} · ₩{row['amount']:,.0f} · {row['description'] or ''}")
                         if st.button("✅ 정상 — 이 거래들은 중복이 아니에요", key=f"normalgrp_{hashlib.md5(str(gkey).encode('utf-8')).hexdigest()[:12]}", disabled=bool(_keep_err)):
                             _mark_normal(g["id"].tolist(), "정상 확인")
                         st.divider()
@@ -543,7 +536,7 @@ elif menu == "🔗 전체 매칭 현황":
         b_show = base[base["account_category_id"].isna() | base["is_dup_suspect"]] if show_only_unc else base  # 애매한 중복도 분류 확인용으로 함께 보여준다
         b_show = b_show.sort_values("txn_date", ascending=False)
         if n_suspect:
-            st.caption(f"⚠️ 같은 날·같은 금액 거래(애매한 중복 {n_suspect}건)도 계정과목을 확인할 수 있게 이 목록에 함께 나와요. 정상이면 각 줄의 '✅ 정상'을 눌러 빼세요.")
+            st.caption(f"⚠️ 같은 날·같은 금액의 입금/출금(애매한 의심 {n_suspect}건)도 계정과목을 확인할 수 있게 이 목록에 함께 나와요. 정상이면 각 줄의 '✅ 정상'을 눌러 빼세요.")
         st.caption(f"{len(b_show)}건 · ⚠️ 여기서 재연결하면 송금캘린더의 매칭(완료 상태)에도 즉시 반영됩니다 — 신중하게 사용하세요.")
         cat_opts = ["(선택 안함)"] + list(cat_name_to_id.keys())
         for _, row in b_show.head(150).iterrows():
@@ -554,7 +547,7 @@ elif menu == "🔗 전체 매칭 현황":
                     mb = row["matched_brand"] if pd.notna(row["matched_brand"]) else "-"
                     mt = row["matched_title"] if pd.notna(row["matched_title"]) else ""
                     match_info = f"🔗 매칭됨: {mb} · {mt}"
-                sus = " · ⚠️같은 날·같은 금액 거래 있음(확인)" if row["is_dup_suspect"] else ""
+                sus = " · ⚠️같은 날 같은 금액의 반대 거래 있음(확인)" if row["is_dup_suspect"] else ""
                 xfer = " · 🔁내부이체" if row["cat_type"] == "transfer" else ""
                 bsflag = " · 🏦재무상태표항목" if row["cat_type"] == "balance_sheet" else ""
                 d = row["txn_date"].strftime("%Y-%m-%d") if pd.notna(row["txn_date"]) else "-"
