@@ -18,11 +18,13 @@ NAV = {
     ],
     "CFO · Finance & IR": [
         st.Page("pages/17_수금관리.py", title="Receivables", icon="💰", url_path="receivables"),
+        st.Page("pages/18_캠페인마진.py", title="Campaign Margin", icon="📈", url_path="campaign-margin"),
         st.Page("pages/9_재무캘린더.py", title="Finance Calendar", icon="💹", url_path="finance"),
     ],
     "COO · People & Automation": [
         st.Page("pages/14_ OKR피드백관리.py", title="OKR Feedback", icon="🧭", url_path="okr-feedback"),
         st.Page("pages/15_휴가관리.py", title="Leave", icon="🏖️", url_path="leave"),
+        st.Page("pages/19_직원입력현황.py", title="Team Input", icon="👥", url_path="team-input"),
     ],
 }
 

@@ -112,6 +112,19 @@ def compute_pl(pl_df):
     }
 
 
+def _fetch_all(table, cols, order_col, desc=True, page=1000):
+    """테이블을 끝까지 읽는다. Supabase 는 한 번에 최대 1000행만 주기 때문에 range 로 이어서 읽는다.
+    (이걸 안 쓰면 은행거래가 1000건을 넘는 순간 오래된 거래가 대시보드·손익계산서에서 조용히 빠진다)"""
+    rows, start = [], 0
+    while True:
+        chunk = (SUPA.table(table).select(cols).order(order_col, desc=desc).order("id")
+                 .range(start, start + page - 1).execute().data)
+        rows += chunk
+        if len(chunk) < page:
+            return rows
+        start += page
+
+
 @st.cache_data(ttl=45)
 def load_all():
     categories = SUPA.table("fin_account_categories").select("*").order("sort_order").execute().data
@@ -119,9 +132,10 @@ def load_all():
         "id,project_id,direction,category,title,amount,due_date,paid,paid_date,memo,account_category_id"
     ).execute().data
     projects = SUPA.table("projects").select("id,brand,campaign").execute().data
-    bank_txns = SUPA.table("bank_transactions").select(
-        "id,direction,amount,txn_date,txn_datetime,description,matched_cash_event_id,account_label,account_category_id,created_at,dedup_hash"
-    ).order("txn_date", desc=True).execute().data
+    bank_txns = _fetch_all(
+        "bank_transactions",
+        "id,direction,amount,txn_date,txn_datetime,description,matched_cash_event_id,account_label,account_category_id,created_at,dedup_hash",
+        "txn_date")
     tax_invs = SUPA.table("tax_invoices").select(
         "approval_no,write_date,issue_date,buyer_biz_no,buyer_name,total_amount,supply_amount,vat,kind,"
         "matched_cash_event_id,canceled,account_category_id"
@@ -129,9 +143,33 @@ def load_all():
     return categories, events, projects, bank_txns, tax_invs
 
 
+@st.cache_data(ttl=45)
+def load_offset_keep():
+    """대표님이 '상쇄 아님(별개 거래)'으로 정한 은행거래 id 집합. 테이블이 아직 없으면 빈 집합(자동 상쇄만 동작)."""
+    try:
+        rows = SUPA.table("bank_offset_overrides").select("bank_transaction_id").eq("decision", "keep").execute().data
+        return {r["bank_transaction_id"] for r in rows}, None
+    except Exception as e:
+        return set(), f"{type(e).__name__}: {str(e)[:120]}"
+
+
 def refresh():
     load_all.clear()
+    load_offset_keep.clear()
     st.rerun()
+
+
+def _mark_normal(ids, what):
+    """대표님이 '정상(중복·상쇄 아님)'으로 확인한 은행거래를 기록한다. 데이터는 바꾸지 않고 bank_offset_overrides 에만 쌓는다."""
+    ids = [i for i in ids if i]
+    try:
+        SUPA.table("bank_offset_overrides").upsert(
+            [{"bank_transaction_id": i, "decision": "keep", "decided_by": "장현우"} for i in ids], on_conflict="bank_transaction_id").execute()
+        st.session_state["offset_flash"] = f"{what} — {len(ids)}건을 정상 거래로 표시했어요."
+    except Exception as e:
+        st.session_state["offset_flash"] = (f"저장하지 못했어요 ({type(e).__name__}: {str(e)[:120]}). "
+                                            "migrations/20261012_bank_offset_overrides.sql 이 DB에 적용됐는지 확인해주세요.")
+    refresh()
 
 
 @st.cache_data(ttl=45)
@@ -172,58 +210,61 @@ if not ev_df.empty:
     ev_df["brand"] = ev_df["project_id"].map(lambda x: proj_by_id.get(x, {}).get("brand", "-"))
     ev_df["month"] = ev_df["due_date"].dt.to_period("M").astype(str)
 
-def mark_duplicates(df):
-    """이미 저장된 은행거래 중 중복 후보를 찾아 표시한다 (DB는 안 바꾸고 화면용 플래그만 계산).
-    - is_dup_certain: 계좌+방향+금액+거래일시(초단위)가 완전히 같거나, 시간이 없어도 적요까지 완전히 같은 경우 → 확실한 중복으로 보고 집계에서 제외
-    - is_dup_suspect: 계좌+방향+금액+날짜만 같고 적요/시간이 다른 경우 → 애매하니 집계에는 포함하되 화면에 표시만 함
+OFFSET_WINDOW_MIN = 10   # 입금·출금이 이 분 안에 있어야 '결제 ↔ 취소' 상쇄로 본다
+
+
+def mark_duplicates(df, keep_ids=None):
+    """'상쇄' = 같은 계좌에서 같은 날, 같은 금액의 입금과 출금이 몇 분 차이로 짝을 이룬 것 (결제 ↔ 취소/환불). (DB는 안 바꾸고 화면용 플래그만 계산)
+    - is_dup_certain(=상쇄): 계좌+금액+날짜가 같고 방향이 반대(입금↔출금)이며 거래 시각 차이가 OFFSET_WINDOW_MIN분 이하인 쌍.
+        가장 가까운 것끼리 1:1로 짝지어 둘 다 집계에서 뺀다. 짝이 없는 거래는 그대로 반영된다.
+    - is_dup_suspect(=애매): 같은 날·같은 금액의 입금/출금이 있는데 시간 차이가 크거나 시각을 몰라서 짝을 못 지은 거래 → 집계에는 포함, 화면에 표시만
+    - 같은 방향(출금/출금, 입금/입금)끼리는 상쇄가 아니다. (같은 거래의 이중 입력은 dedup_hash 가 이미 막는다)
+    - keep_ids: 대표님이 '상쇄 아님(별개 거래)'으로 정한 거래 id → 자동 판단에서 완전히 뺀다
     """
     df = df.copy()
+    keep_ids = keep_ids or set()
     df["is_dup_certain"] = False
     df["is_dup_suspect"] = False
     df["dup_group"] = None
+    df["offset_kept"] = df["id"].isin(keep_ids)
     if df.empty:
         return df
-    df["_sort_key"] = pd.to_datetime(df.get("created_at"), errors="coerce")
-
-    def _flag(group_cols, target_col, require_nonempty_col=None):
-        pool = df[~df["is_dup_certain"]] if target_col == "is_dup_certain" else df[~df["is_dup_certain"] & ~df["is_dup_suspect"]]
-        grouped = pool.groupby(group_cols, dropna=True).groups
-        for gkey, idx in grouped.items():
-            idxs = list(idx)
-            if len(idxs) < 2:
+    ts = pd.to_datetime(df["txn_datetime"], errors="coerce", utc=True, format="mixed") if "txn_datetime" in df.columns else pd.Series(pd.NaT, index=df.index)
+    pool = df[~df["offset_kept"]]
+    for gkey, g in pool.groupby(["account_label", "amount", "txn_date"], dropna=True):
+        ins, outs = g.index[g["direction"] == "in"], g.index[g["direction"] == "out"]
+        if len(ins) == 0 or len(outs) == 0:
+            continue
+        cand = sorted(
+            (abs((ts[i] - ts[o]).total_seconds()), i, o)
+            for i in ins for o in outs if pd.notna(ts[i]) and pd.notna(ts[o])
+        )
+        used, matched = set(), []
+        for gap, i, o in cand:
+            if gap > OFFSET_WINDOW_MIN * 60:
+                break
+            if i in used or o in used:
                 continue
-            if require_nonempty_col is not None:
-                colpos = group_cols.index(require_nonempty_col)
-                val = gkey[colpos] if isinstance(gkey, tuple) else gkey
-                if not val or (isinstance(val, float) and pd.isna(val)):
-                    continue
-            sub = df.loc[idxs].sort_values("_sort_key", na_position="last")
-            canonical = sub.index[0]
-            others = [i for i in idxs if i != canonical]
-            if target_col == "is_dup_certain":
-                df.loc[others, "is_dup_certain"] = True
-            else:
-                df.loc[idxs, "is_dup_suspect"] = True
-            df.loc[idxs, "dup_group"] = df.loc[idxs, "dup_group"].where(df.loc[idxs, "dup_group"].notna(), str(gkey))
-
-    # A. 계좌+방향+금액+거래일시(초단위)까지 완전히 같음 → 확실한 중복
-    if "txn_datetime" in df.columns:
-        _flag(["account_label", "direction", "amount", "txn_datetime"], "is_dup_certain")
-    # B. 시간정보가 없어도, 계좌+방향+금액+날짜+적요(이름)까지 완전히 같으면 → 확실한 중복
-    _flag(["account_label", "direction", "amount", "txn_date", "description"], "is_dup_certain", require_nonempty_col="description")
-    # C. 계좌+방향+금액+날짜만 같고 나머지는 다름 → 애매한 중복 의심 (표시만, 집계에서 빼지 않음)
-    _flag(["account_label", "direction", "amount", "txn_date"], "is_dup_suspect")
-
-    df.drop(columns=["_sort_key"], inplace=True)
+            used.update((i, o)); matched += [i, o]
+        left_in = [i for i in ins if i not in used]
+        left_out = [o for o in outs if o not in used]
+        if matched:
+            df.loc[matched, "is_dup_certain"] = True
+        if left_in and left_out:   # 같은 날·같은 금액인데 짝을 못 지은 입금/출금 → 애매
+            df.loc[left_in + left_out, "is_dup_suspect"] = True
+        if matched or (left_in and left_out):   # 화면에서 한 묶음으로 보이게(짝 없는 거래도 '남음'으로 함께 표시)
+            df.loc[g.index, "dup_group"] = str(gkey)
     return df
 
 
+_keep_ids, _keep_err = load_offset_keep()
 bank_df = pd.DataFrame(bank_txns)
 if not bank_df.empty:
     bank_df["amount"] = pd.to_numeric(bank_df["amount"], errors="coerce").fillna(0)
     bank_df["txn_date"] = pd.to_datetime(bank_df["txn_date"], errors="coerce")
     if "txn_datetime" in bank_df.columns:
-        bank_df["txn_datetime"] = pd.to_datetime(bank_df["txn_datetime"], errors="coerce")
+        # 은행마다 표기가 다르다(SC제일 '2025.10.07 12:42:04' / 기업 '2025-11-19 14:21:23'). 첫 줄 형식으로 통째로 읽으면 나머지가 빈 값이 되므로 형식을 섞어서 읽는다
+        bank_df["txn_datetime"] = pd.to_datetime(bank_df["txn_datetime"].astype("string").str.replace(".", "-", regex=False), errors="coerce", format="mixed")
     bank_df["cat_name"] = bank_df["account_category_id"].map(lambda x: cat_by_id.get(x, {}).get("name", "미분류"))
     bank_df["cat_type"] = bank_df["account_category_id"].map(lambda x: cat_by_id.get(x, {}).get("type"))
     bank_df["matched_brand"] = bank_df["matched_cash_event_id"].map(
@@ -232,9 +273,9 @@ if not bank_df.empty:
     bank_df["matched_title"] = bank_df["matched_cash_event_id"].map(
         lambda x: (events_by_id.get(x, {}).get("title") if pd.notna(x) else None)
     )
-    bank_df = mark_duplicates(bank_df)
+    bank_df = mark_duplicates(bank_df, _keep_ids)
 
-# 집계(대시보드/손익계산서)는 '확실한 중복'을 제외한 버전을 쓴다 — 실제 매칭/태깅 리스트는 원본(bank_df)을 그대로 보여줌
+# 집계(대시보드/손익계산서)는 '상쇄(결제↔취소)'된 거래를 제외한 버전을 쓴다 — 실제 매칭/태깅 리스트는 원본(bank_df)을 그대로 보여줌
 bank_df_clean = bank_df[~bank_df["is_dup_certain"]].copy() if not bank_df.empty else bank_df
 
 tax_df = pd.DataFrame(tax_invs)
@@ -261,7 +302,7 @@ if total_unc > 0:
 else:
     st.success("✅ 모든 항목이 계정과목으로 분류되어 있습니다.")
 if n_dup_certain or n_dup_suspect:
-    st.info(f"🧹 은행거래 중복 의심 — 확실한 중복 {n_dup_certain}건(집계에서 자동 제외됨) · 애매한 중복 {n_dup_suspect}건(표시만, 집계엔 포함) → **'전체 매칭 현황 > 은행거래내역'**의 '중복 거래 정리'에서 확인하세요.")
+    st.info(f"🧹 은행거래 상쇄·중복 — 상쇄 {n_dup_certain}건(입금↔출금 쌍, 둘 다 집계에서 제외됨) · 애매한 의심 {n_dup_suspect}건(집계에 포함, 분류 목록에 함께 표시) → **'전체 매칭 현황 > 은행거래내역'**의 '상쇄 정리'에서 확인하세요.")
 
 menu = st.radio(
     "메뉴", ["📊 대시보드", "🔗 전체 매칭 현황", "🤖 AI 계정과목 추천", "🏦 뱅크다 연동", "⚙️ 계정과목 설정", "📄 손익계산서", "📝 CFO 인사이트"],
@@ -295,7 +336,7 @@ if menu == "📊 대시보드":
     m5.metric("예상 출금(직원신고, 미해결)", f"₩{fc_out_total:,.0f}")
 
     st.divider()
-    st.subheader("📊 계정과목별 현황 (은행거래 실제 기준, 확실한 중복 제외)")
+    st.subheader("📊 계정과목별 현황 (은행거래 실제 기준, 상쇄 제외)")
 
     period_choice = st.radio("기간", ["전체", "이번달", "이번분기"], horizontal=True, key="dash_period")
     if period_choice == "이번달":
@@ -356,7 +397,7 @@ if menu == "📊 대시보드":
                             load_cash_forecasts.clear(); st.rerun()
 
     st.divider()
-    st.subheader("🗓️ 월별 요약 (은행거래 실제 기준, 확실한 중복 제외)")
+    st.subheader("🗓️ 월별 요약 (은행거래 실제 기준, 상쇄 제외)")
     bank_df_clean["month"] = bank_df_clean["txn_date"].dt.to_period("M").astype(str)
     monthly = bank_df_clean.groupby(["month", "direction"])["amount"].sum().unstack(fill_value=0)
     if not monthly.empty:
@@ -434,41 +475,68 @@ elif menu == "🔗 전체 매칭 현황":
 
     # ── 은행거래내역 ──────────────────────────────────────
     with tab_bank:
+        if st.session_state.get("offset_flash"):
+            st.success(st.session_state.pop("offset_flash"))
         n_certain = int(bank_df["is_dup_certain"].sum())
         n_suspect = int(bank_df["is_dup_suspect"].sum())
-        if n_certain or n_suspect:
-            with st.expander(f"🧹 중복 거래 정리 — 확실한 중복 {n_certain}건 · 애매한 중복 {n_suspect}건", expanded=True):
+        if n_certain or n_suspect or _keep_ids:
+            with st.expander(f"🧹 상쇄 정리 — 상쇄 {n_certain}건 · 애매한 의심 {n_suspect}건", expanded=True):
                 if n_certain:
-                    st.markdown("**확실한 중복** (계좌+방향+금액+거래일시 초단위까지 같거나, 적요까지 완전히 같음) — 아래 목록은 대시보드/손익계산서 집계에서 이미 자동 제외되어 있습니다. 완전히 지우고 싶으면 '삭제'를 누르세요.")
+                    st.markdown(f"**상쇄 처리된 거래** — 같은 계좌에서 **같은 날 같은 금액의 입금과 출금이 {OFFSET_WINDOW_MIN}분 안에** 있으면 결제와 취소가 서로 지워지는 쌍으로 보고 "
+                                "대시보드/손익계산서 집계에서 둘 다 뺐어요. 짝이 없는 거래는 그대로 반영돼요. "
+                                "데이터는 지우지 않아요. 실제로 따로 일어난 거래라면 '상쇄 아님'을 눌러주세요.")
+                    if _keep_err:
+                        st.caption("'상쇄 아님' 저장 테이블(bank_offset_overrides)을 읽지 못해서 이 버튼은 꺼져 있어요 — migrations/20261012_bank_offset_overrides.sql 을 DB에 적용하면 켜져요.")
                     dup_groups = bank_df[bank_df["is_dup_certain"] | (bank_df["dup_group"].isin(bank_df.loc[bank_df["is_dup_certain"], "dup_group"]))]
                     for gkey, g in dup_groups.groupby("dup_group"):
                         if not g["is_dup_certain"].any():
                             continue
-                        for _, row in g.sort_values("txn_date").iterrows():
-                            tag = "🟡 대표(유지)" if not row["is_dup_certain"] else "🔴 중복(제외됨)"
+                        order_cols = ["txn_date", "txn_datetime"] if "txn_datetime" in g.columns else ["txn_date"]
+                        for _, row in g.sort_values(order_cols, na_position="last").iterrows():
+                            tag = "🔵 상쇄(제외됨)" if row["is_dup_certain"] else "🟡 남음(정상 반영)"
                             d = row["txn_date"].strftime("%Y-%m-%d") if pd.notna(row["txn_date"]) else "-"
-                            dc1, dc2 = st.columns([5, 1])
-                            dc1.write(f"{tag} · {'입금' if row['direction']=='in' else '출금'} · {d} · ₩{row['amount']:,.0f} · {row['description'] or ''}")
-                            if row["is_dup_certain"] and dc2.button("삭제", key=f"deldup_{row['id']}"):
-                                SUPA.table("bank_transactions").delete().eq("id", row["id"]).execute()
-                                st.success("삭제 완료"); refresh()
+                            tm = row["txn_datetime"].strftime("%H:%M:%S") if ("txn_datetime" in g.columns and pd.notna(row["txn_datetime"])) else ""
+                            st.write(f"{tag} · {'입금' if row['direction']=='in' else '출금'} · {d} {tm} · ₩{row['amount']:,.0f} · {row['description'] or ''}")
+                        if st.button("↩️ 상쇄 아님 — 이 거래들은 모두 정상 거래로", key=f"keepgrp_{hashlib.md5(str(gkey).encode('utf-8')).hexdigest()[:12]}", disabled=bool(_keep_err)):
+                            try:
+                                SUPA.table("bank_offset_overrides").upsert(
+                                    [{"bank_transaction_id": rid, "decision": "keep", "decided_by": "장현우"} for rid in g["id"]],
+                                    on_conflict="bank_transaction_id").execute()
+                                st.session_state["offset_flash"] = f"상쇄에서 뺐어요. {len(g)}건을 정상 거래로 집계에 반영했어요."
+                            except Exception as e:
+                                st.session_state["offset_flash"] = f"저장하지 못했어요 ({type(e).__name__}: {str(e)[:120]})"
+                            refresh()
                         st.divider()
                 if n_suspect:
-                    st.markdown("**애매한 중복 의심** (계좌+방향+금액+날짜는 같은데 적요나 시간이 다름) — 집계에는 그대로 포함되어 있고, 자동으로 지우지 않습니다. 직접 확인 후 필요하면 위 확실한 중복처럼 개별적으로 지워주세요.")
+                    st.markdown(f"**애매한 상쇄 의심** (같은 날·같은 금액의 입금과 출금이 있는데 시간 차이가 {OFFSET_WINDOW_MIN}분보다 크거나 시각을 몰라서 짝을 못 지었어요) — 집계에는 그대로 포함되어 있고, "
+                                "아래 거래는 **'미분류만 보기' 목록에도 자동으로 함께 나와서** 계정과목을 다시 확인·분류할 수 있어요. "
+                                "정상이면 '✅ 정상'을 눌러 이 의심 표시에서 빼세요. (지우지 않아요)")
+                    if st.button(f"✅ 애매한 의심 {n_suspect}건 모두 정상으로 표시", key="bulk_normal_suspect", disabled=bool(_keep_err)):
+                        _mark_normal(bank_df.loc[bank_df["is_dup_suspect"], "id"].tolist(), "애매한 의심 전체")
                     for gkey, g in bank_df[bank_df["is_dup_suspect"]].groupby("dup_group"):
                         for _, row in g.sort_values("txn_date").iterrows():
                             d = row["txn_date"].strftime("%Y-%m-%d") if pd.notna(row["txn_date"]) else "-"
-                            dc1, dc2 = st.columns([5, 1])
-                            dc1.write(f"⚠️ · {'입금' if row['direction']=='in' else '출금'} · {d} · ₩{row['amount']:,.0f} · {row['description'] or ''}")
-                            if dc2.button("삭제", key=f"delsus_{row['id']}"):
-                                SUPA.table("bank_transactions").delete().eq("id", row["id"]).execute()
-                                st.success("삭제 완료"); refresh()
+                            tm = row["txn_datetime"].strftime("%H:%M:%S") if ("txn_datetime" in g.columns and pd.notna(row["txn_datetime"])) else ""
+                            st.write(f"⚠️ · {'입금' if row['direction']=='in' else '출금'} · {d} {tm} · ₩{row['amount']:,.0f} · {row['description'] or ''}")
+                        if st.button("✅ 정상 — 이 거래들은 중복이 아니에요", key=f"normalgrp_{hashlib.md5(str(gkey).encode('utf-8')).hexdigest()[:12]}", disabled=bool(_keep_err)):
+                            _mark_normal(g["id"].tolist(), "정상 확인")
                         st.divider()
+                if _keep_ids:
+                    st.caption(f"'상쇄 아님'으로 정한 거래 {len(_keep_ids)}건 (자동 상쇄 판단에서 빠져 있어요)")
+                    if st.button("↩️ '상쇄 아님' 모두 취소 — 다시 자동 판단에 맡기기", key="reset_offset_keep"):
+                        try:
+                            SUPA.table("bank_offset_overrides").delete().in_("bank_transaction_id", list(_keep_ids)).execute()
+                            st.session_state["offset_flash"] = "'상쇄 아님'을 모두 취소했어요. 다시 자동으로 상쇄를 판단해요."
+                        except Exception as e:
+                            st.session_state["offset_flash"] = f"되돌리지 못했어요 ({type(e).__name__}: {str(e)[:120]})"
+                        refresh()
 
         show_only_unc = st.checkbox("미분류만 보기", value=True, key="bank_unc_only")
-        base = bank_df[~bank_df["is_dup_certain"]]  # 확실한 중복은 기본 목록에서 항상 숨김
-        b_show = base[base["account_category_id"].isna()] if show_only_unc else base
+        base = bank_df[~bank_df["is_dup_certain"]]  # 상쇄된 거래는 기본 목록에서 항상 숨김
+        b_show = base[base["account_category_id"].isna() | base["is_dup_suspect"]] if show_only_unc else base  # 애매한 중복도 분류 확인용으로 함께 보여준다
         b_show = b_show.sort_values("txn_date", ascending=False)
+        if n_suspect:
+            st.caption(f"⚠️ 같은 날·같은 금액의 입금/출금(애매한 의심 {n_suspect}건)도 계정과목을 확인할 수 있게 이 목록에 함께 나와요. 정상이면 각 줄의 '✅ 정상'을 눌러 빼세요.")
         st.caption(f"{len(b_show)}건 · ⚠️ 여기서 재연결하면 송금캘린더의 매칭(완료 상태)에도 즉시 반영됩니다 — 신중하게 사용하세요.")
         cat_opts = ["(선택 안함)"] + list(cat_name_to_id.keys())
         for _, row in b_show.head(150).iterrows():
@@ -479,13 +547,16 @@ elif menu == "🔗 전체 매칭 현황":
                     mb = row["matched_brand"] if pd.notna(row["matched_brand"]) else "-"
                     mt = row["matched_title"] if pd.notna(row["matched_title"]) else ""
                     match_info = f"🔗 매칭됨: {mb} · {mt}"
-                sus = " · ⚠️중복의심" if row["is_dup_suspect"] else ""
+                sus = " · ⚠️같은 날 같은 금액의 반대 거래 있음(확인)" if row["is_dup_suspect"] else ""
                 xfer = " · 🔁내부이체" if row["cat_type"] == "transfer" else ""
                 bsflag = " · 🏦재무상태표항목" if row["cat_type"] == "balance_sheet" else ""
                 d = row["txn_date"].strftime("%Y-%m-%d") if pd.notna(row["txn_date"]) else "-"
                 rc1.markdown(f"**{'입금' if row['direction']=='in' else '출금'}** · {d} · ₩{row['amount']:,.0f}\n\n{row['description'] or ''}  {match_info}{sus}{xfer}{bsflag}")
                 cur_idx = cat_opts.index(row["cat_name"]) if row["cat_name"] in cat_opts else 0
                 chosen = rc2.selectbox("계정과목", options=cat_opts, index=cur_idx, key=f"bankcat_{row['id']}", label_visibility="collapsed")
+                if row["is_dup_suspect"] and rc3.button("✅ 정상", key=f"normal_{row['id']}", disabled=bool(_keep_err),
+                                                        help="같은 날 같은 금액이지만 별개의 정상 거래예요 — 이 의심 표시에서 빼요"):
+                    _mark_normal(bank_df.loc[bank_df["dup_group"] == row["dup_group"], "id"].tolist(), "정상 확인")
                 if rc3.button("저장", key=f"bankassign_{row['id']}"):
                     new_val = cat_name_to_id.get(chosen) if chosen != "(선택 안함)" else None
                     SUPA.table("bank_transactions").update({"account_category_id": new_val}).eq("id", row["id"]).execute()
