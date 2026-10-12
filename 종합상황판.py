@@ -18,6 +18,7 @@ NAV = {
     ],
     "CFO · Finance & IR": [
         st.Page("pages/17_수금관리.py", title="Receivables", icon="💰", url_path="receivables"),
+        st.Page("pages/18_캠페인마진.py", title="Campaign Margin", icon="📈", url_path="campaign-margin"),
         st.Page("pages/9_재무캘린더.py", title="Finance Calendar", icon="💹", url_path="finance"),
     ],
     "COO · People & Automation": [
