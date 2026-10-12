@@ -1,0 +1,30 @@
+# .github/workflows/check.yml
+# 푸시/PR 때마다 자동으로: (1) 파이썬 문법 체크 (2) 비밀키가 코드에 박혀있는지 검사
+# 실패하면 GitHub에서 빨간 X가 떠서, 배포 전에 바로 알 수 있어요.
+name: check
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 파이썬 문법 체크
+        run: python -m compileall -q .
+
+      - name: 비밀키가 코드에 들어있는지 검사
+        run: |
+          if grep -rIn --exclude-dir=.git --exclude-dir=.github -e "sk-ant-" -e "eyJhbGciOi" . ; then
+            echo "::error::API 키/토큰으로 보이는 문자열이 코드에 있습니다. 환경변수로 옮겨주세요."
+            exit 1
+          fi
+          echo "비밀키 패턴 없음 ✅"
