@@ -1,0 +1,90 @@
+"""은행거래 공통 계산 (재무캘린더·부가세 신고 준비가 함께 쓴다). streamlit 에 의존하지 않는다.
+
+'상쇄' 규칙(10/12 대표 정정): 같은 계좌·같은 날·같은 금액의 입금과 출금이 몇 분 안에 짝을 이루면 결제 ↔ 취소로 본다.
+"""
+import pandas as pd
+
+OFFSET_WINDOW_MIN = 10   # 입금·출금이 이 분 안에 있어야 '결제 ↔ 취소' 상쇄로 본다
+
+
+def mark_duplicates(df, keep_ids=None, offset_ids=None):
+    """'상쇄' = 같은 계좌에서 같은 날, 같은 금액의 입금과 출금이 몇 분 차이로 짝을 이룬 것 (결제 ↔ 취소/환불). (DB는 안 바꾸고 화면용 플래그만 계산)
+    - is_dup_certain(=상쇄): 계좌+금액+날짜가 같고 방향이 반대(입금↔출금)이며 거래 시각 차이가 OFFSET_WINDOW_MIN분 이하인 쌍.
+        가장 가까운 것끼리 1:1로 짝지어 둘 다 집계에서 뺀다. 짝이 없는 거래는 그대로 반영된다.
+    - is_dup_suspect(=애매): 같은 날·같은 금액의 입금/출금이 있는데 시간 차이가 크거나 시각을 몰라서 짝을 못 지은 거래 → 집계에는 포함, 화면에 표시만
+    - 같은 방향(출금/출금, 입금/입금)끼리는 상쇄가 아니다. (같은 거래의 이중 입력은 dedup_hash 가 이미 막는다)
+    - keep_ids: 대표님이 '상쇄 아님(별개 거래)'으로 정한 거래 id → 자동 판단에서 완전히 뺀다
+    - offset_ids: 대표님이 '상쇄 확정(재무 미반영)'으로 일괄처리한 거래 id → 상쇄로 고정(offset_confirmed=True). 자동 짝지음에서도 뺀다
+    - offset_pair: 자동으로 짝지어진 두 거래가 같은 값을 갖는 쌍 키(일괄처리 화면에서 '한 쌍 = 한 줄'로 보여주는 데 씀), pair_gap_min: 두 거래 시간 차(분)
+    """
+    df = df.copy()
+    keep_ids = keep_ids or set()
+    offset_ids = offset_ids or set()
+    df["is_dup_certain"] = False
+    df["is_dup_suspect"] = False
+    df["dup_group"] = None
+    df["offset_kept"] = df["id"].isin(keep_ids)
+    df["offset_confirmed"] = df["id"].isin(offset_ids)
+    df["offset_pair"] = None
+    df["pair_gap_min"] = None
+    if df.empty:
+        return df
+    ts = pd.to_datetime(df["txn_datetime"], errors="coerce", utc=True, format="mixed") if "txn_datetime" in df.columns else pd.Series(pd.NaT, index=df.index)
+    pool = df[~df["offset_kept"] & ~df["offset_confirmed"]]
+    for gkey, g in pool.groupby(["account_label", "amount", "txn_date"], dropna=True):
+        ins, outs = g.index[g["direction"] == "in"], g.index[g["direction"] == "out"]
+        if len(ins) == 0 or len(outs) == 0:
+            continue
+        cand = sorted(
+            (abs((ts[i] - ts[o]).total_seconds()), i, o)
+            for i in ins for o in outs if pd.notna(ts[i]) and pd.notna(ts[o])
+        )
+        used, matched = set(), []
+        for gap, i, o in cand:
+            if gap > OFFSET_WINDOW_MIN * 60:
+                break
+            if i in used or o in used:
+                continue
+            used.update((i, o)); matched += [i, o]
+            key = "|".join(sorted([str(df.at[i, "id"]), str(df.at[o, "id"])]))
+            df.at[i, "offset_pair"] = key; df.at[o, "offset_pair"] = key
+            df.at[i, "pair_gap_min"] = round(gap / 60, 1); df.at[o, "pair_gap_min"] = round(gap / 60, 1)
+        left_in = [i for i in ins if i not in used]
+        left_out = [o for o in outs if o not in used]
+        if matched:
+            df.loc[matched, "is_dup_certain"] = True
+        if left_in and left_out:   # 같은 날·같은 금액인데 짝을 못 지은 입금/출금 → 애매
+            df.loc[left_in + left_out, "is_dup_suspect"] = True
+        if matched or (left_in and left_out):   # 화면에서 한 묶음으로 보이게(짝 없는 거래도 '남음'으로 함께 표시)
+            df.loc[g.index, "dup_group"] = str(gkey)
+    df.loc[df["offset_confirmed"], "is_dup_certain"] = True   # 대표님이 확정한 상쇄는 항상 상쇄
+    return df
+
+
+def add_confirm_state(df):
+    """은행거래 한 줄마다 '확정/미확정'과 미확정 이유를 붙인다(재무 화면의 '확정만 / 미확정 포함' 보기와 재무 미션이 쓴다).
+    · 확정 = 대표님이 직접 분류했거나(자동분류 아님) 대표님이 일괄처리로 확정한 상쇄. 정리할 문제(상쇄 확인·애매 의심)가 남아 있지 않은 것.
+    · 미확정 이유: 분류 필요(미분류) / 자동분류 확인(소액 자동분류) / 상쇄 확인(자동 짝지음, 아직 일괄처리 전) / 애매 확인(같은 날 같은 금액의 반대 거래)
+    미확정이어도 숫자에는 그대로 반영한다(대표님 요청: 미루면 부정확해지는 것보다 '미확정이지만 다 반영된 표')."""
+    d = df.copy()
+    if d.empty:
+        d["confirm_state"] = []
+        d["pending_reason"] = []
+        return d
+    auto = d["is_auto_categorized"].fillna(False).astype(bool) if "is_auto_categorized" in d.columns else pd.Series(False, index=d.index)
+    uncategorized = d["account_category_id"].isna()
+    pend_off = d["is_dup_certain"] & ~d["offset_confirmed"]
+    reason = pd.Series("", index=d.index)
+    reason = reason.mask(auto & ~uncategorized, "자동분류 확인")
+    reason = reason.mask(uncategorized & ~d["is_dup_certain"], "분류 필요")
+    reason = reason.mask(d["is_dup_suspect"], "애매 확인")
+    reason = reason.mask(pend_off, "상쇄 확인")
+    d["pending_reason"] = reason
+    d["confirm_state"] = reason.map(lambda r: "미확정" if r else "확정")
+    return d
+
+
+def parse_txn_datetime(series):
+    """은행마다 거래시각 표기가 다르다(SC제일 '2025.10.07 12:42:04' / 기업 '2025-11-19 14:21:23').
+    첫 줄 형식으로 통째로 읽으면 나머지가 빈 값이 되므로 형식을 섞어서 읽는다."""
+    return pd.to_datetime(series.astype("string").str.replace(".", "-", regex=False), errors="coerce", format="mixed")
