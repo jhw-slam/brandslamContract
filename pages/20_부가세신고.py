@@ -8,7 +8,7 @@ import streamlit as st
 from supabase import create_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 레포 루트의 bank_common.py / vat_package.py
-from bank_common import OFFSET_WINDOW_MIN, mark_duplicates, parse_txn_datetime
+from bank_common import OFFSET_WINDOW_MIN, apply_internal_rule, mark_duplicates, parse_txn_datetime
 from vat_package import (PERIODS, build_account_workbook, build_zip, default_period, find_date_gaps, period_deadline,
                          period_range, prepare_ledger)
 import drive_upload as du
@@ -104,6 +104,7 @@ def to_bank_df(rows, cats, keep_ids):
     df["txn_datetime"] = parse_txn_datetime(df["txn_datetime"])
     df["cat_name"] = df["account_category_id"].map(lambda x: cat_by_id.get(x, {}).get("name", "미분류"))
     df["cat_type"] = df["account_category_id"].map(lambda x: cat_by_id.get(x, {}).get("type"))
+    df = apply_internal_rule(df, cats)   # 회사 이름이 적힌 거래 = 내부이체
     return mark_duplicates(df, keep_ids)
 
 

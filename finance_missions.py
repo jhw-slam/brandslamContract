@@ -114,7 +114,7 @@ def fetch_all(SUPA, table, cols, order=None, page=1000):
 def build_state(SUPA):
     """대표 화면(Command Center 등)이 쓰는 재무 미션 요약. 반환 {"missions": [...], "pct_amount", "pct_n", "pending_n", "total_n", "error"}.
     읽지 못하면 error 문구만 채워 돌려준다(화면이 이유를 보여주고 죽지 않게)."""
-    from bank_common import add_confirm_state, mark_duplicates, parse_txn_datetime
+    from bank_common import add_confirm_state, apply_internal_rule, mark_duplicates, parse_txn_datetime
     try:
         cats = SUPA.table("fin_account_categories").select("id,code,name,type").execute().data
         rows = fetch_all(SUPA, "bank_transactions",
@@ -134,7 +134,7 @@ def build_state(SUPA):
         df["txn_date"] = pd.to_datetime(df["txn_date"], errors="coerce")
         df["txn_datetime"] = parse_txn_datetime(df["txn_datetime"])
         df["cat_name"] = df["account_category_id"].map(lambda x: cat_by_id.get(x, {}).get("name", "미분류"))
-        df = add_confirm_state(mark_duplicates(df, keep, off))
+        df = add_confirm_state(mark_duplicates(apply_internal_rule(df, cats), keep, off))
     tax_unc = ev_unc = 0
     try:
         tax_unc = SUPA.table("tax_invoices").select("approval_no", count="exact").is_("account_category_id", "null").eq("canceled", False).execute().count or 0

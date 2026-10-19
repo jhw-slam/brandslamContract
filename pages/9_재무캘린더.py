@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 레포 루트의 expense_breakdown.py
 from expense_breakdown import group_merchants, proposal_summary
 from finance_missions import NONE_LABEL as M_NONE, PAGE as M_PAGE, compute_missions, merchant_groups, pending_pairs, suspect_groups
-from bank_common import OFFSET_WINDOW_MIN, add_confirm_state, mark_duplicates, parse_txn_datetime
+from bank_common import OFFSET_WINDOW_MIN, add_confirm_state, apply_internal_rule, mark_duplicates, parse_txn_datetime
 
 st.set_page_config(page_title="재무캘린더", layout="wide")
 
@@ -274,6 +274,7 @@ if not bank_df.empty:
     bank_df["matched_title"] = bank_df["matched_cash_event_id"].map(
         lambda x: (events_by_id.get(x, {}).get("title") if pd.notna(x) else None)
     )
+    bank_df = apply_internal_rule(bank_df, categories)   # 회사 이름이 적힌 입금·출금 = 내부이체(매출 아님)
     bank_df = add_confirm_state(mark_duplicates(bank_df, _keep_ids, _offset_ids))
 
 # 집계(대시보드/손익계산서)는 '상쇄(결제↔취소)'된 거래를 제외한 버전을 쓴다 — 실제 매칭/태깅 리스트는 원본(bank_df)을 그대로 보여줌
@@ -498,11 +499,12 @@ elif menu == "📊 대시보드":
     fc_overdue_cnt = sum(1 for f in open_fc if pd.Timestamp(f["expected_date"]) < today)
 
     m1, m2, m3, m4, m5 = st.columns(5)
-    paid_in_month = bank_df_clean[(bank_df_clean["direction"] == "in") & (bank_df_clean["txn_date"].dt.strftime("%Y-%m") == this_month)]["amount"].sum()
-    paid_out_month = bank_df_clean[(bank_df_clean["direction"] == "out") & (bank_df_clean["txn_date"].dt.strftime("%Y-%m") == this_month)]["amount"].sum()
+    _ops = bank_df_clean[bank_df_clean["cat_type"] != "transfer"]   # 계좌간 이동(내부이체)은 입출금 합계에서 뺀다 — 안 빼면 입금·출금이 같은 금액만큼 부풀어요
+    paid_in_month = _ops[(_ops["direction"] == "in") & (_ops["txn_date"].dt.strftime("%Y-%m") == this_month)]["amount"].sum()
+    paid_out_month = _ops[(_ops["direction"] == "out") & (_ops["txn_date"].dt.strftime("%Y-%m") == this_month)]["amount"].sum()
 
-    m1.metric("이번달 입금(실제)", f"₩{paid_in_month:,.0f}")
-    m2.metric("이번달 출금(실제)", f"₩{paid_out_month:,.0f}")
+    m1.metric("이번달 입금(실제, 내부이체 제외)", f"₩{paid_in_month:,.0f}")
+    m2.metric("이번달 출금(실제, 내부이체 제외)", f"₩{paid_out_month:,.0f}")
     m3.metric("이번달 순현금흐름", f"₩{paid_in_month - paid_out_month:,.0f}")
     m4.metric("예상 입금(직원신고, 미해결)", f"₩{fc_in_total:,.0f}", delta=f"기한지남 {fc_overdue_cnt}건" if fc_overdue_cnt else None, delta_color="inverse")
     m5.metric("예상 출금(직원신고, 미해결)", f"₩{fc_out_total:,.0f}")
@@ -675,9 +677,10 @@ elif menu == "📊 대시보드":
                             load_cash_forecasts.clear(); st.rerun()
 
     st.divider()
-    st.subheader("🗓️ 월별 요약 (은행거래 실제 기준, 상쇄 제외)")
-    bank_df_clean["month"] = bank_df_clean["txn_date"].dt.to_period("M").astype(str)
-    monthly = bank_df_clean.groupby(["month", "direction"])["amount"].sum().unstack(fill_value=0)
+    st.subheader("🗓️ 월별 요약 (은행거래 실제 기준, 상쇄·내부이체 제외)")
+    _ops_m = bank_df_clean[bank_df_clean["cat_type"] != "transfer"].copy()   # 내부이체 제외
+    _ops_m["month"] = _ops_m["txn_date"].dt.to_period("M").astype(str)
+    monthly = _ops_m.groupby(["month", "direction"])["amount"].sum().unstack(fill_value=0)
     if not monthly.empty:
         monthly = monthly.rename(columns={"in": "입금", "out": "출금"})
         for col in ["입금", "출금"]:

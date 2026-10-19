@@ -2,6 +2,8 @@
 
 '상쇄' 규칙(10/12 대표 정정): 같은 계좌·같은 날·같은 금액의 입금과 출금이 몇 분 안에 짝을 이루면 결제 ↔ 취소로 본다.
 """
+import unicodedata
+
 import pandas as pd
 
 OFFSET_WINDOW_MIN = 10   # 입금·출금이 이 분 안에 있어야 '결제 ↔ 취소' 상쇄로 본다
@@ -88,3 +90,39 @@ def parse_txn_datetime(series):
     """은행마다 거래시각 표기가 다르다(SC제일 '2025.10.07 12:42:04' / 기업 '2025-11-19 14:21:23').
     첫 줄 형식으로 통째로 읽으면 나머지가 빈 값이 되므로 형식을 섞어서 읽는다."""
     return pd.to_datetime(series.astype("string").str.replace(".", "-", regex=False), errors="coerce", format="mixed")
+
+
+# ── 회사 자기 이름이 적요에 있으면 '내부 자금이동'(10/19 대표 지시: 브랜드슬램으로 입금된 것은 매출이 아니라 내부이체) ──
+INTERNAL_NAME = "브랜드슬"      # 은행이 이름을 앞 몇 글자만 줘서('기업－（주）브랜드슬') '브랜드슬'까지만 본다
+INTERNAL_CODE = "TRANSFER_INTERNAL"
+
+
+def is_internal_desc(desc):
+    """적요에 우리 회사 이름이 있으면 True. 전각 문자(（주）·－)는 반각으로 바꿔서 본다."""
+    return INTERNAL_NAME in unicodedata.normalize("NFKC", str(desc or "")).replace(" ", "")
+
+
+def apply_internal_rule(df, cats):
+    """회사 이름이 적힌 거래(입금·출금 모두)를 '계좌간 자금이동(내부이체)'으로 본다 → 매출·비용에 안 들어가고 손익계산서에서 빠진다.
+    · DB는 바꾸지 않는다(화면 계산용). 이미 대표님이 다른 계정과목으로 확정한 거래는 건드리지 않는다(미분류·자동분류만 바꿈).
+    · DB 트리거(trg_auto_tag_internal_transfer)는 적요가 '주식회사브랜드슬램'과 정확히 같을 때만 분류하므로, 그 밖의 표기(은행이 줄여 준 이름 등)를 여기서 보완한다.
+    반환: 같은 DataFrame(복사본) + rule_internal 컬럼"""
+    d = df.copy()
+    d["rule_internal"] = False
+    if d.empty:
+        return d
+    tcat = next((c for c in cats if c.get("code") == INTERNAL_CODE), None)
+    if not tcat:
+        return d
+    mask = d["description"].map(is_internal_desc)
+    auto = d["is_auto_categorized"].fillna(False).astype(bool) if "is_auto_categorized" in d.columns else pd.Series(False, index=d.index)
+    target = mask & (d["account_category_id"].isna() | auto)
+    d.loc[target, "account_category_id"] = tcat["id"]
+    if "cat_name" in d.columns:
+        d.loc[target, "cat_name"] = tcat["name"]
+    if "cat_type" in d.columns:
+        d.loc[target, "cat_type"] = tcat.get("type", "transfer")
+    if "is_auto_categorized" in d.columns:
+        d.loc[target, "is_auto_categorized"] = False
+    d.loc[target, "rule_internal"] = True
+    return d

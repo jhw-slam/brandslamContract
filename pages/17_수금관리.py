@@ -8,6 +8,7 @@ import streamlit as st
 from supabase import create_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 레포 루트의 ceo_common.py 를 어디서 실행해도 찾게
+from bank_common import is_internal_desc
 from ceo_common import CHECK_EVERY_DAYS, STATUS_LABEL, build_receivables, summarize, to_date
 
 st.set_page_config(page_title="Receivables", layout="wide")
@@ -191,8 +192,8 @@ with tab_dep:
     rows = []
     for r in dep["rows"]:
         cat = dep["cats"].get(r.get("account_category_id"))
-        if hide_transfer and cat and cat.get("type") == "transfer":
-            continue
+        if hide_transfer and ((cat and cat.get("type") == "transfer") or is_internal_desc(r.get("description"))):
+            continue   # 분류가 내부이체이거나, 적요에 우리 회사 이름이 있으면(아직 분류 전이어도) 내부이체로 본다
         matched = bool(r.get("matched_cash_event_id"))
         ev = dep["evs"].get(r.get("matched_cash_event_id")) or {}
         brand = (dep["projs"].get(ev.get("project_id")) or {}).get("brand") or ""
