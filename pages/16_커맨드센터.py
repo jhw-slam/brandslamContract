@@ -9,6 +9,7 @@ from supabase import create_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 레포 루트의 ceo_common.py 를 어디서 실행해도 찾게
 from ceo_common import STATUS_LABEL, build_receivables, summarize
+from finance_missions import build_state as build_finance_state
 
 st.set_page_config(page_title="Command Center", layout="wide")
 
@@ -474,6 +475,29 @@ camps = ops["camp"]
 camp_contract = sum(1 for c in camps if c.get("contract_url"))
 camp_invoice = [c for c in camps if c.get("invoice_amount") is not None]
 camp_invoice_sum = sum(float(c.get("invoice_amount") or 0) for c in camp_invoice)
+
+@st.cache_data(ttl=60)
+def load_finance_missions():
+    return build_finance_state(SUPA)
+
+
+# ── 재무 미션 (미뤄진 재무 정리를 시간 날 때 처리) ───────────────────
+fm = load_finance_missions()
+st.markdown("### 💼 재무 미션")
+if fm.get("error"):
+    st.caption(f"재무 미션을 계산하지 못했어요 ({fm['error']})")
+elif not fm["missions"]:
+    st.success("🎉 처리할 재무 미션이 없어요. 모든 거래가 확정됐어요.")
+else:
+    st.progress(min(fm["pct_amount"], 1.0), text=f"재무 확정 완성도 — 금액 {fm['pct_amount'] * 100:.0f}% · 건수 {fm['pct_n'] * 100:.0f}% (미확정 {fm['pending_n']:,}건). 미확정도 숫자에는 반영돼 있어요.")
+    mcols = st.columns(len(fm["missions"]))
+    for mc, m in zip(mcols, fm["missions"]):
+        unit = "쌍" if m["id"] == "offset" else ("건" if m["id"] in ("tax", "event") else "곳")
+        mc.metric(f"{m['icon']} {m['title']}", f"{m['count']:,}{unit}", help=m["hint"])
+    try:
+        st.page_link("pages/9_재무캘린더.py", label="🎯 재무 미션 하러 가기 (CFO › Finance Calendar)")
+    except Exception:
+        pass
 
 st.markdown("### 💰 받을 돈 · 계약예정")
 m1, m2 = st.columns(2)

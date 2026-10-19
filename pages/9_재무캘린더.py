@@ -16,7 +16,8 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 레포 루트의 expense_breakdown.py
 from expense_breakdown import group_merchants, proposal_summary
-from bank_common import OFFSET_WINDOW_MIN, mark_duplicates, parse_txn_datetime
+from finance_missions import NONE_LABEL as M_NONE, PAGE as M_PAGE, compute_missions, merchant_groups, pending_pairs, suspect_groups
+from bank_common import OFFSET_WINDOW_MIN, add_confirm_state, mark_duplicates, parse_txn_datetime
 
 st.set_page_config(page_title="재무캘린더", layout="wide")
 
@@ -144,7 +145,7 @@ def load_all():
     projects = SUPA.table("projects").select("id,brand,campaign").execute().data
     bank_txns = _fetch_all(
         "bank_transactions",
-        "id,direction,amount,txn_date,txn_datetime,description,matched_cash_event_id,account_label,account_category_id,created_at,dedup_hash",
+        "id,direction,amount,txn_date,txn_datetime,description,matched_cash_event_id,account_label,account_category_id,created_at,dedup_hash,is_auto_categorized",
         "txn_date")
     tax_invs = SUPA.table("tax_invoices").select(
         "approval_no,write_date,issue_date,buyer_biz_no,buyer_name,total_amount,supply_amount,vat,kind,"
@@ -155,12 +156,15 @@ def load_all():
 
 @st.cache_data(ttl=45)
 def load_offset_keep():
-    """대표님이 '상쇄 아님(별개 거래)'으로 정한 은행거래 id 집합. 테이블이 아직 없으면 빈 집합(자동 상쇄만 동작)."""
+    """대표님의 상쇄 결정. 반환 (상쇄 아님=정상 거래 id 집합, 상쇄 확정 id 집합, 에러문구).
+    테이블이 아직 없으면 빈 집합(자동 상쇄만 동작). 'offset' 값은 migrations/20261019_bank_offset_confirm.sql 적용 뒤에 저장할 수 있다."""
     try:
-        rows = SUPA.table("bank_offset_overrides").select("bank_transaction_id").eq("decision", "keep").execute().data
-        return {r["bank_transaction_id"] for r in rows}, None
+        rows = SUPA.table("bank_offset_overrides").select("bank_transaction_id,decision").execute().data
+        keep = {r["bank_transaction_id"] for r in rows if r.get("decision") == "keep"}
+        off = {r["bank_transaction_id"] for r in rows if r.get("decision") == "offset"}
+        return keep, off, None
     except Exception as e:
-        return set(), f"{type(e).__name__}: {str(e)[:120]}"
+        return set(), set(), f"{type(e).__name__}: {str(e)[:120]}"
 
 
 @st.cache_data(ttl=45)
@@ -254,7 +258,7 @@ if not ev_df.empty:
 
 
 
-_keep_ids, _keep_err = load_offset_keep()
+_keep_ids, _offset_ids, _keep_err = load_offset_keep()
 bank_df = pd.DataFrame(bank_txns)
 if not bank_df.empty:
     bank_df["amount"] = pd.to_numeric(bank_df["amount"], errors="coerce").fillna(0)
@@ -270,10 +274,31 @@ if not bank_df.empty:
     bank_df["matched_title"] = bank_df["matched_cash_event_id"].map(
         lambda x: (events_by_id.get(x, {}).get("title") if pd.notna(x) else None)
     )
-    bank_df = mark_duplicates(bank_df, _keep_ids)
+    bank_df = add_confirm_state(mark_duplicates(bank_df, _keep_ids, _offset_ids))
 
 # 집계(대시보드/손익계산서)는 '상쇄(결제↔취소)'된 거래를 제외한 버전을 쓴다 — 실제 매칭/태깅 리스트는 원본(bank_df)을 그대로 보여줌
-bank_df_clean = bank_df[~bank_df["is_dup_certain"]].copy() if not bank_df.empty else bank_df
+bank_df_live = bank_df[~bank_df["is_dup_certain"]].copy() if not bank_df.empty else bank_df   # 숫자에 반영되는 거래(상쇄 제외)
+
+# ── 확정/미확정 보기 + 완성도 (10/19 대표 요청: 미뤄진 것이 있어도 숫자는 다 반영하고, 확정만 따로도 볼 수 있게) ──
+view_mode = "미확정 포함 (전부 반영)"
+if not bank_df.empty:
+    _uni = bank_df[~(bank_df["is_dup_certain"] & bank_df["offset_confirmed"])]   # 대표님이 확정한 상쇄를 뺀 '실제 거래' 전체
+    _conf = _uni[_uni["confirm_state"] == "확정"]
+    _pct_n = len(_conf) / max(len(_uni), 1)
+    _pct_a = _conf["amount"].sum() / max(_uni["amount"].sum(), 1)
+    t1, t2 = st.columns([2, 3])
+    view_mode = t1.radio("표시 기준", ["미확정 포함 (전부 반영)", "확정만"], horizontal=True, key="fin_view_mode",
+                         help="미확정 포함: 분류가 덜 됐거나 상쇄 확인 전인 거래도 숫자에 다 넣어요(상쇄로 보이는 쌍은 제외). 확정만: 대표님이 직접 확정한 거래만 보여요.")
+    t2.progress(min(_pct_a, 1.0), text=f"재무 확정 완성도 — 금액 {_pct_a * 100:.0f}% · 건수 {_pct_n * 100:.0f}% ({len(_conf):,}/{len(_uni):,}건)")
+    _pend = _uni[_uni["confirm_state"] == "미확정"]
+    if len(_pend):
+        _by = _pend.groupby("pending_reason").agg(n=("id", "count"), amt=("amount", "sum"))
+        st.caption("📋 아직 확정 전: " + " · ".join(f"**{r}** {int(x.n):,}건(₩{x.amt:,.0f})" for r, x in _by.sort_values("amt", ascending=False).iterrows())
+                   + " — 「🎯 재무 미션」 메뉴에서 빠르게 정리할 수 있어요.")
+bank_df_clean = bank_df_live.copy() if not bank_df.empty else bank_df
+if not bank_df.empty and view_mode == "확정만":
+    bank_df_clean = bank_df_live[bank_df_live["confirm_state"] == "확정"].copy()
+    st.info("🔒 지금은 **확정된 거래만** 보여줘요. 미확정을 포함한 전체 숫자는 위 '표시 기준'을 바꾸면 돼요.")
 
 tax_df = pd.DataFrame(tax_invs)
 if not tax_df.empty:
@@ -286,7 +311,7 @@ today = pd.Timestamp(date.today())
 this_month = today.strftime("%Y-%m")
 
 # ── 상단: 전체 미분류 현황 배너 ──────────────────────────────
-unc_bank = int((bank_df_clean["account_category_id"].isna()).sum()) if not bank_df.empty else 0
+unc_bank = int((bank_df_live["account_category_id"].isna()).sum()) if not bank_df.empty else 0
 unc_tax = int((tax_df["account_category_id"].isna()).sum()) if not tax_df.empty else 0
 unc_ev = int((ev_df["account_category_id"].isna()).sum()) if not ev_df.empty else 0
 total_unc = unc_bank + unc_tax + unc_ev
@@ -294,15 +319,9 @@ n_dup_certain = int(bank_df["is_dup_certain"].sum()) if not bank_df.empty else 0
 n_dup_suspect = int(bank_df["is_dup_suspect"].sum()) if not bank_df.empty else 0
 
 st.divider()
-if total_unc > 0:
-    st.warning(f"⚠️ 계정과목 미분류 항목이 총 **{total_unc}건** 있습니다 — 은행거래 {unc_bank} · 세금계산서 {unc_tax} · 송금일정 {unc_ev}  → **'전체 매칭 현황'** 또는 **'AI 계정과목 추천'** 탭에서 처리하세요.")
-else:
-    st.success("✅ 모든 항목이 계정과목으로 분류되어 있습니다.")
-if n_dup_certain or n_dup_suspect:
-    st.info(f"🧹 은행거래 상쇄·중복 — 상쇄 {n_dup_certain}건(입금↔출금 쌍, 둘 다 집계에서 제외됨) · 애매한 의심 {n_dup_suspect}건(집계에 포함, 분류 목록에 함께 표시) → 「전체 매칭 현황 > 은행거래내역」의 '상쇄 정리'에서 확인하세요.")
 
 menu = st.radio(
-    "메뉴", ["📊 대시보드", "🔗 전체 매칭 현황", "🤖 AI 계정과목 추천", "🏦 뱅크다 연동", "⚙️ 계정과목 설정", "📄 손익계산서", "📝 CFO 인사이트"],
+    "메뉴", ["🎯 재무 미션", "📊 대시보드", "🔗 전체 매칭 현황", "🤖 AI 계정과목 추천", "🏦 뱅크다 연동", "⚙️ 계정과목 설정", "📄 손익계산서", "📝 CFO 인사이트"],
     horizontal=True, label_visibility="collapsed",
 )
 st.divider()
@@ -311,7 +330,163 @@ st.divider()
 # ════════════════════════════════════════════════════════════
 # 📊 대시보드
 # ════════════════════════════════════════════════════════════
-if menu == "📊 대시보드":
+if menu == "🎯 재무 미션":
+    st.subheader("🎯 재무 미션 — 시간 날 때 하나씩")
+    st.caption("미루고 있던 일을 한곳에 모았어요. **미확정이어도 숫자에는 이미 반영돼 있고**, 여기서 처리하면 '확정'으로 바뀌어요. "
+               f"표에서 고르고 **저장은 한 번만** 누르세요(한 번에 {M_PAGE}줄). 처리한 줄은 목록에서 빠지고 다음 줄이 올라와요.")
+    if st.session_state.get("offset_flash"):
+        st.success(st.session_state.pop("offset_flash"))
+    _name_by_code = {c["code"]: c["name"] for c in categories}
+    _tax_unc = tax_df[tax_df["account_category_id"].isna() & ~tax_df["canceled"].fillna(False).astype(bool)] if not tax_df.empty else pd.DataFrame()
+    _unc_ev = int(ev_df["account_category_id"].isna().sum()) if not ev_df.empty else 0
+    _ms = compute_missions(bank_df, _name_by_code, len(_tax_unc), _unc_ev)
+    if not _ms:
+        st.success("🎉 지금 처리할 재무 미션이 없어요. 모든 거래가 확정됐어요.")
+    else:
+        _cols = st.columns(len(_ms))
+        for _c, _m in zip(_cols, _ms):
+            _c.metric(f"{_m['icon']} {_m['title']}", f"{_m['count']:,}" + ("쌍" if _m["id"] == "offset" else "건" if _m["id"] in ("tax", "event") else "곳" if _m["id"] in ("classify", "suspect") else ""),
+                      help=_m["hint"] + (f" · 관련 거래 {_m['rows']:,}건" if _m.get("rows") else ""))
+    if _keep_err:
+        st.warning(f"상쇄 결정 테이블(bank_offset_overrides)을 읽지 못했어요 ({_keep_err}). 상쇄 일괄처리 저장은 잠시 꺼져 있어요.")
+
+    def _save_decisions(items, label):
+        """items: [(거래 id 목록, 'offset' | 'keep')]. 한 번에 저장하고, 'offset' 허용 전이면 이유를 알려준다."""
+        rows_ = [{"bank_transaction_id": i, "decision": dec, "decided_by": "장현우"} for ids, dec in items for i in ids]
+        try:
+            SUPA.table("bank_offset_overrides").upsert(rows_, on_conflict="bank_transaction_id").execute()
+            n_off = sum(len(ids) for ids, dec in items if dec == "offset")
+            st.session_state["offset_flash"] = f"✅ {label}: 상쇄 확정 {n_off}건(재무 미반영, 기록만 보관) · 정상 거래 {len(rows_) - n_off}건을 저장했어요."
+            st.session_state["m_ver"] = st.session_state.get("m_ver", 0) + 1
+            refresh()
+        except Exception as e:
+            msg = str(e)
+            if "check" in msg.lower() or "23514" in msg:
+                st.error("❌ 아직 '상쇄 확정'을 저장할 수 없어요 — `migrations/20261019_bank_offset_confirm.sql`을 DB에 적용해야 해요. (적용 전에는 아무것도 저장되지 않았어요)")
+            else:
+                st.error(f"❌ 저장하지 못했어요 ({type(e).__name__}: {msg[:160]}) — 아무것도 저장되지 않았어요.")
+
+    _mv = st.session_state.get("m_ver", 0)
+
+    # ── 1) 상쇄 확인 ──
+    _pairs = pending_pairs(bank_df)
+    if _pairs:
+        with st.expander(f"🔁 상쇄 확인 — {len(_pairs)}쌍 (같은 날·같은 금액의 입금↔출금이 {OFFSET_WINDOW_MIN}분 안)", expanded=True):
+            st.caption("**기본으로 모두 '상쇄'에 체크돼 있어요.** 이상 없으면 그대로 아래 일괄처리만 누르세요. 상쇄가 아닌 특이한 건만 체크를 풀어주세요. "
+                       "체크된 쌍은 재무에 반영하지 않고(기록만 보관), 푼 쌍은 정상 거래로 남겨요. 데이터는 지우지 않아요.")
+            _pg = 1
+            if len(_pairs) > M_PAGE:
+                _pg = int(st.number_input(f"페이지 ({M_PAGE}쌍씩, 총 {-(-len(_pairs) // M_PAGE)}쪽)", min_value=1, max_value=-(-len(_pairs) // M_PAGE), value=1, step=1, key="m_pair_page"))
+                st.caption("⚠️ 저장하지 않고 페이지를 넘기면 이 페이지에서 바꾼 체크는 사라져요.")
+            _pv = _pairs[(_pg - 1) * M_PAGE: _pg * M_PAGE]
+            _pdf = pd.DataFrame({
+                "상쇄": [True] * len(_pv), "날짜": [p_["date"].strftime("%Y-%m-%d") for p_ in _pv], "계좌": [p_["account"] for p_ in _pv],
+                "금액": [f"₩{p_['amount']:,.0f}" for p_ in _pv], "출금 시각": [p_["out_time"] for p_ in _pv], "입금 시각": [p_["in_time"] for p_ in _pv],
+                "간격(분)": [p_["gap_min"] for p_ in _pv], "적요(출금 / 입금)": [f"{p_['out_desc']} / {p_['in_desc']}" for p_ in _pv],
+            }, index=[p_["key"] for p_ in _pv])
+            with st.form(f"m_pair_form_{_mv}"):
+                _ed = st.data_editor(_pdf, hide_index=True, use_container_width=True, key=f"m_pair_ed_{_mv}_{_pg}",
+                                     disabled=[c for c in _pdf.columns if c != "상쇄"],
+                                     column_config={"상쇄": st.column_config.CheckboxColumn("상쇄", help="체크=상쇄(재무 미반영) · 해제=정상 거래")})
+                _go = st.form_submit_button(f"✅ 이 {len(_pv)}쌍 일괄처리 (체크=상쇄 확정 · 해제=정상 거래)", type="primary", disabled=bool(_keep_err))
+            if _go:
+                _byk = {p_["key"]: p_ for p_ in _pv}
+                _save_decisions([(_byk[k]["ids"], "offset" if bool(_ed.loc[k, "상쇄"]) else "keep") for k in _ed.index], "상쇄 일괄처리")
+
+    # ── 2) 애매한 의심 ──
+    _sus = suspect_groups(bank_df)
+    if _sus:
+        with st.expander(f"⚠️ 애매한 의심 확인 — {len(_sus)}곳 (같은 날·같은 금액의 입금/출금인데 시간 차이가 커요)", expanded=not _pairs):
+            st.caption("**기본은 '정상 거래'(체크 해제)** 예요. 실제로 결제↔취소 상쇄인 것만 체크하세요. 저장하면 이 의심 표시가 사라져요.")
+            _sv = _sus[:M_PAGE]
+            _sdf = pd.DataFrame({
+                "상쇄": [False] * len(_sv), "날짜": [x["date"].strftime("%Y-%m-%d") for x in _sv], "계좌": [x["account"] for x in _sv],
+                "금액": [f"₩{x['amount']:,.0f}" for x in _sv], "출금 시각": [x["out_time"] for x in _sv], "입금 시각": [x["in_time"] for x in _sv],
+                "적요": [x["desc"] for x in _sv],
+            }, index=[x["key"] for x in _sv])
+            with st.form(f"m_sus_form_{_mv}"):
+                _sed = st.data_editor(_sdf, hide_index=True, use_container_width=True, key=f"m_sus_ed_{_mv}", disabled=[c for c in _sdf.columns if c != "상쇄"],
+                                      column_config={"상쇄": st.column_config.CheckboxColumn("상쇄", help="체크=상쇄(재무 미반영) · 해제=정상 거래")})
+                _sgo = st.form_submit_button(f"✅ 이 {len(_sv)}곳 일괄처리 (체크=상쇄 · 해제=정상 거래)", type="primary", disabled=bool(_keep_err))
+            if _sgo:
+                _bys = {x["key"]: x for x in _sv}
+                _save_decisions([(_bys[k]["ids"], "offset" if bool(_sed.loc[k, "상쇄"]) else "keep") for k in _sed.index], "애매한 의심 처리")
+
+    # ── 3) 계정과목 설정 필요 (거래처별) ──
+    _mg = merchant_groups(bank_df, _name_by_code)
+    if _mg:
+        with st.expander(f"🏷️ 계정과목 설정 필요 — 거래처 {len(_mg):,}곳 · 거래 {sum(g['n'] for g in _mg):,}건 (미분류 + 소액 자동분류)", expanded=not _pairs and not _sus):
+            st.caption("**거래처 하나를 고르면 그 거래처의 모든 거래에 적용돼요.** 금액이 큰 거래처부터 보여줘요. '제안대로'는 이름만 보고 짐작한 것이고, 확신이 높은 것만 미리 체크해 뒀어요 — "
+                       "나머지는 직접 고르거나, 제안이 맞다면 체크하세요. 고르지 않은 줄은 그대로 남아요. 대표님이 저장한 것은 '확정'으로 바뀌어요.")
+            _gp = 1
+            if len(_mg) > M_PAGE:
+                _gp = int(st.number_input(f"페이지 ({M_PAGE}곳씩, 총 {-(-len(_mg) // M_PAGE)}쪽)", min_value=1, max_value=-(-len(_mg) // M_PAGE), value=1, step=1, key="m_cls_page"))
+                st.caption("⚠️ 저장하지 않고 페이지를 넘기면 이 페이지에서 고른 값은 사라져요.")
+            _gv = _mg[(_gp - 1) * M_PAGE: _gp * M_PAGE]
+            _opts = [M_NONE] + list(cat_name_to_id.keys())
+            _conf_k = {"high": "높음", "medium": "보통", "low": "낮음"}
+            _gdf = pd.DataFrame({
+                "거래처(적요)": [g["merchant"] for g in _gv], "구분": ["입금" if g["direction"] == "in" else "출금" for g in _gv],
+                "건수": [g["n"] for g in _gv], "합계": [f"₩{g['total']:,.0f}" for g in _gv], "지금": [g["cur"] for g in _gv],
+                "제안(참고)": [((g["sug_name"] or ("카드대금 — 명세서 필요" if g["code"] == "CARD_BILL" else "—")) + (f" · 확신 {_conf_k.get(g['conf'], '-')}" if g["code"] else "")) for g in _gv],
+                "제안대로": [g["apply_default"] for g in _gv], "직접 선택": [M_NONE] * len(_gv),
+            }, index=[f"{g['direction']}|{g['merchant']}" for g in _gv])
+            with st.form(f"m_cls_form_{_mv}"):
+                _ged = st.data_editor(_gdf, hide_index=True, use_container_width=True, key=f"m_cls_ed_{_mv}_{_gp}", height=min(36 * (len(_gv) + 1) + 6, 760),
+                                      disabled=["거래처(적요)", "구분", "건수", "합계", "지금", "제안(참고)"],
+                                      column_config={"제안대로": st.column_config.CheckboxColumn("제안대로", help="체크하면 '제안(참고)'의 계정과목으로 저장돼요"),
+                                                     "직접 선택": st.column_config.SelectboxColumn("직접 선택 ▼", options=_opts, required=True, width="medium", help="고르면 제안보다 우선해요")})
+                _cgo = st.form_submit_button("💾 고른 거래처 저장 (여기서 저장돼요)", type="primary")
+            if _cgo:
+                _byg = {f"{g['direction']}|{g['merchant']}": g for g in _gv}
+                _plan, _n_rows, _n_grp, _amt = {}, 0, 0, 0.0
+                for k in _ged.index:
+                    g = _byg[k]
+                    manual = _ged.loc[k, "직접 선택"]
+                    target = cat_name_to_id.get(manual) if manual != M_NONE else (cat_name_to_id.get(g["sug_name"]) if (bool(_ged.loc[k, "제안대로"]) and g["sug_name"]) else None)
+                    if target:
+                        _plan.setdefault(target, []).extend(g["ids"]); _n_rows += g["n"]; _n_grp += 1; _amt += g["total"]
+                if not _plan:
+                    st.info("고르거나 체크한 거래처가 없어요. 계정과목을 정한 뒤 저장해주세요.")
+                else:
+                    try:
+                        for cid, ids in _plan.items():
+                            for i0 in range(0, len(ids), 100):
+                                SUPA.table("bank_transactions").update({"account_category_id": cid, "is_auto_categorized": False}).in_("id", ids[i0:i0 + 100]).execute()
+                        st.session_state["offset_flash"] = f"✅ 거래처 {_n_grp}곳 · 거래 {_n_rows:,}건(₩{_amt:,.0f})의 계정과목을 확정했어요."
+                        st.session_state["m_ver"] = _mv + 1
+                        refresh()
+                    except Exception as e:
+                        st.error(f"❌ 저장 중 오류 ({type(e).__name__}: {str(e)[:160]}) — 일부만 저장됐을 수 있으니 새로고침해서 확인해주세요.")
+
+    # ── 4) 세무항목 설정 필요 (세금계산서) ──
+    if len(_tax_unc):
+        with st.expander(f"🧾 세무항목 설정 필요 — 세금계산서 {len(_tax_unc)}건 (계정과목 미분류)", expanded=not (_pairs or _sus or _mg)):
+            st.caption("세금계산서마다 계정과목을 골라 한 번에 저장하세요. 취소된 계산서는 빠져 있어요.")
+            _tv = _tax_unc.sort_values("issue_date", ascending=False).head(M_PAGE)
+            _tdf = pd.DataFrame({"작성일": _tv["issue_date"].dt.strftime("%Y-%m-%d").tolist(), "거래처": _tv["buyer_name"].fillna("").tolist(),
+                                 "합계": _tv["total_amount"].map(lambda v: f"₩{v:,.0f}").tolist(), "계정과목": [M_NONE] * len(_tv)}, index=_tv["approval_no"].tolist())
+            with st.form(f"m_tax_form_{_mv}"):
+                _ted = st.data_editor(_tdf, hide_index=True, use_container_width=True, key=f"m_tax_ed_{_mv}", disabled=["작성일", "거래처", "합계"],
+                                      column_config={"계정과목": st.column_config.SelectboxColumn("계정과목 ▼", options=[M_NONE] + list(cat_name_to_id.keys()), required=True, width="medium")})
+                _tgo = st.form_submit_button("💾 고른 세금계산서 저장 (여기서 저장돼요)", type="primary")
+            if _tgo:
+                _chg = [(k, cat_name_to_id.get(_ted.loc[k, "계정과목"])) for k in _ted.index if _ted.loc[k, "계정과목"] != M_NONE]
+                if not _chg:
+                    st.info("고른 항목이 없어요.")
+                else:
+                    try:
+                        for ap, cid in _chg:
+                            SUPA.table("tax_invoices").update({"account_category_id": cid}).eq("approval_no", ap).execute()
+                        st.session_state["offset_flash"] = f"✅ 세금계산서 {len(_chg)}건의 계정과목을 저장했어요."
+                        st.session_state["m_ver"] = _mv + 1
+                        refresh()
+                    except Exception as e:
+                        st.error(f"❌ 저장하지 못했어요 ({type(e).__name__}: {str(e)[:160]})")
+    if _unc_ev:
+        st.info(f"📅 송금일정(cash_events) 중 계정과목이 비어 있는 것이 {_unc_ev}건 있어요 — 「🔗 전체 매칭 현황 › 송금일정」에서 분류하세요.")
+
+elif menu == "📊 대시보드":
     if bank_df.empty:
         st.info("은행거래 데이터가 없습니다.")
         st.stop()
@@ -335,7 +510,7 @@ if menu == "📊 대시보드":
     st.divider()
     if st.session_state.get("offset_flash"):
         st.success(st.session_state.pop("offset_flash"))
-    st.subheader("📊 계정과목별 현황 (은행거래 실제 기준, 상쇄 제외)")
+    st.subheader("📊 계정과목별 현황 (은행거래 실제 기준, 상쇄 제외" + (", 확정만)" if view_mode == "확정만" else ", 미확정 포함)"))
 
     period_choice = st.radio("기간", ["전체", "이번달", "이번분기"], horizontal=True, key="dash_period")
     if period_choice == "이번달":
@@ -783,7 +958,7 @@ elif menu == "🤖 AI 계정과목 추천":
     st.subheader("🤖 AI 계정과목 추천")
     st.caption("미분류 은행거래 내역을 Claude가 분석해서 계정과목을 추천합니다. 과거에 직접 분류해둔 사례도 함께 참고해서 추천해요. 검토 후 원하는 항목만 선택해서 일괄 등록하세요.")
 
-    unclassified_bank = bank_df_clean[bank_df_clean["account_category_id"].isna()].sort_values("txn_date", ascending=False) if not bank_df.empty else pd.DataFrame()
+    unclassified_bank = bank_df_live[bank_df_live["account_category_id"].isna()].sort_values("txn_date", ascending=False) if not bank_df.empty else pd.DataFrame()
 
     if unclassified_bank.empty:
         st.success("미분류 은행거래가 없습니다 👍")
@@ -885,7 +1060,7 @@ elif menu == "🤖 AI 계정과목 추천":
 
     if st.button("🤖 AI 추천 실행", type="primary"):
         with st.spinner("Claude가 거래 내역을 분석 중입니다..."):
-            fewshot_examples = build_fewshot_examples(bank_df_clean, cat_by_id)
+            fewshot_examples = build_fewshot_examples(bank_df_live, cat_by_id)
             biz_notes = load_business_notes()
             items, err = call_claude_suggest(batch, categories, fewshot_examples, biz_notes)
         if err:
