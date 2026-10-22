@@ -56,10 +56,7 @@ def main():
         import send_morning_checkin
         safe_run("send_morning_checkin", send_morning_checkin.main)
 
-    # 오후 4시대 (16:00~16:09)
-    if h == 16 and m < 10:
-        import send_afternoon_wrapup
-        safe_run("send_afternoon_wrapup", send_afternoon_wrapup.main)
+
 
     # KPI 맥락 정렬 — 하루 2번(9시대, 18시대)
     if (h == 9 or h == 18) and m < 10:
