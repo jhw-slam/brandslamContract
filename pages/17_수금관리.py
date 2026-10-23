@@ -192,13 +192,13 @@ with tab_dep:
     rows = []
     for r in dep["rows"]:
         cat = dep["cats"].get(r.get("account_category_id"))
-        if hide_transfer and ((cat and cat.get("type") == "transfer") or is_internal_desc(r.get("description"))):
-            continue   # 분류가 내부이체이거나, 적요에 우리 회사 이름이 있으면(아직 분류 전이어도) 내부이체로 본다
+        if hide_transfer and cat and cat.get("type") == "transfer":
+            continue
         matched = bool(r.get("matched_cash_event_id"))
         ev = dep["evs"].get(r.get("matched_cash_event_id")) or {}
         brand = (dep["projs"].get(ev.get("project_id")) or {}).get("brand") or ""
         rows.append({"입금일": str(r["txn_date"])[:10], "입금자/적요": r.get("description") or "-", "금액": float(r.get("amount") or 0),
-                     "계좌": r.get("account_label") or "", "계정과목": cat["name"] if cat else "분류 전",
+                     "계좌": r.get("account_label") or "", "계정과목": cat["name"] if cat else ("분류 전 · 회사 이름 — 내부이체인지 확인" if is_internal_desc(r.get("description")) else "분류 전"),
                      "매칭": f"✅ {brand} {ev.get('title') or ''}".strip() if matched else "⚠️ 미매칭", "_m": matched})
     shown = [x for x in rows if view == "전체" or (view == "미매칭만" and not x["_m"]) or (view == "매칭됨만" and x["_m"])]
     un = [x for x in rows if not x["_m"]]

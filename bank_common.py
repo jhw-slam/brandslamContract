@@ -102,21 +102,44 @@ def is_internal_desc(desc):
     return INTERNAL_NAME in unicodedata.normalize("NFKC", str(desc or "")).replace(" ", "")
 
 
-def apply_internal_rule(df, cats):
-    """회사 이름이 적힌 거래(입금·출금 모두)를 '계좌간 자금이동(내부이체)'으로 본다 → 매출·비용에 안 들어가고 손익계산서에서 빠진다.
-    · DB는 바꾸지 않는다(화면 계산용). 이미 대표님이 다른 계정과목으로 확정한 거래는 건드리지 않는다(미분류·자동분류만 바꿈).
-    · DB 트리거(trg_auto_tag_internal_transfer)는 적요가 '주식회사브랜드슬램'과 정확히 같을 때만 분류하므로, 그 밖의 표기(은행이 줄여 준 이름 등)를 여기서 보완한다.
-    반환: 같은 DataFrame(복사본) + rule_internal 컬럼"""
+def internal_pairing(df):
+    """회사 이름이 적힌 거래(입금·출금)마다 '반대편 거래'(같은 금액·반대 방향·하루 안)가 데이터에 있는지 본다.
+    내부이체라면 보내는 쪽 출금과 받는 쪽 입금이 짝으로 보여야 한다(10/22 대표: 보내는 사람·받는 사람이 모두 브랜드슬램).
+    반환: internal_name(회사 이름 적힘) · internal_pair('다른 계좌' / '같은 계좌' / '짝 없음' / '')"""
     d = df.copy()
+    d["internal_name"] = d["description"].map(is_internal_desc) if not d.empty else pd.Series(dtype=bool)
+    d["internal_pair"] = ""
+    if d.empty or not d["internal_name"].any():
+        return d
+    sub = d[d["internal_name"]].copy()
+    sub["_day"] = pd.to_datetime(sub["txn_date"], errors="coerce")   # 문자열로 들어와도 날짜로 비교
+    for amt, g in sub.groupby("amount"):
+        for idx, r in g.iterrows():
+            opp = g[(g["direction"] != r["direction"]) & ((g["_day"] - r["_day"]).abs() <= pd.Timedelta(days=1))]
+            if opp.empty:
+                d.at[idx, "internal_pair"] = "짝 없음"
+            elif (opp["account_label"] != r["account_label"]).any():
+                d.at[idx, "internal_pair"] = "다른 계좌"
+            else:
+                d.at[idx, "internal_pair"] = "같은 계좌"
+    return d
+
+
+def apply_internal_rule(df, cats):
+    """회사 이름이 적힌 거래 중 **반대편 거래(짝)가 확인되는 것**을 '계좌간 자금이동(내부이체)'으로 본다 → 매출·비용에 안 들어가고 손익계산서에서 빠진다.
+    · 짝이 없는 거래(보내는 쪽/받는 쪽 한쪽만 보임)는 자동으로 바꾸지 않는다 — 데이터에 없는 다른 계좌에서 온 돈일 수 있어서 대표님이 확인해야 한다(재무 미션의 '내부이체 짝 점검').
+    · DB는 바꾸지 않는다(화면 계산용). 이미 대표님이 다른 계정과목으로 확정한 거래는 건드리지 않는다(미분류·자동분류만 바꿈).
+    · DB 트리거(trg_auto_tag_internal_transfer)는 입력되는 순간 적요만 보고 분류하므로 짝 확인은 이 화면 계산이 맡는다.
+    반환: 같은 DataFrame(복사본) + rule_internal / internal_name / internal_pair 컬럼"""
+    d = internal_pairing(df)
     d["rule_internal"] = False
     if d.empty:
         return d
     tcat = next((c for c in cats if c.get("code") == INTERNAL_CODE), None)
     if not tcat:
         return d
-    mask = d["description"].map(is_internal_desc)
     auto = d["is_auto_categorized"].fillna(False).astype(bool) if "is_auto_categorized" in d.columns else pd.Series(False, index=d.index)
-    target = mask & (d["account_category_id"].isna() | auto)
+    target = d["internal_name"] & d["internal_pair"].isin(["다른 계좌", "같은 계좌"]) & (d["account_category_id"].isna() | auto)
     d.loc[target, "account_category_id"] = tcat["id"]
     if "cat_name" in d.columns:
         d.loc[target, "cat_name"] = tcat["name"]
@@ -126,3 +149,10 @@ def apply_internal_rule(df, cats):
         d.loc[target, "is_auto_categorized"] = False
     d.loc[target, "rule_internal"] = True
     return d
+
+
+def unmatched_internal(df):
+    """회사 이름이 적혔는데 반대편 거래가 없는 거래(점검 대상). 최근 날짜순."""
+    if df.empty or "internal_pair" not in df.columns:
+        return df.iloc[0:0]
+    return df[df["internal_pair"] == "짝 없음"].sort_values("txn_date", ascending=False)

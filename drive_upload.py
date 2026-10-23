@@ -49,17 +49,33 @@ def build_service(raw_json=None):
         return None, f"드라이브에 연결하지 못했어요 ({type(e).__name__}: {str(e)[:120]})"
 
 
+def _google_reason(e):
+    """HttpError 에서 구글이 준 이유 코드와 메시지를 꺼낸다. 없으면 (None, None)."""
+    try:
+        data = json.loads(e.content.decode("utf-8"))["error"]
+        errs = data.get("errors") or [{}]
+        return errs[0].get("reason"), data.get("message")
+    except Exception:
+        return None, None
+
+
 def explain_error(e):
-    """구글 API 에러를 대표님이 이해할 문장으로."""
+    """구글 API 에러를 대표님이 이해할 문장으로. 구글이 준 이유 코드도 뒤에 붙여서 원인을 숨기지 않는다."""
     msg = str(e)
     low = msg.lower()
+    reason, gmsg = _google_reason(e)
+    tail = f" (구글 응답: {reason or '-'}{' — ' + gmsg[:90] if gmsg else ''})" if (reason or gmsg) else ""
     if "storagequotaexceeded" in low or "do not have storage quota" in low:
         return ("서비스계정은 '내 드라이브' 폴더에 파일을 만들 저장 공간이 없어서 올릴 수 없어요. "
-                "해결: ① 세무사 공유 폴더를 '공유 드라이브'로 옮기고 서비스계정을 멤버(콘텐츠 관리자)로 추가하거나, ② 대표 구글계정(OAuth)으로 올리는 방식으로 바꿔야 해요.")
-    if "insufficientfilepermissions" in low or "insufficient permission" in low or "forbidden" in low or " 403" in low:
-        return "이 폴더에 올릴 권한이 없어요. 서비스계정을 폴더의 '편집자'로 공유했는지 확인해주세요(열람자는 목록만 볼 수 있어요)."
+                "해결: ① 세무사 공유 폴더를 '공유 드라이브'로 옮기고 서비스계정을 멤버(콘텐츠 관리자)로 추가하거나, ② 대표 구글계정(OAuth)으로 올리는 방식으로 바꿔야 해요." + tail)
+    if "accessnotconfigured" in low or "has not been used in project" in low or "api has not been used" in low or "is disabled" in low:
+        return "Google Cloud 프로젝트에서 'Google Drive API'가 꺼져 있어요. 구글 클라우드 콘솔 → API 및 서비스 → 라이브러리 → 'Google Drive API' → 사용 설정을 눌러주세요." + tail
+    if "ratelimit" in low or "userratelimitexceeded" in low:
+        return "구글이 요청이 많다고 잠시 막았어요. 1~2분 뒤에 다시 눌러주세요." + tail
+    if "insufficientfilepermissions" in low or "insufficient permission" in low or "does not have sufficient" in low or "forbidden" in low or " 403" in low:
+        return "이 폴더에 올릴 권한이 없어요. 서비스계정을 폴더의 '편집자'로 공유했는지 확인해주세요(열람자는 목록만 볼 수 있어요)." + tail
     if "notfound" in low or " 404" in low or "file not found" in low:
-        return "폴더를 찾지 못했어요. 폴더 ID가 맞는지, 서비스계정에 폴더가 공유됐는지 확인해주세요."
+        return "폴더를 찾지 못했어요. 폴더 ID가 맞는지, 서비스계정에 폴더가 공유됐는지 확인해주세요." + tail
     return f"{type(e).__name__}: {msg[:200]}"
 
 

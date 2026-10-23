@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 레포 루트의 expense_breakdown.py
 from expense_breakdown import group_merchants, proposal_summary
 from finance_missions import NONE_LABEL as M_NONE, PAGE as M_PAGE, compute_missions, merchant_groups, pending_pairs, suspect_groups
-from bank_common import OFFSET_WINDOW_MIN, add_confirm_state, apply_internal_rule, mark_duplicates, parse_txn_datetime
+from bank_common import OFFSET_WINDOW_MIN, add_confirm_state, apply_internal_rule, unmatched_internal, mark_duplicates, parse_txn_datetime
 
 st.set_page_config(page_title="재무캘린더", layout="wide")
 
@@ -484,6 +484,28 @@ if menu == "🎯 재무 미션":
                         refresh()
                     except Exception as e:
                         st.error(f"❌ 저장하지 못했어요 ({type(e).__name__}: {str(e)[:160]})")
+    # ── 내부이체 짝 점검 (읽기 전용) ──
+    if not bank_df.empty and "internal_pair" in bank_df.columns:
+        _int = bank_df[bank_df["internal_name"]]
+        _um = unmatched_internal(bank_df)
+        _paired = _int[_int["internal_pair"].isin(["다른 계좌", "같은 계좌"])]
+        with st.expander(f"🔁 내부이체 짝 점검 — 회사 이름이 적힌 거래 {len(_int):,}건 중 짝이 없는 것 {len(_um):,}건 (₩{_um['amount'].sum():,.0f})", expanded=False):
+            st.caption("내부이체는 **보내는 쪽 출금과 받는 쪽 입금이 짝**으로 보여야 해요(같은 금액·반대 방향·하루 안). 짝이 확인된 것만 자동으로 내부이체로 계산해요. "
+                       "**짝이 없는 건 '데이터에 없는 다른 계좌'에서 온 돈일 수 있어요** — 그 계좌의 내역이 수집되지 않았거나, 사실은 매출·정산금일 수도 있어요. 아래 목록을 은행 앱에서 확인해주세요.")
+            q1, q2, q3 = st.columns(3)
+            q1.metric("짝 확인됨", f"{len(_paired):,}건", f"₩{_paired['amount'].sum():,.0f}", delta_color="off")
+            q2.metric("짝 없음 · 입금", f"{int((_um['direction'] == 'in').sum())}건", f"₩{_um[_um['direction'] == 'in']['amount'].sum():,.0f}", delta_color="off")
+            q3.metric("짝 없음 · 출금", f"{int((_um['direction'] == 'out').sum())}건", f"₩{_um[_um['direction'] == 'out']['amount'].sum():,.0f}", delta_color="off")
+            if _um.empty:
+                st.success("회사 이름이 적힌 모든 거래에 반대편 거래가 있어요 👍")
+            else:
+                _udf = pd.DataFrame({"날짜": _um["txn_date"].dt.strftime("%Y-%m-%d"), "계좌": _um["account_label"], "구분": _um["direction"].map({"in": "입금", "out": "출금"}),
+                                     "금액": _um["amount"].map(lambda v: f"₩{v:,.0f}"), "적요": _um["description"].fillna(""), "지금 분류": _um["cat_name"]})
+                st.dataframe(_udf, hide_index=True, use_container_width=True, height=min(36 * (len(_udf) + 1) + 6, 520))
+                st.download_button("⬇️ 짝 없는 거래 CSV (엑셀 호환)", _um[["txn_date", "account_label", "direction", "amount", "description", "cat_name"]].to_csv(index=False).encode("utf-8-sig"),
+                                   file_name="내부이체_짝없음.csv", mime="text/csv", key="m_int_csv")
+                st.caption("판단 기준: ① 다른 법인 계좌(수집 안 된 계좌)에서 온 돈이면 → 그 계좌 내역을 수집해야 지출까지 보여요. ② 정산금·매출이면 → 계정과목을 매출로 바꿔야 해요('전체 매칭 현황' 또는 위 계정과목 표).")
+
     if _unc_ev:
         st.info(f"📅 송금일정(cash_events) 중 계정과목이 비어 있는 것이 {_unc_ev}건 있어요 — 「🔗 전체 매칭 현황 › 송금일정」에서 분류하세요.")
 

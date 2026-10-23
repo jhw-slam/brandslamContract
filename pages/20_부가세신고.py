@@ -242,6 +242,14 @@ st.subheader("📝 단계별 제출 — 위에서부터 하나씩")
 st.caption("🔐 비밀번호는 이 화면에서 받거나 저장하지 않아요. 로그인은 평소 쓰시는 방식(비밀번호 관리자·공동인증서)으로 하세요. 메뉴 이름은 사이트 개편으로 바뀔 수 있어요.")
 
 
+def drive_err(e):
+    """올리기 실패 안내: 이유 + 어느 서비스계정을 어느 폴더에 편집자로 공유해야 하는지까지 보여준다."""
+    st.error(f"❌ 올리지 못했어요 — {du.explain_error(e)}")
+    sa = getattr(get_svc()[0], "_sa_email", "") if get_svc()[0] else ""
+    fn = listing["folder"]["name"] if drive_ok else "(폴더 확인 전)"
+    st.caption(f"📌 접속한 서비스계정: {sa or '-'} · 올리려던 폴더: {fn} — 이 계정이 **이 폴더**의 '편집자'로 공유돼 있어야 해요.")
+
+
 def folder_for(step):
     """단계 폴더 ID(없으면 만든다). 반환 (id, 에러문구)"""
     svc, err = get_svc()
@@ -333,7 +341,7 @@ def upload_form(step, extra_ui=None):
             du.replace_or_upload(get_svc()[0], fid, AUTO + extra["memo"][0], extra["memo"][1].encode("utf-8"), "text/plain")
         bump_and_rerun(f"✅ {step['title'].split(' (')[0]}: 파일 {n_ok}개" + (" + 메모" if extra and extra.get("memo") else "") + "를 올렸어요.")
     except Exception as e:
-        st.error(f"❌ 올리지 못했어요 — {du.explain_error(e)}")
+        drive_err(e)
 
 
 for stp in STEPS:
@@ -363,7 +371,7 @@ for stp in STEPS:
                                 du.replace_or_upload(get_svc()[0], fid, f"{AUTO}{ac} {ptag} 거래내역.xlsx", b, XLSX)
                             bump_and_rerun(f"✅ 은행내역 엑셀 {len(wbs)}개를 올렸어요.")
                         except Exception as e:
-                            st.error(f"❌ 올리지 못했어요 — {du.explain_error(e)}")
+                            drive_err(e)
                 for ac, b in wbs.items():
                     st.download_button(f"⬇️ {ac} 엑셀 내려받기", b, file_name=f"{ac}_{ptag}.xlsx", mime=XLSX, key=f"vat_dl_{ac}")
             upload_form(stp)
@@ -388,7 +396,7 @@ for stp in STEPS:
                             du.replace_or_upload(get_svc()[0], fid, f"{AUTO}캠페인 인보이스 목록 {ptag}.xlsx", bio.getvalue(), XLSX)
                             bump_and_rerun("✅ 인보이스 목록을 올렸어요.")
                         except Exception as e:
-                            st.error(f"❌ 올리지 못했어요 — {du.explain_error(e)}")
+                            drive_err(e)
             else:
                 st.caption("이 기간에 인보이스가 등록된 캠페인이 없어요.")
             upload_form(stp)
@@ -413,7 +421,7 @@ for stp in STEPS:
                             du.replace_or_upload(get_svc()[0], fid, f"{AUTO}은행 PAYPAL 출금 목록 {ptag}.xlsx", bio.getvalue(), XLSX)
                             bump_and_rerun("✅ PAYPAL 출금 목록을 올렸어요.")
                         except Exception as e:
-                            st.error(f"❌ 올리지 못했어요 — {du.explain_error(e)}")
+                            drive_err(e)
             else:
                 st.caption("이 기간 은행에서 PAYPAL 출금이 보이지 않아요.")
             upload_form(stp)
