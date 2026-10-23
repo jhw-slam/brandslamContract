@@ -65,8 +65,9 @@ def mark_duplicates(df, keep_ids=None, offset_ids=None):
 
 def add_confirm_state(df):
     """은행거래 한 줄마다 '확정/미확정'과 미확정 이유를 붙인다(재무 화면의 '확정만 / 미확정 포함' 보기와 재무 미션이 쓴다).
-    · 확정 = 대표님이 직접 분류했거나(자동분류 아님) 대표님이 일괄처리로 확정한 상쇄. 정리할 문제(상쇄 확인·애매 의심)가 남아 있지 않은 것.
-    · 미확정 이유: 분류 필요(미분류) / 자동분류 확인(소액 자동분류) / 상쇄 확인(자동 짝지음, 아직 일괄처리 전) / 애매 확인(같은 날 같은 금액의 반대 거래)
+    · 확정 = 대표님이 직접 분류했거나(자동분류 아님) 명확한 상쇄(자동 제외). 정리할 문제(애매 의심)가 남아 있지 않은 것.
+    · 미확정 이유: 분류 필요(미분류) / 자동분류 확인(소액 자동분류) / 애매 확인(같은 날 같은 금액의 반대 거래)
+    · 명확한 상쇄(같은 계좌·같은 날·같은 금액·반대 방향·10분 안)는 확인 없이 자동으로 재무에서 빠진다.
     미확정이어도 숫자에는 그대로 반영한다(대표님 요청: 미루면 부정확해지는 것보다 '미확정이지만 다 반영된 표')."""
     d = df.copy()
     if d.empty:
@@ -75,12 +76,11 @@ def add_confirm_state(df):
         return d
     auto = d["is_auto_categorized"].fillna(False).astype(bool) if "is_auto_categorized" in d.columns else pd.Series(False, index=d.index)
     uncategorized = d["account_category_id"].isna()
-    pend_off = d["is_dup_certain"] & ~d["offset_confirmed"]
     reason = pd.Series("", index=d.index)
     reason = reason.mask(auto & ~uncategorized, "자동분류 확인")
     reason = reason.mask(uncategorized & ~d["is_dup_certain"], "분류 필요")
     reason = reason.mask(d["is_dup_suspect"], "애매 확인")
-    reason = reason.mask(pend_off, "상쇄 확인")
+    reason = reason.mask(d["is_dup_certain"], "")   # 명확한 상쇄(자동)는 확인할 게 없다 — 재무에 안 들어가고 목록에도 안 나온다(10/23 대표)
     d["pending_reason"] = reason
     d["confirm_state"] = reason.map(lambda r: "미확정" if r else "확정")
     return d

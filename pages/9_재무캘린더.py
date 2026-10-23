@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 레포 루트의 expense_breakdown.py
 from expense_breakdown import group_merchants, proposal_summary
-from finance_missions import NONE_LABEL as M_NONE, PAGE as M_PAGE, compute_missions, merchant_groups, pending_pairs, suspect_groups
+from finance_missions import NONE_LABEL as M_NONE, PAGE as M_PAGE, compute_missions, merchant_groups, suspect_groups
 from bank_common import OFFSET_WINDOW_MIN, add_confirm_state, apply_internal_rule, unmatched_internal, mark_duplicates, parse_txn_datetime
 
 st.set_page_config(page_title="재무캘린더", layout="wide")
@@ -283,13 +283,13 @@ bank_df_live = bank_df[~bank_df["is_dup_certain"]].copy() if not bank_df.empty e
 # ── 확정/미확정 보기 + 완성도 (10/19 대표 요청: 미뤄진 것이 있어도 숫자는 다 반영하고, 확정만 따로도 볼 수 있게) ──
 view_mode = "미확정 포함 (전부 반영)"
 if not bank_df.empty:
-    _uni = bank_df[~(bank_df["is_dup_certain"] & bank_df["offset_confirmed"])]   # 대표님이 확정한 상쇄를 뺀 '실제 거래' 전체
+    _uni = bank_df[~bank_df["is_dup_certain"]]   # 명확한 상쇄(자동 제외)를 뺀 '실제 거래' 전체
     _conf = _uni[_uni["confirm_state"] == "확정"]
     _pct_n = len(_conf) / max(len(_uni), 1)
     _pct_a = _conf["amount"].sum() / max(_uni["amount"].sum(), 1)
     t1, t2 = st.columns([2, 3])
     view_mode = t1.radio("표시 기준", ["미확정 포함 (전부 반영)", "확정만"], horizontal=True, key="fin_view_mode",
-                         help="미확정 포함: 분류가 덜 됐거나 상쇄 확인 전인 거래도 숫자에 다 넣어요(상쇄로 보이는 쌍은 제외). 확정만: 대표님이 직접 확정한 거래만 보여요.")
+                         help="미확정 포함: 분류가 덜 됐거나 확인 전인 거래도 숫자에 다 넣어요(명확한 상쇄는 자동 제외). 확정만: 대표님이 직접 확정한 거래만 보여요.")
     t2.progress(min(_pct_a, 1.0), text=f"재무 확정 완성도 — 금액 {_pct_a * 100:.0f}% · 건수 {_pct_n * 100:.0f}% ({len(_conf):,}/{len(_uni):,}건)")
     _pend = _uni[_uni["confirm_state"] == "미확정"]
     if len(_pend):
@@ -346,7 +346,7 @@ if menu == "🎯 재무 미션":
     else:
         _cols = st.columns(len(_ms))
         for _c, _m in zip(_cols, _ms):
-            _c.metric(f"{_m['icon']} {_m['title']}", f"{_m['count']:,}" + ("쌍" if _m["id"] == "offset" else "건" if _m["id"] in ("tax", "event") else "곳" if _m["id"] in ("classify", "suspect") else ""),
+            _c.metric(f"{_m['icon']} {_m['title']}", f"{_m['count']:,}" + ("건" if _m["id"] in ("tax", "event") else "곳" if _m["id"] in ("classify", "suspect") else ""),
                       help=_m["hint"] + (f" · 관련 거래 {_m['rows']:,}건" if _m.get("rows") else ""))
     if _keep_err:
         st.warning(f"상쇄 결정 테이블(bank_offset_overrides)을 읽지 못했어요 ({_keep_err}). 상쇄 일괄처리 저장은 잠시 꺼져 있어요.")
@@ -369,35 +369,10 @@ if menu == "🎯 재무 미션":
 
     _mv = st.session_state.get("m_ver", 0)
 
-    # ── 1) 상쇄 확인 ──
-    _pairs = pending_pairs(bank_df)
-    if _pairs:
-        with st.expander(f"🔁 상쇄 확인 — {len(_pairs)}쌍 (같은 날·같은 금액의 입금↔출금이 {OFFSET_WINDOW_MIN}분 안)", expanded=True):
-            st.caption("**기본으로 모두 '상쇄'에 체크돼 있어요.** 이상 없으면 그대로 아래 일괄처리만 누르세요. 상쇄가 아닌 특이한 건만 체크를 풀어주세요. "
-                       "체크된 쌍은 재무에 반영하지 않고(기록만 보관), 푼 쌍은 정상 거래로 남겨요. 데이터는 지우지 않아요.")
-            _pg = 1
-            if len(_pairs) > M_PAGE:
-                _pg = int(st.number_input(f"페이지 ({M_PAGE}쌍씩, 총 {-(-len(_pairs) // M_PAGE)}쪽)", min_value=1, max_value=-(-len(_pairs) // M_PAGE), value=1, step=1, key="m_pair_page"))
-                st.caption("⚠️ 저장하지 않고 페이지를 넘기면 이 페이지에서 바꾼 체크는 사라져요.")
-            _pv = _pairs[(_pg - 1) * M_PAGE: _pg * M_PAGE]
-            _pdf = pd.DataFrame({
-                "상쇄": [True] * len(_pv), "날짜": [p_["date"].strftime("%Y-%m-%d") for p_ in _pv], "계좌": [p_["account"] for p_ in _pv],
-                "금액": [f"₩{p_['amount']:,.0f}" for p_ in _pv], "출금 시각": [p_["out_time"] for p_ in _pv], "입금 시각": [p_["in_time"] for p_ in _pv],
-                "간격(분)": [p_["gap_min"] for p_ in _pv], "적요(출금 / 입금)": [f"{p_['out_desc']} / {p_['in_desc']}" for p_ in _pv],
-            }, index=[p_["key"] for p_ in _pv])
-            with st.form(f"m_pair_form_{_mv}"):
-                _ed = st.data_editor(_pdf, hide_index=True, use_container_width=True, key=f"m_pair_ed_{_mv}_{_pg}",
-                                     disabled=[c for c in _pdf.columns if c != "상쇄"],
-                                     column_config={"상쇄": st.column_config.CheckboxColumn("상쇄", help="체크=상쇄(재무 미반영) · 해제=정상 거래")})
-                _go = st.form_submit_button(f"✅ 이 {len(_pv)}쌍 일괄처리 (체크=상쇄 확정 · 해제=정상 거래)", type="primary", disabled=bool(_keep_err))
-            if _go:
-                _byk = {p_["key"]: p_ for p_ in _pv}
-                _save_decisions([(_byk[k]["ids"], "offset" if bool(_ed.loc[k, "상쇄"]) else "keep") for k in _ed.index], "상쇄 일괄처리")
-
-    # ── 2) 애매한 의심 ──
+    # ── 애매한 의심 (명확한 상쇄는 자동 제외라 여기서 확인하지 않는다) ──
     _sus = suspect_groups(bank_df)
     if _sus:
-        with st.expander(f"⚠️ 애매한 의심 확인 — {len(_sus)}곳 (같은 날·같은 금액의 입금/출금인데 시간 차이가 커요)", expanded=not _pairs):
+        with st.expander(f"⚠️ 애매한 의심 확인 — {len(_sus)}곳 (같은 날·같은 금액의 입금/출금인데 시간 차이가 커요)", expanded=True):
             st.caption("**기본은 '정상 거래'(체크 해제)** 예요. 실제로 결제↔취소 상쇄인 것만 체크하세요. 저장하면 이 의심 표시가 사라져요.")
             _sv = _sus[:M_PAGE]
             _sdf = pd.DataFrame({
@@ -416,7 +391,7 @@ if menu == "🎯 재무 미션":
     # ── 3) 계정과목 설정 필요 (거래처별) ──
     _mg = merchant_groups(bank_df, _name_by_code)
     if _mg:
-        with st.expander(f"🏷️ 계정과목 설정 필요 — 거래처 {len(_mg):,}곳 · 거래 {sum(g['n'] for g in _mg):,}건 (미분류 + 소액 자동분류)", expanded=not _pairs and not _sus):
+        with st.expander(f"🏷️ 계정과목 설정 필요 — 거래처 {len(_mg):,}곳 · 거래 {sum(g['n'] for g in _mg):,}건 (미분류 + 소액 자동분류)", expanded=not _sus):
             st.caption("**거래처 하나를 고르면 그 거래처의 모든 거래에 적용돼요.** 금액이 큰 거래처부터 보여줘요. '제안대로'는 이름만 보고 짐작한 것이고, 확신이 높은 것만 미리 체크해 뒀어요 — "
                        "나머지는 직접 고르거나, 제안이 맞다면 체크하세요. 고르지 않은 줄은 그대로 남아요. 대표님이 저장한 것은 '확정'으로 바뀌어요.")
             _gp = 1
@@ -462,7 +437,7 @@ if menu == "🎯 재무 미션":
 
     # ── 4) 세무항목 설정 필요 (세금계산서) ──
     if len(_tax_unc):
-        with st.expander(f"🧾 세무항목 설정 필요 — 세금계산서 {len(_tax_unc)}건 (계정과목 미분류)", expanded=not (_pairs or _sus or _mg)):
+        with st.expander(f"🧾 세무항목 설정 필요 — 세금계산서 {len(_tax_unc)}건 (계정과목 미분류)", expanded=not (_sus or _mg)):
             st.caption("세금계산서마다 계정과목을 골라 한 번에 저장하세요. 취소된 계산서는 빠져 있어요.")
             _tv = _tax_unc.sort_values("issue_date", ascending=False).head(M_PAGE)
             _tdf = pd.DataFrame({"작성일": _tv["issue_date"].dt.strftime("%Y-%m-%d").tolist(), "거래처": _tv["buyer_name"].fillna("").tolist(),
@@ -783,11 +758,11 @@ elif menu == "🔗 전체 매칭 현황":
         n_certain = int(bank_df["is_dup_certain"].sum())
         n_suspect = int(bank_df["is_dup_suspect"].sum())
         if n_certain or n_suspect or _keep_ids:
-            with st.expander(f"🧹 상쇄 정리 — 상쇄 {n_certain}건 · 애매한 의심 {n_suspect}건", expanded=True):
+            with st.expander(f"🧹 상쇄 기록 — 자동 제외 {n_certain}건 · 애매한 의심 {n_suspect}건 (확인만 하는 곳이에요)", expanded=False):
                 if n_certain:
-                    st.markdown(f"**상쇄 처리된 거래** — 같은 계좌에서 **같은 날 같은 금액의 입금과 출금이 {OFFSET_WINDOW_MIN}분 안에** 있으면 결제와 취소가 서로 지워지는 쌍으로 보고 "
-                                "대시보드/손익계산서 집계에서 둘 다 뺐어요. 짝이 없는 거래는 그대로 반영돼요. "
-                                "데이터는 지우지 않아요. 실제로 따로 일어난 거래라면 '상쇄 아님'을 눌러주세요.")
+                    st.markdown(f"**자동 상쇄(재무에 반영 안 됨)** — 같은 계좌에서 **같은 날 같은 금액의 입금과 출금이 {OFFSET_WINDOW_MIN}분 안에** 있으면 결제와 취소가 서로 지워지는 쌍으로 보고 "
+                                "대시보드/손익계산서에서 둘 다 뺐어요. 계정과목을 고르거나 확인할 필요 없어요(데이터는 지우지 않고 기록만 남아 있어요). "
+                                "혹시 실제로 따로 일어난 거래라면 아래 '상쇄 아님'을 눌러주세요.")
                     if _keep_err:
                         st.caption("'상쇄 아님' 저장 테이블(bank_offset_overrides)을 읽지 못해서 이 버튼은 꺼져 있어요 — migrations/20261012_bank_offset_overrides.sql 을 DB에 적용하면 켜져요.")
                     dup_groups = bank_df[bank_df["is_dup_certain"] | (bank_df["dup_group"].isin(bank_df.loc[bank_df["is_dup_certain"], "dup_group"]))]
@@ -836,10 +811,10 @@ elif menu == "🔗 전체 매칭 현황":
 
         show_only_unc = st.checkbox("미분류만 보기", value=True, key="bank_unc_only")
         base = bank_df[~bank_df["is_dup_certain"]]  # 상쇄된 거래는 기본 목록에서 항상 숨김
-        b_show = base[base["account_category_id"].isna() | base["is_dup_suspect"]] if show_only_unc else base  # 애매한 중복도 분류 확인용으로 함께 보여준다
+        b_show = base[base["account_category_id"].isna() & ~base["is_dup_suspect"]] if show_only_unc else base  # 애매한 의심은 재무 미션에서 '상쇄/정상'부터 정한다(상쇄 여부와 계정과목을 한 화면에서 섞지 않음)
         b_show = b_show.sort_values("txn_date", ascending=False)
         if n_suspect:
-            st.caption(f"⚠️ 같은 날·같은 금액의 입금/출금(애매한 의심 {n_suspect}건)도 계정과목을 확인할 수 있게 이 목록에 함께 나와요. 정상이면 각 줄의 '✅ 정상'을 눌러 빼세요.")
+            st.caption(f"ℹ️ 같은 날·같은 금액의 입금/출금 {n_suspect}건은 이 목록에서 빼뒀어요. 먼저 「🎯 재무 미션 › 애매한 의심 확인」에서 '상쇄'인지 '정상'인지 정하면, 정상 거래만 여기서 계정과목을 고르게 돼요.")
         st.caption(f"{len(b_show)}건")
         cat_opts = ["(선택 안함)"] + list(cat_name_to_id.keys())
 
