@@ -17,7 +17,6 @@ NAV = {
         st.Page("pages/11_회의록.py", title="Meetings", icon="🗒️", url_path="meetings"),
     ],
     "CFO · Finance & IR": [
-        st.Page("pages/17_수금관리.py", title="Receivables", icon="💰", url_path="receivables"),
         st.Page("pages/18_캠페인마진.py", title="Campaign Margin", icon="📈", url_path="campaign-margin"),
         st.Page("pages/9_재무캘린더.py", title="Finance Calendar", icon="💹", url_path="finance"),
         st.Page("pages/20_부가세신고.py", title="VAT Filing", icon="🧾", url_path="vat-filing"),
@@ -28,6 +27,9 @@ NAV = {
         st.Page("pages/19_직원입력현황.py", title="Team Input", icon="👥", url_path="team-input"),
     ],
 }
+
+if os.environ.get("SHOW_RECEIVABLES") == "1":   # 10/27 대표: 미수금(Receivables)은 따로 설계하기 전까지 메뉴에서 숨긴다(데이터·코드는 그대로)
+    NAV["CFO · Finance & IR"].insert(0, st.Page("pages/17_수금관리.py", title="Receivables", icon="💰", url_path="receivables"))
 
 if os.environ.get("SHOW_LEGACY_PAGES") == "1":
     NAV["Archive (legacy)"] = [

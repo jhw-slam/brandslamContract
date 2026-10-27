@@ -17,9 +17,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 레포 루트의 expense_breakdown.py
 from expense_breakdown import group_merchants, proposal_summary
 from finance_missions import NONE_LABEL as M_NONE, PAGE as M_PAGE, compute_missions, merchant_groups, suspect_groups
+from auto_ledger import classify_ledger, prepare_bank_df
+from auto_ledger_view import render_home
 from bank_common import OFFSET_WINDOW_MIN, add_confirm_state, apply_internal_rule, unmatched_internal, mark_duplicates, parse_txn_datetime
 
 st.set_page_config(page_title="재무캘린더", layout="wide")
+
+# 10/27 대표: 캠페인·송금일정 매칭 표시는 영업-재무관리 섹션을 따로 설계하기 전까지 숨긴다(데이터는 그대로, Railway 변수 SHOW_MATCH=1 이면 다시 보임)
+SHOW_MATCH = os.environ.get("SHOW_MATCH") == "1"
 
 # ── 레이어 1: 앱 공통 비밀번호 게이트 (다른 페이지와 동일) ──────────
 PW = os.environ.get("APP_PASSWORD")
@@ -167,6 +172,14 @@ def load_offset_keep():
         return set(), set(), f"{type(e).__name__}: {str(e)[:120]}"
 
 
+@st.cache_data(ttl=45, show_spinner="자동 정리하는 중…")
+def load_ledger():
+    """🏠 자동 정리 화면용: 은행거래 전부를 자동으로 정리한 결과(DB는 안 바꿈)."""
+    cats, _ev, _pr, txns, _tx = load_all()
+    keep, off, _err = load_offset_keep()
+    return classify_ledger(prepare_bank_df(txns, parse_txn_datetime), cats, keep, off)
+
+
 @st.cache_data(ttl=45)
 def load_campaign_link_data():
     """입금 ↔ 캠페인 연결에 쓰는 자료. 반환: (캠페인 선택지 {라벨: id}, 연결 {은행거래id: [캠페인id,...]}, 에러문구 또는 None).
@@ -201,6 +214,7 @@ def load_campaign_link_data():
 def refresh():
     load_all.clear()
     load_offset_keep.clear()
+    load_ledger.clear()
     load_campaign_link_data.clear()
     st.rerun()
 
@@ -282,7 +296,8 @@ bank_df_live = bank_df[~bank_df["is_dup_certain"]].copy() if not bank_df.empty e
 
 # ── 확정/미확정 보기 + 완성도 (10/19 대표 요청: 미뤄진 것이 있어도 숫자는 다 반영하고, 확정만 따로도 볼 수 있게) ──
 view_mode = "미확정 포함 (전부 반영)"
-if not bank_df.empty:
+_menu_now = st.session_state.get("fin_menu", "🏠 자동 정리")
+if not bank_df.empty and _menu_now != "🏠 자동 정리":
     _uni = bank_df[~bank_df["is_dup_certain"]]   # 명확한 상쇄(자동 제외)를 뺀 '실제 거래' 전체
     _conf = _uni[_uni["confirm_state"] == "확정"]
     _pct_n = len(_conf) / max(len(_uni), 1)
@@ -322,8 +337,8 @@ n_dup_suspect = int(bank_df["is_dup_suspect"].sum()) if not bank_df.empty else 0
 st.divider()
 
 menu = st.radio(
-    "메뉴", ["🎯 재무 미션", "📊 대시보드", "🔗 전체 매칭 현황", "🤖 AI 계정과목 추천", "🏦 뱅크다 연동", "⚙️ 계정과목 설정", "📄 손익계산서", "📝 CFO 인사이트"],
-    horizontal=True, label_visibility="collapsed",
+    "메뉴", ["🏠 자동 정리", "📊 대시보드", "📄 손익계산서", "📝 CFO 인사이트", "🔗 전체 매칭 현황", "🤖 AI 계정과목 추천", "🏦 뱅크다 연동", "⚙️ 계정과목 설정", "🎯 재무 미션"],
+    horizontal=True, label_visibility="collapsed", key="fin_menu",
 )
 st.divider()
 
@@ -331,8 +346,11 @@ st.divider()
 # ════════════════════════════════════════════════════════════
 # 📊 대시보드
 # ════════════════════════════════════════════════════════════
-if menu == "🎯 재무 미션":
-    st.subheader("🎯 재무 미션 — 시간 날 때 하나씩")
+if menu == "🏠 자동 정리":
+    render_home(SUPA, load_ledger(), categories, refresh)
+
+elif menu == "🎯 재무 미션":
+    st.subheader("🎯 재무 미션 (이전 방식) — 새 '🏠 자동 정리'에서 대부분 해결돼요")
     st.caption("미루고 있던 일을 한곳에 모았어요. **미확정이어도 숫자에는 이미 반영돼 있고**, 여기서 처리하면 '확정'으로 바뀌어요. "
                f"표에서 고르고 **저장은 한 번만** 누르세요(한 번에 {M_PAGE}줄). 처리한 줄은 목록에서 빠지고 다음 줄이 올라와요.")
     if st.session_state.get("offset_flash"):
@@ -542,7 +560,7 @@ elif menu == "📊 대시보드":
             _dtype = _d["cat_type"].iloc[0] if not _d.empty else None
             st.caption(f"{len(_d)}건 · 합계 ₩{_d['amount'].sum():,.0f} (위 기간 설정과 상쇄 제외가 그대로 적용돼요)")
             _mon = _d.groupby(_d["txn_date"].dt.strftime("%Y-%m"))["amount"].sum()
-            if _dtype == "revenue":
+            if _dtype == "revenue" and SHOW_MATCH:
                 st.markdown("**💼 입금 ↔ 캠페인 연결** — 매출 입금이 어느 캠페인의 돈인지 연결해요. 연결하면 캠페인 마진의 '입금' 기준에 반영돼요.")
                 _camp_opts, _links_by_tx, _link_err = load_campaign_link_data()
                 _dep = _d[_d["direction"] == "in"].sort_values("txn_date", ascending=False)
@@ -835,7 +853,7 @@ elif menu == "🔗 전체 매칭 현황":
 
         def _status_text(row):
             bits = []
-            if pd.notna(row["matched_cash_event_id"]):
+            if SHOW_MATCH and pd.notna(row["matched_cash_event_id"]):
                 bits.append("🔗 " + (str(row["matched_brand"]) if pd.notna(row["matched_brand"]) else "-") + " · " + (str(row["matched_title"]) if pd.notna(row["matched_title"]) else ""))
             if row["is_dup_suspect"]:
                 bits.append("⚠️같은 날 같은 금액의 반대 거래")

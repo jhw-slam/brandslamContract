@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 레포 루트
 from ceo_common import STATUS_LABEL, build_receivables, summarize
 from finance_missions import build_state as build_finance_state
 
+SHOW_RECEIVABLES = os.environ.get("SHOW_RECEIVABLES") == "1"   # 10/27 대표: 미수금(받을 돈)은 따로 설계하기 전까지 표시하지 않는다(데이터·코드는 그대로, 변수로 다시 켤 수 있음)
 st.set_page_config(page_title="Command Center", layout="wide")
 
 # ── 앱 공통 비밀번호 게이트 (다른 페이지와 동일. 대표 전용 비밀번호는 따로 걸지 않음) ──
@@ -348,7 +349,7 @@ if st.session_state.get("cc_flash"):
     _m, _ok = st.session_state.pop("cc_flash")
     (st.success if _ok else st.error)(_m)
 
-missing = [k for k, v in ceo["missing"].items() if v] + (["receivable_checks"] if money["missing_checks"] else []) \
+missing = [k for k, v in ceo["missing"].items() if v] + (["receivable_checks"] if (money["missing_checks"] and SHOW_RECEIVABLES) else []) \
     + (["scm_stage_map"] if okr["missing_map"] else []) + (["sales_pipeline_deals"] if ops["missing_deals"] else [])
 if missing:
     st.info("📌 아직 DB에 만들지 않은 테이블이 있어서 해당 칸은 '입력 대기'로 보여요: " + ", ".join(missing)
@@ -495,36 +496,37 @@ else:
         unit = "쌍" if m["id"] == "offset" else ("건" if m["id"] in ("tax", "event") else "곳")
         mc.metric(f"{m['icon']} {m['title']}", f"{m['count']:,}{unit}", help=m["hint"])
     try:
-        st.page_link("pages/9_재무캘린더.py", label="🎯 재무 미션 하러 가기 (CFO › Finance Calendar)")
+        st.page_link("pages/9_재무캘린더.py", label="🏠 재무 자동 정리 보러 가기 (CFO › Finance Calendar)")
     except Exception:
         pass
 
-st.markdown("### 💰 받을 돈 · 계약예정")
-m1, m2 = st.columns(2)
-with m1:
-    top_rows = ""
-    for r in open_rows[:6]:
-        name = r["brand"] or r["title"] or "(이름 없음)"
-        ck = r["check"]
-        tag = pill("체크 필요", RED) if r["need_check"] else (f"<span class='cc-gray'>{days_ago(ck['checked_at'])}일 전 확인({STATUS_LABEL[ck['status']]})</span>" if ck else "")
-        due_txt = (f"<b style='color:{RED}'>{r['overdue_days']}일 경과</b>" if r["overdue_days"] else (f"D-{(r['due_date'] - TODAY).days}" if r["due_date"] else "기한 미정"))
-        part = f" <span class='cc-gray'>(예정 {won(r['amount'])} 중 {won(r['received'])} 받음)</span>" if r["received"] else ""
-        top_rows += (f"<div class='cc-row'><span class='n'>{esc(name)} <span class='cc-gray'>{esc(r['title'])}</span></span>"
-                     f"<span>{won(r['remaining'])}{part} · {due_txt} {tag}</span></div>")
-    if not open_rows:
-        top_rows = "<div class='cc-row cc-gray'><span>받을 돈(예정) 건이 없어요</span><span>0건</span></div>"
-    st.markdown(
-        "<div class='cc-card'><div class='cc-eyebrow'>O2 · 현금</div><div class='cc-h2'>받을 돈 (예정)</div>"
-        "<div class='cc-big' style='color:{c}'>{v}</div>"
-        "<div class='cc-sub'>예정 {n}건 · <b style='color:{c2}'>체크 필요 {nc}건</b> · 기한 경과 {no}건(최대 {mo}일)</div>"
-        "<div class='cc-sub'>남은 금액이 큰 순서예요. 부분입금은 남은 금액만, 계약취소·받음은 뺀 값이에요.</div>"
-        "<div style='margin-top:10px'>{rows}</div></div>".format(
-            c=RED if total_open else "inherit", v=won(total_open) if total_open else "0원", n=sm["n"], c2=RED if sm["need_n"] else GRAY,
-            nc=sm["need_n"], no=sm["late_n"], mo=max_over, rows=top_rows), unsafe_allow_html=True)
-    try:
-        st.page_link("pages/17_수금관리.py", label="💰 확인·처리는 CFO › Receivables 에서 →")
-    except Exception:
-        st.caption("확인·처리는 상단 메뉴 CFO › Receivables 에서 해요.")
+st.markdown("### 💰 받을 돈 · 계약예정" if SHOW_RECEIVABLES else "### 🗓 계약예정")
+m1, m2 = st.columns(2) if SHOW_RECEIVABLES else (None, st.container())
+if SHOW_RECEIVABLES:
+    with m1:
+        top_rows = ""
+        for r in open_rows[:6]:
+            name = r["brand"] or r["title"] or "(이름 없음)"
+            ck = r["check"]
+            tag = pill("체크 필요", RED) if r["need_check"] else (f"<span class='cc-gray'>{days_ago(ck['checked_at'])}일 전 확인({STATUS_LABEL[ck['status']]})</span>" if ck else "")
+            due_txt = (f"<b style='color:{RED}'>{r['overdue_days']}일 경과</b>" if r["overdue_days"] else (f"D-{(r['due_date'] - TODAY).days}" if r["due_date"] else "기한 미정"))
+            part = f" <span class='cc-gray'>(예정 {won(r['amount'])} 중 {won(r['received'])} 받음)</span>" if r["received"] else ""
+            top_rows += (f"<div class='cc-row'><span class='n'>{esc(name)} <span class='cc-gray'>{esc(r['title'])}</span></span>"
+                         f"<span>{won(r['remaining'])}{part} · {due_txt} {tag}</span></div>")
+        if not open_rows:
+            top_rows = "<div class='cc-row cc-gray'><span>받을 돈(예정) 건이 없어요</span><span>0건</span></div>"
+        st.markdown(
+            "<div class='cc-card'><div class='cc-eyebrow'>O2 · 현금</div><div class='cc-h2'>받을 돈 (예정)</div>"
+            "<div class='cc-big' style='color:{c}'>{v}</div>"
+            "<div class='cc-sub'>예정 {n}건 · <b style='color:{c2}'>체크 필요 {nc}건</b> · 기한 경과 {no}건(최대 {mo}일)</div>"
+            "<div class='cc-sub'>남은 금액이 큰 순서예요. 부분입금은 남은 금액만, 계약취소·받음은 뺀 값이에요.</div>"
+            "<div style='margin-top:10px'>{rows}</div></div>".format(
+                c=RED if total_open else "inherit", v=won(total_open) if total_open else "0원", n=sm["n"], c2=RED if sm["need_n"] else GRAY,
+                nc=sm["need_n"], no=sm["late_n"], mo=max_over, rows=top_rows), unsafe_allow_html=True)
+        try:
+            st.page_link("pages/17_수금관리.py", label="💰 확인·처리는 CFO › Receivables 에서 →")
+        except Exception:
+            st.caption("확인·처리는 상단 메뉴 CFO › Receivables 에서 해요.")
 with m2:
     deal_rows = ""
     for d in sorted(live_deals, key=lambda d: -float(d.get("expected_amount") or 0))[:5]:
@@ -618,7 +620,7 @@ METRICS = {
     "S3": (pct(plc_done, len(plc)), f"업로드 완료율({plc_done}/{len(plc)}건)", [("진행중(미완료)", f"{len(plc) - plc_done}건"), ("가이드라인 확인", f"{plc_ok}/{len(plc)}"), ("최근 14일 갱신", f"{plc_recent}건")], bool(plc)),
     "S4": (f"{len(sat)}/{len(acc)}", "만족도 점수 입력된 계정", [("30일 넘게 접촉 없음", f"{no_contact}곳"), ("갱신일 30일 이내", f"{renew30}곳"), ("공짜요소·시즌성 부여 기록", "항목 없음(설계 필요)")], bool(sat)),
     "S5": (avg_pct(by_stage["S5"]), "자동화 OKR 평균 달성률", [("개발 할 일 미완료", f"{dev_open}건"), ("지난 KPI 기간 달성", lg("S5"))], bool(by_stage["S5"]) or bool(ops["dev"])),
-    "S6": (pct(money["tot90"] - money["unc90"], money["tot90"]) if cls_rate is not None else "0%", "은행거래 분류율(90일)", [("미분류 거래", f"{money['unc90']}건"), ("받을 돈 체크 필요", f"{sm['need_n']}건"), ("기한 경과 미수", f"{sm['late_n']}건")], bool(money["tot90"])),
+    "S6": (pct(money["tot90"] - money["unc90"], money["tot90"]) if cls_rate is not None else "0%", "은행거래 분류율(90일)", [("미분류 거래", f"{money['unc90']}건")], bool(money["tot90"])),
     "S7": (f"{len(act)}건", "최근 14일 업무기록", [("대표 피드백 달린 기록", f"{fb}건"), ("대표 할일 완료", f"{asg_done}/{len(ops['asg'])}"), ("회의록(30일)", f"{ops['meet']}건"), ("지난 KPI 기간 달성", lg("S7"))], bool(act or ops["meet"])),
     "S8": ("입력", "IR 지표 정의 필요", [("회사 비전 마지막 수정", f"{vis_age}일 전" if vis_age is not None else "기록 없음"), ("1~7단계 핵심 숫자", "IR 재료로 쌓는 중")], False),
 }
