@@ -77,10 +77,6 @@ def merchant_groups(bank_df, name_by_code):
 def compute_missions(bank_df, name_by_code, tax_unc=0, ev_unc=0):
     """미션 카드 목록. 각 항목: id, icon, title, count(처리할 줄/쌍/거래처 수), rows(관련 거래 건수), amount, hint"""
     ms = []
-    pairs = pending_pairs(bank_df)
-    if pairs:
-        ms.append({"id": "offset", "icon": "🔁", "title": "상쇄 확인", "count": len(pairs), "rows": len(pairs) * 2, "amount": sum(p["amount"] for p in pairs),
-                   "hint": "입금↔출금 쌍 — 기본으로 상쇄 체크돼 있어요. 특이한 것만 체크 풀고 일괄처리"})
     sus = suspect_groups(bank_df)
     if sus:
         ms.append({"id": "suspect", "icon": "⚠️", "title": "애매한 의심 확인", "count": len(sus), "rows": sum(len(s["ids"]) for s in sus), "amount": sum(s["amount"] for s in sus) * 1.0,
@@ -147,7 +143,7 @@ def build_state(SUPA):
     ms = compute_missions(df, {c["code"]: c["name"] for c in cats}, tax_unc, ev_unc) if not df.empty else []
     if df.empty:
         return {"missions": ms, "pct_amount": 0, "pct_n": 0, "pending_n": 0, "total_n": 0, "error": None}
-    uni = df[~(df["is_dup_certain"] & df["offset_confirmed"])]
+    uni = df[~df["is_dup_certain"]]   # 명확한 상쇄는 재무에 안 들어가므로 완성도 계산에서도 뺀다
     conf = uni[uni["confirm_state"] == "확정"]
     return {"missions": ms, "pct_amount": float(conf["amount"].sum() / max(uni["amount"].sum(), 1)), "pct_n": len(conf) / max(len(uni), 1),
             "pending_n": len(uni) - len(conf), "total_n": len(uni), "error": None}

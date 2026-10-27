@@ -207,6 +207,42 @@ if drive_ok:
         st.link_button("📂 드라이브에서 폴더 열기", fo["webViewLink"])
 else:
     st.warning(f"드라이브에 아직 연결되지 않았어요 — {listing['err']}")
+# ── 대표 계정(OAuth) 연결: 내 드라이브 폴더에 대표님 소유로 올릴 때 (서비스계정은 내 드라이브에 파일을 못 만든다) ──
+_oc_id, _oc_sec, _oc_tok, _oc_missing = du.oauth_env()
+_base = (os.environ.get("APP_BASE_URL") or ("https://" + os.environ["RAILWAY_PUBLIC_DOMAIN"] if os.environ.get("RAILWAY_PUBLIC_DOMAIN") else "")).rstrip("/")
+_redirect = f"{_base}/vat-filing" if _base else ""
+_code = st.query_params.get("code")
+with st.expander("🔑 대표 계정으로 연결 (내 드라이브 폴더에 올릴 때 한 번만)", expanded=bool(_code)):
+    if not _oc_missing:
+        st.success("✅ 대표 계정(OAuth)으로 올리도록 설정돼 있어요. 올린 파일은 대표님 드라이브에 대표님 소유로 저장돼요.")
+    else:
+        st.info("지금은 서비스계정으로 올려요. 내 드라이브 폴더에서 '저장 공간이 없다'는 오류가 나면 아래 순서로 한 번만 연결하세요. 빠진 환경변수: " + ", ".join(f"`{n}`" for n in _oc_missing))
+    if _code:
+        if not (_oc_id and _oc_sec and _redirect):
+            st.error("GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET 가 Railway에 있어야 토큰을 만들 수 있어요.")
+        elif st.session_state.get("vat_tok_done") != _code:
+            _tok, _terr = du.oauth_exchange(_code, _oc_id, _oc_sec, _redirect)
+            st.session_state["vat_tok_done"] = _code
+            st.session_state["vat_tok"] = (_tok, _terr)
+        _tok, _terr = st.session_state.get("vat_tok", (None, None))
+        if _tok:
+            st.success("✅ 허용 완료! 아래 값을 복사해서 Railway 변수 `GOOGLE_DRIVE_REFRESH_TOKEN`에 붙여넣고 저장(재배포)하세요. 이 화면에만 보이고 저장하지 않아요. 남에게 보여주지 마세요.")
+            st.code(_tok, language=None)
+        elif _terr:
+            st.error(_terr)
+    with st.container():
+        st.markdown("**하는 순서**\n"
+                    "1. 구글 클라우드 콘솔 › API 및 서비스 › 사용자 인증 정보에서 'OAuth 클라이언트 ID(웹 애플리케이션)'를 만들고, **승인된 리디렉션 URI**에 아래 주소를 그대로 추가해요.\n"
+                    "2. 그 클라이언트의 ID·보안 비밀번호를 Railway 변수 `GOOGLE_OAUTH_CLIENT_ID`·`GOOGLE_OAUTH_CLIENT_SECRET`에 넣고 재배포해요.\n"
+                    "3. 아래 '구글 허용하러 가기'를 눌러 **대표 계정(jhw@slam-global.com)** 으로 로그인 → '허용'을 눌러요.\n"
+                    "4. 돌아온 이 화면에 나오는 값을 Railway 변수 `GOOGLE_DRIVE_REFRESH_TOKEN`에 넣고 재배포해요.")
+        st.text_input("1번에 등록할 리디렉션 URI (복사해서 구글 콘솔에 붙여넣기)", value=_redirect or "(Railway 공개 주소를 못 찾았어요 — 변수 APP_BASE_URL 에 앱 주소를 넣어주세요)", disabled=True, key="vat_redirect_show")
+        if _oc_id and _redirect:
+            st.link_button("🔑 구글 허용하러 가기", du.oauth_auth_url(_oc_id, _redirect))
+        else:
+            st.caption("GOOGLE_OAUTH_CLIENT_ID 와 앱 주소가 있어야 '허용하러 가기' 버튼이 나와요.")
+        st.caption("🔐 이 허용은 '앱이 대표님 드라이브에 파일을 올릴 수 있게' 하는 거예요. 비밀번호는 앱이 받지 않고, 구글 로그인 화면에서만 입력해요. 취소하려면 구글 계정 › 보안 › 타사 앱 액세스에서 지우면 돼요.")
+
 with st.expander("🔧 연결 점검 (올릴 수 있는지 확인)"):
     st.caption("폴더를 읽을 수 있는지, 작은 파일을 올렸다 지울 수 있는지 확인해요. 올릴 수 없으면 이유와 해결 방법을 알려드려요.")
     if st.button("연결 점검하기", key="vat_diag", disabled=not folder_id):
@@ -214,9 +250,10 @@ with st.expander("🔧 연결 점검 (올릴 수 있는지 확인)"):
         if err:
             st.error(err)
         else:
-            sa = getattr(svc, "_sa_email", "")
-            if sa:
-                st.caption(f"서비스계정: {sa} — 폴더에서 이 계정을 **편집자**로 공유해야 올릴 수 있어요.")
+            if getattr(svc, "_mode", "") == "oauth":
+                st.caption(f"접속 방식: 대표 계정(OAuth) · {svc._who} — 이 계정이 폴더에 올릴 권한이 있어야 해요.")
+            elif getattr(svc, "_sa_email", ""):
+                st.caption(f"접속 방식: 서비스계정 · {svc._sa_email} — 폴더에서 이 계정을 **편집자**로 공유해야 올릴 수 있어요.")
             for name, ok, msg in du.diagnose(svc, folder_id):
                 (st.success if ok else st.error)(f"{'✅' if ok else '❌'} {name}: {msg}")
 
@@ -240,6 +277,14 @@ if drive_ok and listing["root"]:
 # ── 2) 단계별 제출 ────────────────────────────────────────
 st.subheader("📝 단계별 제출 — 위에서부터 하나씩")
 st.caption("🔐 비밀번호는 이 화면에서 받거나 저장하지 않아요. 로그인은 평소 쓰시는 방식(비밀번호 관리자·공동인증서)으로 하세요. 메뉴 이름은 사이트 개편으로 바뀔 수 있어요.")
+
+
+def drive_err(e):
+    """올리기 실패 안내: 이유 + 어느 서비스계정을 어느 폴더에 편집자로 공유해야 하는지까지 보여준다."""
+    st.error(f"❌ 올리지 못했어요 — {du.explain_error(e)}")
+    sa = getattr(get_svc()[0], "_who", "") if get_svc()[0] else ""
+    fn = listing["folder"]["name"] if drive_ok else "(폴더 확인 전)"
+    st.caption(f"📌 접속한 계정: {sa or '-'} · 올리려던 폴더: {fn} — 이 계정이 **이 폴더**의 '편집자'로 공유돼 있어야 해요.")
 
 
 def folder_for(step):
@@ -333,7 +378,7 @@ def upload_form(step, extra_ui=None):
             du.replace_or_upload(get_svc()[0], fid, AUTO + extra["memo"][0], extra["memo"][1].encode("utf-8"), "text/plain")
         bump_and_rerun(f"✅ {step['title'].split(' (')[0]}: 파일 {n_ok}개" + (" + 메모" if extra and extra.get("memo") else "") + "를 올렸어요.")
     except Exception as e:
-        st.error(f"❌ 올리지 못했어요 — {du.explain_error(e)}")
+        drive_err(e)
 
 
 for stp in STEPS:
@@ -363,7 +408,7 @@ for stp in STEPS:
                                 du.replace_or_upload(get_svc()[0], fid, f"{AUTO}{ac} {ptag} 거래내역.xlsx", b, XLSX)
                             bump_and_rerun(f"✅ 은행내역 엑셀 {len(wbs)}개를 올렸어요.")
                         except Exception as e:
-                            st.error(f"❌ 올리지 못했어요 — {du.explain_error(e)}")
+                            drive_err(e)
                 for ac, b in wbs.items():
                     st.download_button(f"⬇️ {ac} 엑셀 내려받기", b, file_name=f"{ac}_{ptag}.xlsx", mime=XLSX, key=f"vat_dl_{ac}")
             upload_form(stp)
@@ -388,7 +433,7 @@ for stp in STEPS:
                             du.replace_or_upload(get_svc()[0], fid, f"{AUTO}캠페인 인보이스 목록 {ptag}.xlsx", bio.getvalue(), XLSX)
                             bump_and_rerun("✅ 인보이스 목록을 올렸어요.")
                         except Exception as e:
-                            st.error(f"❌ 올리지 못했어요 — {du.explain_error(e)}")
+                            drive_err(e)
             else:
                 st.caption("이 기간에 인보이스가 등록된 캠페인이 없어요.")
             upload_form(stp)
@@ -413,7 +458,7 @@ for stp in STEPS:
                             du.replace_or_upload(get_svc()[0], fid, f"{AUTO}은행 PAYPAL 출금 목록 {ptag}.xlsx", bio.getvalue(), XLSX)
                             bump_and_rerun("✅ PAYPAL 출금 목록을 올렸어요.")
                         except Exception as e:
-                            st.error(f"❌ 올리지 못했어요 — {du.explain_error(e)}")
+                            drive_err(e)
             else:
                 st.caption("이 기간 은행에서 PAYPAL 출금이 보이지 않아요.")
             upload_form(stp)
